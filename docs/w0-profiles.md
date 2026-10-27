@@ -14,4 +14,4 @@ The canonical decisions live in Docs. This Engine index links contracts used by 
 
 Correctness, isolation/security cases, failure/recovery and performance are separate gates. Numbers in the protocols are predeclared engineering budgets on specified resource tiers, not measurements or production promises. Baselines must preserve policy, schema and durability semantics. Failed/invalid runs remain evidence; do not tune thresholds after seeing results to claim a pass.
 
-Next dependency is exact SDK/provider/artifact qualification in issue #3. W0 design completion in #2/#4/#21 does not complete runtime or sample tasks. SDK candidate metadata and pending locks are recorded in Docs; this index does not pin or install a runtime.
+Issue #3 owns exact SDK/provider/artifact qualification. The repository now has [SDK pins and bounded platform/driver qualification](../Tests/PlatformQualification/README.md); raw outcomes, unsupported-host observations and package-license limits are explicit. W0 design/qualification completion does not complete Engine adapters or sample tasks. Current artifact/model/CI boundaries remain recorded in Docs.

@@ -1,0 +1,4 @@
+.artifacts/
+evidence/*.pfx
+evidence/*.dll
+evidence/*.pdb

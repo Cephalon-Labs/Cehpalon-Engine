@@ -3,3 +3,5 @@
 *.json text eol=lf
 *.py text eol=lf
 *.ps1 text eol=lf
+Tests/PlatformQualification/evidence/** -text
+Tests/PlatformQualification/packages.lock.json -text
