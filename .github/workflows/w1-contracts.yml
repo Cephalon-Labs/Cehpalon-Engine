@@ -8,7 +8,10 @@ on:
       - Tests/Core.ContractTests/**
       - Tests/Composition.ContractTests/**
       - Tests/CodeGeneration.ContractTests/**
+      - Tests/Identity.ContractTests/**
+      - Tests/Tenancy.ContractTests/**
       - Benchmarks/W1.Components/**
+      - Benchmarks/Tenancy.Components/**
       - tools/verify_w1.py
       - Cehpalon.Engine.slnx
       - Directory.Packages.props
