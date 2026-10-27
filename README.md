@@ -6,6 +6,8 @@ Goal: a small host-agnostic core with optional modules, reusable business handle
 
 **Status: planning and repository bootstrap. No runtime implementation, passing runtime test suite, performance result or production maturity is claimed.**
 
+W0 now has [selected sample profiles and predeclared proof contracts](docs/w0-profiles.md). Provider selection is complete for the first qualification slice; SDK/driver/artifact/runtime qualification is still pending and all runtime features remain M0.
+
 - [Project](https://github.com/orgs/Cephalon-Labs/projects/4)
 - [Engine issues](https://github.com/Cephalon-Labs/Cehpalon-Engine/issues)
 - [Plan and documentation](https://github.com/Cephalon-Labs/Cehpalon-Engine-Docs)
