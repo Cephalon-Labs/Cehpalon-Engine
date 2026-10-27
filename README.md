@@ -4,7 +4,9 @@ Private MIT-licensed .NET engine program. Baseline: 2026-10-27.
 
 Goal: a small host-agnostic core with optional modules, reusable business handlers and configuration-selected supported transports, topology and capability profiles.
 
-**Status: Engine runtime features remain unimplemented/M0. Scoped SDK/platform/third-party qualification is separate from Engine feature, performance or production proof.**
+**Status: experimental Core, Composition and operation code generation are implemented; full features remain M0 while their acceptance/dependency gates are outstanding. Scoped local component proof is separate from supported-platform, transport/provider, performance or production qualification.**
+
+The [W1 solution](Cehpalon.Engine.slnx) contains a BCL-only typed dispatcher, strict immutable appsettings composition and an opt-in incremental generator for lazy typed operation registrations. Run [component verification](Tests/README.md) with the pinned SDK. See the [experimental portable consumer](https://github.com/Cephalon-Labs/Cehpalon-Engine-Samples/tree/main/portable-core) and [W1 decision](https://github.com/Cephalon-Labs/Cehpalon-Engine-Docs/blob/main/internal/adr/ADR-0005-w1-portable-core-composition.md). #3 remains Blocked until supported-Windows evidence exists.
 
 [PlatformQualification](Tests/PlatformQualification/README.md) now pins the private-tested .NET11 RC3 SDK and a locked driver graph. The bounded HTTPS/JWT/GraphQL and owned PostgreSQL/RabbitMQ smoke has explicit proof limits and retained failures. Local Windows26H2 is observational compatibility because that version is not in the checked support table; Linux qualification uses listed Ubuntu22.04.5 under WSL. See the qualification evidence and CI results for the exact host/revision tested.
 
@@ -18,9 +20,9 @@ W0 has [selected sample profiles and predeclared proof contracts](docs/w0-profil
 
 ## Layout
 
-- `src/`: future core, composition and optional adapters
-- `Tests/`: future independently runnable contract/integration/conformance suites
-- `Benchmarks/`: future benchmark suites with predeclared protocols and raw evidence
+- `src/`: experimental Core, Composition and build-time CodeGeneration; optional host/provider adapters remain future work
+- `Tests/`: independently runnable component contracts, compiler consumer and separate platform qualification
+- `Benchmarks/`: bounded component regression runner with a predeclared protocol; three lane workloads remain unmeasured
 - `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`: entry points to canonical program guidance
 
 .NET11 SDK `11.0.100-rc.3.26522.148` is pinned in `global.json` with roll-forward disabled. Use a matching private SDK or CI setup; unrelated system SDKs were not replaced. Direct driver versions and the qualification lock graph are explicit. .NET12 remains a separate research track. Package distribution/license review is required before release; the complete third-party graph must not be described as MIT-only.

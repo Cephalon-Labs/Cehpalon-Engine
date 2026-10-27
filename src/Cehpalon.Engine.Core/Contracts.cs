@@ -1,0 +1,72 @@
+using System.Collections.ObjectModel;
+
+namespace Cehpalon.Engine.Core;
+
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = false, Inherited = false)]
+public sealed class OperationAttribute : Attribute
+{
+    public OperationAttribute(string id) => Id = OperationId.RequireValid(id);
+    public string Id { get; }
+}
+
+public interface IOperationHandler<TRequest, TResponse>
+{
+    ValueTask<OperationResult<TResponse>> HandleAsync(
+        TRequest request, OperationContext context, CancellationToken cancellationToken);
+}
+
+/// <summary>A compile-time typed bridge for generated registrations. Each call transfers a new handler's ownership.</summary>
+public interface IOperationHandlerFactory
+{
+    THandler Create<THandler>() where THandler : class;
+}
+
+/// <summary>Caller-supplied correlation metadata. This is not tenant, identity or authorization authority.</summary>
+public sealed class OperationContext
+{
+    public OperationContext(string correlationId, IEnumerable<KeyValuePair<string, string>>? metadata = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        if (correlationId.Length > 256)
+            throw new ArgumentException("Correlation IDs are limited to 256 characters.", nameof(correlationId));
+        CorrelationId = correlationId;
+        var copy = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in metadata ?? [])
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(pair.Key);
+            ArgumentNullException.ThrowIfNull(pair.Value);
+            if (pair.Key.Length > 128 || pair.Value.Length > 4096)
+                throw new ArgumentException("Metadata keys/values exceed the supported 128/4096 character limits.", nameof(metadata));
+            if (!copy.TryAdd(pair.Key, pair.Value))
+                throw new ArgumentException("Metadata keys must be unique using ordinal comparison.", nameof(metadata));
+            if (copy.Count > 64)
+                throw new ArgumentException("At most 64 metadata entries are supported.", nameof(metadata));
+        }
+        Metadata = new ReadOnlyDictionary<string, string>(copy);
+    }
+
+    public string CorrelationId { get; }
+    public IReadOnlyDictionary<string, string> Metadata { get; }
+}
+
+public static class OperationId
+{
+    /// <summary>Canonical ASCII identifier: [a-z][a-z0-9_.-]{0,127}; comparison is ordinal.</summary>
+    public static bool IsValid(string? value)
+    {
+        if (value is null || value.Length is < 1 or > 128 || value[0] is < 'a' or > 'z') return false;
+        for (var index = 1; index < value.Length; index++)
+        {
+            var c = value[index];
+            if (!(c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '.' or '-')) return false;
+        }
+        return true;
+    }
+
+    public static string RequireValid(string? value)
+    {
+        if (!IsValid(value))
+            throw new ArgumentException("An operation identifier must match [a-z][a-z0-9_.-]{0,127}.", nameof(value));
+        return value!;
+    }
+}

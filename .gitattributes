@@ -3,5 +3,13 @@
 *.json text eol=lf
 *.py text eol=lf
 *.ps1 text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+*.props text eol=lf
+*.slnx text eol=lf
+*.yml text eol=lf
+NuGet.Config text eol=lf
 Tests/PlatformQualification/evidence/** -text
 Tests/PlatformQualification/packages.lock.json -text
+Tests/CodeGeneration.ContractTests/evidence/** -text
+**/packages.lock.json -text
