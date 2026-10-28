@@ -1,4 +1,4 @@
-name: W1 portable component contracts
+name: Portable component and adapter contracts
 
 on:
   push:
@@ -10,6 +10,8 @@ on:
       - Tests/CodeGeneration.ContractTests/**
       - Tests/Identity.ContractTests/**
       - Tests/Tenancy.ContractTests/**
+      - Tests/Http.ContractTests/**
+      - Tests/GraphQL.ContractTests/**
       - Benchmarks/W1.Components/**
       - Benchmarks/Tenancy.Components/**
       - tools/verify_w1.py
