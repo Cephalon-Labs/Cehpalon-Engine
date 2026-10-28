@@ -23,8 +23,8 @@ internal static class TemplateFiles
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net11.0</TargetFramework>
-    <AssemblyName>{{name}}</AssemblyName>
-    <RootNamespace>{{name}}</RootNamespace>
+    <AssemblyName>PortableConsumer.{{name}}</AssemblyName>
+    <RootNamespace>PortableConsumers.Generated</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -52,7 +52,7 @@ using System.Text;
 using System.Text.Json;
 using Cehpalon.Engine.Composition;
 using Cehpalon.Engine.Core;
-using {{name}};
+using PortableConsumers.Generated;
 
 var counters = new Counters();
 var json = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
@@ -129,7 +129,7 @@ catch
 using Cehpalon.Engine.Composition;
 using Cehpalon.Engine.Core;
 
-namespace {{name}};
+namespace PortableConsumers.Generated;
 
 internal static class ModuleCatalog
 {
@@ -201,6 +201,8 @@ internal sealed class OwnedModule(Counters counters) : IAsyncDisposable
 
 This generated console application uses the existing Engine Core, Composition and
 operation-registration generator through explicit local source project references.
+Its assembly is PortableConsumer.{{name}} and its fixed code namespace is
+PortableConsumers.Generated, avoiding collisions with framework/Engine names.
 It is not an HTTP, GraphQL, Worker, provider, tenant-protected or production template.
 The only supported tuple is Modular / SingleProcess / RequestReply. Startup config
 selects the app; changing config does not require changing the business handler.

@@ -34,6 +34,8 @@ engine-source.json and README.md. The supplied Engine checkout must contain the
 required source inputs with the supported SDK policy and official-only NuGet
 source policy. Explicit Engine paths in XML are escaped; the generated project
 references Core/Composition and includes CodeGeneration as an analyzer only.
+Assembly names use `PortableConsumer.<Name>` and source uses the fixed namespace
+`PortableConsumers.Generated` to avoid framework/Engine name collisions.
 Source-root paths containing `%`, `$`, `@`, `;`, `*` or `?` are rejected because
 XML escaping alone does not neutralize MSBuild expressions or item-list syntax.
 Spaces, Unicode and XML-escaped ampersands do not receive this rejection.
