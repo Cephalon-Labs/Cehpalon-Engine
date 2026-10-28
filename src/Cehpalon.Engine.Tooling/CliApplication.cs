@@ -263,7 +263,10 @@ public static class CliApplication
             foreach (var name in new[] { "Cehpalon-Engine", "Cehpalon-Engine-Docs", "Cehpalon-Engine-Samples" })
             {
                 var candidate = Path.Combine(ancestor, name);
-                if (Directory.Exists(candidate)) roots.Add(candidate);
+                // Hosted runners can wrap a checkout in another same-named directory.
+                // A directory name alone does not make that wrapper a checkout root.
+                if (Directory.Exists(candidate) && (Directory.Exists(Path.Combine(candidate, ".git"))
+                    || File.Exists(Path.Combine(candidate, ".git")))) roots.Add(candidate);
             }
         }
         foreach (var root in roots)

@@ -33,7 +33,9 @@ OS temporary directory or an owned new directory under this checkout's `.local`.
 Negative output-boundary cases request a fresh nonexistent path under the
 three named checkout fixtures and verify refusal without creating it. Each fixture
 copies only the seventeen required source inputs, creates a dummy `.git` marker
-and empty Docs/Samples sibling directories; it does not require other repository
+and Docs/Samples sibling directories with dummy `.git` markers; it does not require other repository
 checkouts or claim git-attested provenance. Windows-only extended-path alias
 checks supplement cross-host lexical rejection of device namespaces. Actual
 source-checkout and generated compiler proof remains separate.
+An additional regression distinguishes the actual checkout from a same-named
+outer runner directory, preserving allowed `.local` output on hosted runners.

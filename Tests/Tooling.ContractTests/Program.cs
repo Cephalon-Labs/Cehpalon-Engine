@@ -74,8 +74,8 @@ string CreateSourceFixture(string parent)
 {
     var root = Path.Combine(parent, "Cehpalon-Engine");
     Directory.CreateDirectory(Path.Combine(root, ".git"));
-    Directory.CreateDirectory(Path.Combine(parent, "Cehpalon-Engine-Docs"));
-    Directory.CreateDirectory(Path.Combine(parent, "Cehpalon-Engine-Samples"));
+    Directory.CreateDirectory(Path.Combine(parent, "Cehpalon-Engine-Docs", ".git"));
+    Directory.CreateDirectory(Path.Combine(parent, "Cehpalon-Engine-Samples", ".git"));
     foreach (var relative in sourcePaths)
     {
         var target = Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar));
@@ -386,6 +386,20 @@ Check("new-output-under-own-existing-local-parent-is-allowed", () =>
     var result = Run(NewArguments(target));
     Assert(result.Code == 0, "Ignored .local output should be allowed: " + result.Error);
     Assert(Snapshot(target).Count == expectedFiles.Length);
+});
+
+Check("same-named-runner-wrapper-is-not-a-checkout-boundary", () =>
+{
+    var wrapper = Path.Combine(Scope(), "Cehpalon-Engine");
+    Directory.CreateDirectory(wrapper);
+    var source = CreateSourceFixture(wrapper);
+    var parent = Path.Combine(source, ".local");
+    Directory.CreateDirectory(parent);
+    var target = Path.Combine(parent, "consumer");
+    var result = Run(NewArguments(target, root: source));
+    Assert(result.Code == 0, "A same-named wrapper without .git must not hide the actual checkout's .local: " + result.Error);
+    Assert(Snapshot(target).Count == expectedFiles.Length);
+    Assert(!Directory.Exists(Path.Combine(wrapper, ".git")), "The wrapper must remain an ordinary parent directory.");
 });
 
 foreach (var checkoutName in new[] { "Cehpalon-Engine", "Cehpalon-Engine-Docs", "Cehpalon-Engine-Samples" })
