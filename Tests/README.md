@@ -10,4 +10,6 @@ The W1 verifier requires a fresh ignored attempt directory, restores the locked 
 
 The same verifier also runs [HTTP](Http.ContractTests/README.md) and [GraphQL](GraphQL.ContractTests/README.md) adapter contracts. GraphQL tests own a localhost HTTP listener with a synthetic trusted-principal fixture; actual pinned JWT/HTTPS/tenant/storage checks live in the separate Small API consumer. HTTP has no GraphQL runtime dependency. These bounded tests do not execute the original W0 benchmark protocol.
 
+It also runs [Tooling](Tooling.ContractTests/README.md) filesystem/configuration contracts. The [Samples tooling verifier](https://github.com/Cephalon-Labs/Cehpalon-Engine-Samples/tree/main/tooling) separately invokes the actual CLI and restore/build/runs a newly generated console consumer. Full tooling profiles, transport schemas, performance and distribution qualification remain outstanding.
+
 W0 correctness, tenant/policy, zero-activation and failure/recovery contracts are indexed in [sample profiles](../docs/w0-profiles.md). Implement each supported provider/profile suite from its canonical protocol; fixture passes cannot substitute for real-provider E2E.

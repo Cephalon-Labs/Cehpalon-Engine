@@ -12,6 +12,7 @@ on:
       - Tests/Tenancy.ContractTests/**
       - Tests/Http.ContractTests/**
       - Tests/GraphQL.ContractTests/**
+      - Tests/Tooling.ContractTests/**
       - Benchmarks/W1.Components/**
       - Benchmarks/Tenancy.Components/**
       - tools/verify_w1.py

@@ -7,6 +7,7 @@
     <Project Path="src/Cehpalon.Engine.Tenancy/Cehpalon.Engine.Tenancy.csproj" />
     <Project Path="src/Cehpalon.Engine.Transports.Http/Cehpalon.Engine.Transports.Http.csproj" />
     <Project Path="src/Cehpalon.Engine.Transports.GraphQL/Cehpalon.Engine.Transports.GraphQL.csproj" />
+    <Project Path="src/Cehpalon.Engine.Tooling/Cehpalon.Engine.Tooling.csproj" />
   </Folder>
   <Folder Name="/Tests/">
     <Project Path="Tests/Core.ContractTests/Core.ContractTests.csproj" />
@@ -17,6 +18,7 @@
     <Project Path="Tests/Tenancy.ContractTests/Tenancy.ContractTests.csproj" />
     <Project Path="Tests/Http.ContractTests/Http.ContractTests.csproj" />
     <Project Path="Tests/GraphQL.ContractTests/GraphQL.ContractTests.csproj" />
+    <Project Path="Tests/Tooling.ContractTests/Tooling.ContractTests.csproj" />
   </Folder>
   <Folder Name="/Benchmarks/">
     <Project Path="Benchmarks/W1.Components/W1.Components.csproj" />
