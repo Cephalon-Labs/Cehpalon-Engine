@@ -281,6 +281,102 @@ await Check("mapping-is-lazy-and-requires-authorization-metadata", async () =>
     Assert(!app.Services.GetServices<ITransportOperationDispatcher>().Any());
 });
 
+await Check("schema-uses-adapter-camelcase-required-and-strict-member-policy", () =>
+{
+    var schema = OperationHttpAdapter.ExportJsonSchema<Input>();
+    var properties = schema["properties"]!.AsObject();
+    Assert(properties.ContainsKey("tenant") && properties.ContainsKey("id") && !properties.ContainsKey("Tenant"));
+    Assert(properties["id"]!["type"]!.GetValue<string>() == "integer");
+    Assert(schema["additionalProperties"]!.GetValue<bool>() == false);
+    Assert(schema["required"]!.AsArray().Select(x => x!.GetValue<string>()).Order().SequenceEqual(new[] { "id", "tenant" }));
+    return Task.CompletedTask;
+});
+await Check("schema-result-mutation-cannot-change-future-schema-or-wire-policy", async () =>
+{
+    var mutated = OperationHttpAdapter.ExportJsonSchema<Input>();
+    mutated["properties"]!.AsObject().Remove("id"); mutated["additionalProperties"] = true;
+    var fresh = OperationHttpAdapter.ExportJsonSchema<Input>();
+    Assert(fresh["properties"]!["id"] is not null && fresh["additionalProperties"]!.GetValue<bool>() == false);
+    var probe = new Probe(); var context = Context("{\"tenant\":\"A\",\"id\":1,\"extra\":true}", probe: probe);
+    await OperationHttpAdapter.ExecuteAsync(context, binding);
+    Assert(context.Response.StatusCode == 400 && probe.Calls == 0);
+});
+await Check("schema-nullability-required-and-nested-array-shapes-are-derived", () =>
+{
+    var schema = OperationHttpAdapter.ExportJsonSchema<SchemaShape>();
+    var properties = schema["properties"]!.AsObject();
+    var nullable = properties["optional"]!["type"]!.AsArray().Select(x => x!.GetValue<string>()).ToArray();
+    Assert(nullable.Contains("string") && nullable.Contains("null"));
+    Assert(schema["required"]!.AsArray().Any(x => x!.GetValue<string>() == "optional"));
+    Assert(properties["entries"]!["items"]!["properties"]!["amount"]!["type"]!.GetValue<string>() == "integer");
+    return Task.CompletedTask;
+});
+await Check("schema-recursive-references-resolve-within-detached-document", () =>
+{
+    var schema = OperationHttpAdapter.ExportJsonSchema<SchemaRecursive>();
+    var references = 0;
+    void Walk(System.Text.Json.Nodes.JsonNode? node)
+    {
+        if (node is System.Text.Json.Nodes.JsonObject obj)
+            foreach (var pair in obj)
+            {
+                if (pair.Key == "$ref")
+                {
+                    var path = pair.Value!.GetValue<string>(); Assert(path.StartsWith('#'));
+                    System.Text.Json.Nodes.JsonNode? target = schema;
+                    foreach (var part in path[1..].Split('/', StringSplitOptions.RemoveEmptyEntries))
+                        target = target![part.Replace("~1", "/", StringComparison.Ordinal).Replace("~0", "~", StringComparison.Ordinal)];
+                    Assert(target is not null); references++;
+                }
+                Walk(pair.Value);
+            }
+        else if (node is System.Text.Json.Nodes.JsonArray array) foreach (var item in array) Walk(item);
+    }
+    Walk(schema); Assert(references > 0); return Task.CompletedTask;
+});
+await Check("concurrent-schema-export-does-not-mutate-request-response-serialization", async () =>
+{
+    using var start = new Barrier(4);
+    var threads = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
+    var workers = Enumerable.Range(0, 4).Select(_ => Task.Factory.StartNew(() =>
+    {
+        threads.TryAdd(Environment.CurrentManagedThreadId, 0);
+        for (var iteration = 0; iteration < 8; iteration++)
+        {
+            Assert(start.SignalAndWait(TimeSpan.FromSeconds(30)), "Parallel schema workers did not rendezvous.");
+            var schema = OperationHttpAdapter.ExportJsonSchema<Input>(); schema["description"] = "caller-owned";
+            var probe = new Probe(); var context = Context(probe: probe);
+            OperationHttpAdapter.ExecuteAsync(context, binding).GetAwaiter().GetResult();
+            Assert(context.Response.StatusCode == 200 && probe.Calls == 1 && Body(context) == "{\"label\":\"allowed\"}");
+        }
+    }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+    await Task.WhenAll(workers); Assert(threads.Count == 4);
+});
+await Check("error-schema-describes-actual-problem-envelope-without-policy-mutation", async () =>
+{
+    var schema = OperationHttpAdapter.ExportErrorJsonSchema();
+    var properties = schema["properties"]!.AsObject();
+    Assert(properties.Select(x => x.Key).Order().SequenceEqual(new[] { "code", "status", "title", "type" }));
+    Assert(properties["status"]!["type"]!.GetValue<string>() == "integer");
+    properties.Remove("code");
+    Assert(OperationHttpAdapter.ExportErrorJsonSchema()["properties"]!["code"] is not null);
+    var probe = new Probe { ResultError = new("resource.conflict", "Do not expose business details") };
+    var context = Context(probe: probe); await OperationHttpAdapter.ExecuteAsync(context, binding);
+    Assert(context.Response.StatusCode == 409 && context.Response.ContentType!.StartsWith("application/problem+json", StringComparison.Ordinal));
+    using var body = JsonDocument.Parse(Body(context));
+    Assert(body.RootElement.GetProperty("type").GetString() == "about:blank"
+        && body.RootElement.GetProperty("status").GetInt32() == 409 && body.RootElement.GetProperty("code").GetString() == "resource.conflict");
+    Assert(body.RootElement.EnumerateObject().Select(x => x.Name).Order().SequenceEqual(new[] { "code", "status", "title", "type" }));
+});
+await Check("response-schema-preserves-root-null-supported-by-actual-success-serialization", async () =>
+{
+    var schema = OperationHttpAdapter.ExportJsonSchema<Output>();
+    Assert(schema["type"]!.AsArray().Any(x => x!.GetValue<string>() == "null"));
+    var probe = new Probe { NullResult = true }; var context = Context(probe: probe);
+    await OperationHttpAdapter.ExecuteAsync(context, binding);
+    Assert(context.Response.StatusCode == 200 && probe.Calls == 1 && Body(context) == "null");
+});
+
 var report = new { suite = "Http.ContractTests", total = checks.Count, passed = checks.Count - failures, failed = failures, checks };
 var reportJson = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
 Console.WriteLine(reportJson);
@@ -293,8 +389,12 @@ public sealed record Input(string Tenant, int Id);
 public sealed record DictionaryInput(Dictionary<string, string> Values);
 public sealed record RawInput(JsonElement Extra);
 public sealed record Output(string Label);
+public sealed record SchemaShape(string Name, string? Optional, SchemaLeaf[] Entries);
+public sealed record SchemaLeaf(long Amount);
+public sealed record SchemaRecursive(string Name, SchemaRecursive? Next);
 public sealed class Probe : ITransportOperationDispatcher
 {
+    public bool NullResult { get; init; }
     public int Calls { get; private set; }
     public Input? LastInput { get; private set; }
     public string? LastOperation { get; private set; }
@@ -311,7 +411,7 @@ public sealed class Probe : ITransportOperationDispatcher
         if (Fault is not null) throw Fault;
         cancellationToken.ThrowIfCancellationRequested();
         return ValueTask.FromResult(ResultError is null
-            ? OperationResult<TResponse>.Success((TResponse)(object)new Output("allowed"))
+            ? OperationResult<TResponse>.Success(NullResult ? default! : (TResponse)(object)new Output("allowed"))
             : OperationResult<TResponse>.Failure(ResultError));
     }
 }

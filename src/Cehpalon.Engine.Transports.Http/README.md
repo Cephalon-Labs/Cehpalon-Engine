@@ -9,3 +9,13 @@ Requests require POST, `application/json` with optional UTF-8 charset, no conten
 Success is HTTP200 and a typed JSON value. Intentional failures use ProblemDetails-compatible objects with top-level `code`: `access.denied`403 with fixed generic message; `validation.failed`400; `resource.not_found`404; `resource.conflict`409; `internal.error`500; other intentional business failures422. Business error messages other than denial must be safe for their audience, as required by Core. Protocol failures use401/405/413/415. Actual client cancellation propagates `RequestAborted` without writing an error payload; an unrelated `OperationCanceledException` is a safe server fault. GraphQL can preserve the same operation/error semantics while retaining its protocol's response/status rules.
 
 These bounded contracts do not establish production authentication, reverse-proxy/body-decompression safety, AOT, transport/provider throughput, deployment or supported-Windows qualification. Host-level tenant, disabled-module and real-network behavior require separate consumer evidence.
+
+`ExportJsonSchema<TContract>()` returns a detached BCL structural schema using a copy
+of the actual adapter serializer policy. `ExportErrorJsonSchema()` derives the
+actual problem-envelope payload shape. Neither method exposes mutable transport
+options, runs a validator/handler or grants authority. Nullable successful response
+roots remain allowed; request object-only rules must be applied by the export
+wrapper. Structural schemas do not encode duplicate-name/Unicode/byte parsing,
+all numeric parser bounds, arbitrary validators or tenant policy. The generated
+Small API's offline contract exporter supplies that bounded wrapper and shared
+typed route catalog; no HTTP schema/introspection endpoint is added here.

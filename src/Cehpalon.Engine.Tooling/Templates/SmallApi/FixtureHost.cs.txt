@@ -156,8 +156,7 @@ public sealed class FixtureHost : IAsyncDisposable
             if(enabled.Contains("graphql"))
             {
                 Counters.GraphQLFactories++;
-                var catalog=new GraphQLOperationCatalog.Builder().AddQuery("catalogItem",Bindings.Get).AddQuery("catalogPage",Bindings.List).AddMutation("setLabel",Bindings.Set).Build();
-                builder.Services.AddCehpalonGraphQL(catalog);
+                builder.Services.AddCehpalonGraphQL(TransportCatalog.GraphQL());
             }
             Counters.GraphQLServices=builder.Services.Count(s=>(s.ServiceType.FullName??"").StartsWith("HotChocolate.",StringComparison.Ordinal));
             var app=builder.Build();Application=app;
@@ -168,7 +167,7 @@ public sealed class FixtureHost : IAsyncDisposable
                 if(enabled.Contains("api"))
                 {
                     Counters.ApiFactories++;
-                    app.MapOperation("/api/catalog/get",Bindings.Get);app.MapOperation("/api/catalog/list",Bindings.List);app.MapOperation("/api/catalog/set",Bindings.Set);
+                    TransportCatalog.MapHttp(app);
                 }
                 if(enabled.Contains("graphql")) app.MapCehpalonGraphQL("/graphql");
                 Counters.Endpoints=((Microsoft.AspNetCore.Routing.IEndpointRouteBuilder)app).DataSources.SelectMany(x=>x.Endpoints).Count();

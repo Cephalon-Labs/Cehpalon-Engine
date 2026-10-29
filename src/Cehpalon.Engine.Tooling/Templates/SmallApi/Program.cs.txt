@@ -20,12 +20,14 @@ internal static class Program
             {
                 Console.WriteLine(JsonSerializer.Serialize(new { status = "passed", commands = new[] {
                     "--self-test --output <new-report.json>",
+                    "--export-contracts --config <json> --output <new-directory>",
                     "--serve --config <json> --certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json>" },
                     scope = "Experimental fixture-backed Small API. Type stop + Enter or Ctrl+C for owned shutdown." }, Json));
                 return 0;
             }
-            if (args.Length == 0 || args[0] is not ("--self-test" or "--serve")) return Failure("usage.command", 2);
-            var allowed = args[0] == "--self-test" ? new[] { "--output" } : new[] { "--config", "--certificate", "--public-key", "--ready" };
+            if (args.Length == 0 || args[0] is not ("--self-test" or "--serve" or "--export-contracts")) return Failure("usage.command", 2);
+            var allowed = args[0] switch { "--self-test" => new[] { "--output" }, "--export-contracts" => new[] { "--config", "--output" },
+                _ => new[] { "--config", "--certificate", "--public-key", "--ready" } };
             var options = new Dictionary<string, string>(StringComparer.Ordinal);
             for (var i = 1; i < args.Length; i += 2)
                 if (!allowed.Contains(args[i], StringComparer.Ordinal) || i + 1 >= args.Length
@@ -33,6 +35,7 @@ internal static class Program
                     || !options.TryAdd(args[i], args[i + 1])) return Failure("usage.option", 2);
             if (allowed.Any(key => !options.ContainsKey(key))) return Failure("usage.required", 2);
             if (args[0] == "--self-test") return await SelfTest.Run(options["--output"]);
+            if (args[0] == "--export-contracts") return await ContractExport.Run(options["--config"], options["--output"]);
 
             var ready = Path.GetFullPath(options["--ready"]);
             if (File.Exists(ready) || Directory.Exists(ready)) return Failure("ready.exists", 3);
@@ -101,7 +104,7 @@ internal static class Program
         }
     }
 
-    private static string ReadConfiguration(string path)
+    internal static string ReadConfiguration(string path)
     {
         using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         if (file.Length > CompositionCompiler.MaximumConfigurationBytes) throw new InvalidDataException();

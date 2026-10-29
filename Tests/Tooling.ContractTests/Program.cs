@@ -690,7 +690,7 @@ Check("invalid-utf8-config-is-rejected-without-modification", () =>
 });
 
 string[] SmallArguments(string target) => [.. NewArguments(target), "--profile", "small-api"];
-string[] smallFiles = ["Catalog.cs", "Consumer.csproj", "FixtureHost.cs", "NuGet.Config", "Program.cs", "README.md", "SelfTest.cs",
+string[] smallFiles = ["Catalog.cs", "Consumer.csproj", "ContractExport.cs", "FixtureHost.cs", "NuGet.Config", "Program.cs", "README.md", "SelfTest.cs",
     "appsettings.graphql-only.json", "appsettings.graphql.json", "appsettings.json", "appsettings.off.json", "engine-source.json", "global.json"];
 
 Check("small-api-exact-files-determinism-and-profile-specific-validation", () =>
@@ -726,7 +726,7 @@ foreach (var capability in new[] { "worker", "database", "cache", "broker", "ai"
     });
 }
 
-for (var position = 1; position <= 13; position++)
+for (var position = 1; position <= 14; position++)
 foreach (var after in new[] { false, true })
 {
     var fault = position; var afterWrite = after;

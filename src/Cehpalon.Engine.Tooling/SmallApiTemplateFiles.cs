@@ -48,12 +48,15 @@ internal static class SmallApiTemplateFiles
         var files = new SortedDictionary<string, byte[]>(StringComparer.Ordinal);
         var utf8 = new UTF8Encoding(false, true);
         void Add(string path, string value) => files.Add(path, utf8.GetBytes(value.Replace("\r\n", "\n") + "\n"));
-        foreach (var filename in new[] { "Program.cs", "SelfTest.cs", "FixtureHost.cs", "Catalog.cs" })
+        foreach (var filename in new[] { "Program.cs", "SelfTest.cs", "FixtureHost.cs", "Catalog.cs", "ContractExport.cs" })
         {
             using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("SmallApi." + filename + ".txt")
                 ?? throw new InvalidOperationException("Missing bundled Small API source.");
             using var reader = new StreamReader(stream, utf8);
-            files.Add(filename, utf8.GetBytes(reader.ReadToEnd()));
+            var text = reader.ReadToEnd();
+            if (filename == "ContractExport.cs") text = text.Replace("__CEHPALON_ENGINE_SOURCE_ROOT__",
+                System.Text.Json.JsonSerializer.Serialize(engineRoot), StringComparison.Ordinal);
+            files.Add(filename, utf8.GetBytes(text));
         }
         string Project(string project) => SecurityElement.Escape(Path.Combine(engineRoot, "src", project, project + ".csproj").Replace('\\', '/'))!;
         Add("Consumer.csproj", $$"""
@@ -72,7 +75,7 @@ internal static class SmallApiTemplateFiles
     <EnableDefaultContentItems>false</EnableDefaultContentItems>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="Program.cs" /><Compile Include="SelfTest.cs" /><Compile Include="FixtureHost.cs" /><Compile Include="Catalog.cs" />
+    <Compile Include="Program.cs" /><Compile Include="SelfTest.cs" /><Compile Include="FixtureHost.cs" /><Compile Include="Catalog.cs" /><Compile Include="ContractExport.cs" />
     <Content Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="[11.0.0-rc.3.26522.148]" />
     <ProjectReference Include="{{Project("Cehpalon.Engine.Core")}}" />
@@ -100,12 +103,13 @@ a real IdP/provider, database/RLS proof or an installable distribution.
 Assembly PortableConsumer.{{name}} and fixed namespace PortableConsumers.Generated
 avoid framework/Engine naming collisions.
 
-The CLI only writes these thirteen files; no build, download, installation or service
+The CLI only writes these fourteen files; no build, download, installation or service
 is executed by generation. With the exact SDK pinned by global.json installed:
 
 ```text
 dotnet build Consumer.csproj -c Release
 dotnet run --project Consumer.csproj -c Release --no-build -- --self-test --output <new-report.json>
+dotnet run --project Consumer.csproj -c Release --no-build -- --export-contracts --config appsettings.graphql.json --output <new-contract-directory>
 dotnet run --project Consumer.csproj -c Release --no-build -- --serve --config appsettings.json --certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json>
 ```
 
@@ -130,6 +134,25 @@ Type `stop` followed by Enter, or Ctrl+C, for awaited listener/handler cleanup a
 a stopped JSON report. Redirected stdin EOF alone keeps the host alive without
 polling; an explicit stop command or Ctrl+C remains necessary.
 
+After building, --export-contracts --config <json> --output <new-directory> writes
+offline transport artifacts without WebApplication, TLS/key reads, handlers or
+tenant authority calls. It first validates the same Composition/capability plan.
+manifest.json is always present; enabled API adds openapi.json and enabled GraphQL
+adds schema.graphql from the actual pinned vendor schema. All-off adds neither.
+The same typed catalog drives runtime mapping and export; generated operation IDs
+are checked with a throwing handler factory that must remain uncalled. Enabled
+GraphQL export explicitly constructs/disposes its offline schema service provider
+and reports those counters; disabled GraphQL performs no such registration.
+
+HTTP schemas use the adapter's serializer policy and its actual problem envelope.
+The object-only request root is explicit; inline schema $id resources preserve
+local $ref resolution. These are structural shapes, not complete acceptance rules:
+custom validators, CLR numeric bounds, duplicate JSON names, Unicode/byte limits,
+tenant policy and business constraints remain enforced by actual runtime checks.
+Nullable success roots remain possible as Core allows. No credential or host
+readiness is required to export, and HTTP introspection/schema endpoints stay off.
+Output is new-only staged publication; artifacts contain no timestamps/output paths.
+
 appsettings.json enables API only, appsettings.graphql.json enables API+GraphQL,
 appsettings.graphql-only.json enables GraphQL only, appsettings.off.json disables
 all entrypoints. Off configuration imports no TLS/JWT files and constructs no store,
@@ -147,7 +170,7 @@ Git/build attestation or a complete source inventory. Source paths and inherited
 SDK/MSBuild parent policy must be trusted. Revalidate actual source and package
 locks before reusing evidence. GraphQL/JWT versions are pinned to the observed Engine
 package policy, not claimed latest. Compiler-only CodeGeneration/Roslyn must not
-appear in the runtime dependency graph. Full #20 tooling benchmark, transport schema
+appear in the runtime dependency graph. Full #20 tooling benchmark, arbitrary transport schema
 generation, packaging/global-tool, AOT/trimming, #3 and production gates remain open.
 """);
         return files;

@@ -19,7 +19,7 @@ cehpalon validate --config <file> [--profile portable-request-reply|small-api]
 usage/configuration rejection, and 3 for path/I/O/source failure. Results are JSON;
 success goes to output and diagnostics to error. Unknown or duplicate options,
 extra positional arguments, unsupported profiles and names outside
-`[A-Z][A-Za-z0-9]{0,63}` are rejected. DOS device names CON/PRN/AUX/NUL/COM1Ã¢â‚¬â€œ9/LPT1Ã¢â‚¬â€œ9
+`[A-Z][A-Za-z0-9]{0,63}` are rejected. DOS device names CON/PRN/AUX/NUL/COM1-9/LPT1-9
 are rejected on every OS. No shells, builds, installs, downloads or services run.
 
 `validate` uses the same bounded Composition compiler and selected catalog as the
@@ -45,8 +45,8 @@ Global/feed policy bytes are copied; no package graph is invented by generation.
 The observed manifest hashes selected source inputs and states that it is not a
 git attestation or complete build/input inventory. No git subprocess is invoked.
 
-Small API writes exactly thirteen files: Consumer.csproj, Program.cs, SelfTest.cs,
-FixtureHost.cs, Catalog.cs, four appsettings variants (API-only, API+GraphQL,
+Small API writes exactly fourteen files: Consumer.csproj, Program.cs, SelfTest.cs,
+FixtureHost.cs, Catalog.cs, ContractExport.cs, four appsettings variants (API-only, API+GraphQL,
 GraphQL-only, all-off), global.json, NuGet.Config, engine-source.json and README.md.
 It observes32selected Engine inputs including Identity/Tenancy/HTTP/GraphQL and
 requires the existing exact JWT/GraphQL package-version policy. It embeds template
@@ -70,6 +70,29 @@ at+jwt contract. Caller headers and correlation metadata grant no tenant authori
 Disabled GraphQL skips service registration and mapping; vendor package presence
 is not activation. These checks do not replace the full Small API workload or timing
 protocol. Compiler-only dependencies must remain absent from consumer runtime.
+
+After deliberately building the generated consumer, its explicit command
+`--export-contracts --config <json> --output <new-directory>` writes offline
+transport artifacts. It validates the same Composition/capability plan before
+schema construction or output. `manifest.json` is always present; enabled HTTP
+adds `openapi.json` (OpenAPI3.1), enabled GraphQL adds actual vendor-printed
+`schema.graphql`, all-off adds neither schema. The shared typed transport catalog
+also drives runtime routes/fields; actual generated registration IDs are verified
+using a throwing handler factory without invoking it. HTTP DTO schemas come from
+the adapter's exact serializer policy and errors from its actual envelope factory.
+Request schemas add the adapter's object-only root constraint; inline schema `$id`
+resources preserve local `$ref` roots. Custom validators, CLR numeric bounds,
+duplicate-name/Unicode/body checks and tenant authority are not fully expressed by
+structural JSON schemas. Nullable response roots remain possible as Core permits.
+
+Only an enabled GraphQL export constructs/disposes a schema service provider;
+its counters disclose that work. This offline artifact command does not construct
+WebApplication, read TLS keys, open listeners or execute handlers/authority. It does
+not enable network schema/introspection endpoints or weaken authentication. Output
+is a new atomically published directory with deterministic bytes and hashes;
+observed path protections retain the trusted-parent/race limits below. Failures
+retain actual schema/cleanup counters. The source-only CLI itself executes none
+of this compiled consumer work.
 
 Output must be a new directory with an already-existing parent. Existing files,
 directories and observed symlink/reparse-point ancestry are rejected. Known

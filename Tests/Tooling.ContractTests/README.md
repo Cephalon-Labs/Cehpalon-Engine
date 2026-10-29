@@ -40,7 +40,7 @@ source-checkout and generated compiler proof remains separate.
 An additional regression distinguishes the actual checkout from a same-named
 outer runner directory, preserving allowed `.local` output on hosted runners.
 
-The Small API subset adds exact thirteen-file generation/determinism, pure validation
-of four profile configurations, unsupported capability rejection, all twenty-six
+The Small API subset adds exact fourteen-file generation/determinism, pure validation
+of four profile configurations, unsupported capability rejection, all twenty-eight
 before/after file-write fault positions and a publication collision. Real HTTPS,
 JWT and tenant checks run in the separate generated-consumer Samples verifier.

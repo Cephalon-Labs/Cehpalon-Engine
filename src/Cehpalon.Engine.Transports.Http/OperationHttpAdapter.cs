@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
+using System.Text.Json.Schema;
 using Cehpalon.Engine.Core;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -22,6 +24,31 @@ public static class OperationHttpAdapter
         RespectRequiredConstructorParameters = true,
         MaxDepth = 32
     };
+
+    /// <summary>
+    /// Export a detached structural schema using the adapter's actual serializer policy.
+    /// This executes no validator/handler and grants no tenant authority. Object-only
+    /// request envelopes, byte/Unicode checks and semantic validators remain separate.
+    /// </summary>
+    public static JsonNode ExportJsonSchema<TContract>() => ExportJsonSchema(typeof(TContract), JsonOptions);
+
+    /// <summary>Export the actual adapter-created problem envelope without executing an operation.</summary>
+    public static JsonNode ExportErrorJsonSchema() => ExportJsonSchema(
+        ErrorPayload(400, TransportErrors.ValidationFailed()).GetType(), JsonSerializerOptions.Default);
+
+    private static JsonNode ExportJsonSchema(Type contract, JsonSerializerOptions policy)
+    {
+        // Resolve metadata on a copy: do not expose or mutate shared serializer options.
+        var options = new JsonSerializerOptions(policy);
+        options.MakeReadOnly(populateMissingResolver: true);
+        return options.GetJsonSchemaAsNode(contract, new JsonSchemaExporterOptions
+        {
+            // A generic T cannot retain a caller's top-level T? annotation. Core
+            // permits nullable successful responses, so retain the BCL null-oblivious
+            // default. Hosts add the adapter's object-only request envelope separately.
+            TreatNullObliviousAsNonNullable = false
+        });
+    }
 
     /// <summary>Map only when the API module is enabled. Mapping does not instantiate a dispatcher or business handler.</summary>
     public static RouteHandlerBuilder MapOperation<TRequest, TResponse>(this IEndpointRouteBuilder endpoints,
@@ -195,12 +222,14 @@ public static class OperationHttpAdapter
 
     private static async Task WriteErrorAsync(HttpContext context, int status, OperationError error)
     {
-        var payload = JsonSerializer.SerializeToUtf8Bytes(new
-        {
-            type = "about:blank", title = error.Message, status, code = error.Code
-        });
+        var payload = JsonSerializer.SerializeToUtf8Bytes(ErrorPayload(status, error));
         context.Response.StatusCode = status;
         context.Response.ContentType = "application/problem+json; charset=utf-8";
         await context.Response.Body.WriteAsync(payload, context.RequestAborted);
     }
+
+    private static object ErrorPayload(int status, OperationError error) => new
+    {
+        type = "about:blank", title = error.Message, status, code = error.Code
+    };
 }
