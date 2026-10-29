@@ -23,5 +23,6 @@
   <Folder Name="/Benchmarks/">
     <Project Path="Benchmarks/W1.Components/W1.Components.csproj" />
     <Project Path="Benchmarks/Tenancy.Components/Tenancy.Components.csproj" />
+    <Project Path="Benchmarks/Tooling.Components/Tooling.Components.csproj" />
   </Folder>
 </Solution>

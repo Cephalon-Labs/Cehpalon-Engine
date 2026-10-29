@@ -15,6 +15,7 @@ on:
       - Tests/Tooling.ContractTests/**
       - Benchmarks/W1.Components/**
       - Benchmarks/Tenancy.Components/**
+      - Benchmarks/Tooling.Components/**
       - tools/verify_w1.py
       - Cehpalon.Engine.slnx
       - Directory.Packages.props
