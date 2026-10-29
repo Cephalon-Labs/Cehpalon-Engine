@@ -14,5 +14,6 @@
   <ItemGroup>
     <ProjectReference Include="../Cehpalon.Engine.Composition/Cehpalon.Engine.Composition.csproj" />
     <InternalsVisibleTo Include="Tooling.ContractTests" />
+    <EmbeddedResource Include="Templates/SmallApi/*.txt" LogicalName="SmallApi.%(Filename)%(Extension)" WithCulture="false" />
   </ItemGroup>
 </Project>

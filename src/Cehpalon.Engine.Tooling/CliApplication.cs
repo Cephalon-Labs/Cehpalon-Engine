@@ -42,9 +42,10 @@ public static class CliApplication
             if (args.Length == 1 && args[0] == "--help")
             {
                 Write(output, new { success = true, version = Version, commands = new[] {
-                    "new --name <ASCIIUpperIdentifier> --output <new-directory> --engine-root <existing-checkout> [--profile portable-request-reply]",
-                    "validate --config <file>", "--help", "--version" }, profile = SupportedProfile,
-                    limits = "Portable in-process request/reply only. No tenant authority or HTTP/GraphQL/Worker generation." });
+                    "new --name <ASCIIUpperIdentifier> --output <new-directory> --engine-root <existing-checkout> [--profile portable-request-reply|small-api]",
+                    "validate --config <file> [--profile portable-request-reply|small-api]", "--help", "--version" }, profile = SupportedProfile,
+                    profiles = new[] { SupportedProfile, SmallApiTemplateFiles.Profile },
+                    limits = "Experimental source-checkout profiles; Small API uses fixture-backed authority. No production/provider or Worker qualification." });
                 return 0;
             }
             if (args.Length == 1 && args[0] == "--version")
@@ -56,7 +57,7 @@ public static class CliApplication
             return args[0] switch
             {
                 "new" => New(Parse(args, ["--name", "--output", "--engine-root", "--profile"]), output, fileSystem),
-                "validate" => Validate(Parse(args, ["--config"]), output),
+                "validate" => Validate(Parse(args, ["--config", "--profile"]), output),
                 _ => throw new UsageFailure("usage.command", "Unknown command or extra arguments to --help/--version.")
             };
         }
@@ -68,7 +69,7 @@ public static class CliApplication
         catch (ConfigurationFailure failure)
         {
             Write(error, new { success = false, code = "config.invalid", message = "Configuration was rejected before activation.",
-                diagnostics = failure.Diagnostics.Select(diagnostic => new { diagnostic.Code, path = "$.Cehpalon", message = "Configuration violates the selected portable profile." }) });
+                    diagnostics = failure.Diagnostics.Select(diagnostic => new { diagnostic.Code, path = "$.Cehpalon", message = "Configuration violates the selected profile." }) });
             return 2;
         }
         catch (PathFailure failure)
@@ -104,11 +105,14 @@ public static class CliApplication
 
     private static int Validate(Dictionary<string, string> options, TextWriter output)
     {
+        var profile = Profile(options);
         var configPath = UserPath(Required(options, "--config"));
         DemandPlainAncestors(configPath);
-        var compilation = CompositionCompiler.Compile(ReadConfiguration(configPath), TemplateFiles.Catalog());
+        var compilation = CompositionCompiler.Compile(ReadConfiguration(configPath), profile == SupportedProfile ? TemplateFiles.Catalog() : SmallApiTemplateFiles.Catalog());
         if (!compilation.IsSuccess) throw new ConfigurationFailure(compilation.Diagnostics);
-        Write(output, new { success = true, status = "passed", profile = SupportedProfile, schemaVersion = compilation.Plan!.SchemaVersion,
+        if (profile == SmallApiTemplateFiles.Profile && !SmallApiTemplateFiles.Supported(compilation.Plan!))
+            throw new UsageFailure("config.capability", "The small-api profile supports only host, API and GraphQL activation; disable unsupported capabilities.");
+        Write(output, new { success = true, status = "passed", profile, schemaVersion = compilation.Plan!.SchemaVersion,
             activationOrder = compilation.Plan.ActivationOrder, modules = compilation.Plan.Modules });
         return 0;
     }
@@ -117,8 +121,7 @@ public static class CliApplication
     {
         var name = Required(options, "--name");
         if (!ValidName(name)) throw new UsageFailure("usage.name", "Use [A-Z][A-Za-z0-9]{0,63}, excluding reserved DOS device names.");
-        var profile = options.GetValueOrDefault("--profile", SupportedProfile);
-        if (profile != SupportedProfile) throw new UsageFailure("usage.profile", "Only portable-request-reply is supported.");
+        var profile = Profile(options);
         var destination = Path.TrimEndingDirectorySeparator(UserPath(Required(options, "--output")));
         var engineRoot = Path.TrimEndingDirectorySeparator(UserPath(Required(options, "--engine-root")));
         if (engineRoot.IndexOfAny(['%', '$', '@', ';', '*', '?']) >= 0)
@@ -137,7 +140,7 @@ public static class CliApplication
         // Read all required source inputs before creating any output. This is an observed
         // byte snapshot, not a git revision or a protection against later source edits.
         var sourceBytes = new SortedDictionary<string, byte[]>(StringComparer.Ordinal);
-        foreach (var path in SourcePaths)
+        foreach (var path in profile == SupportedProfile ? SourcePaths : SourcePaths.Concat(SmallApiTemplateFiles.SourcePaths))
         {
             var fullPath = Path.Combine(engineRoot, path.Replace('/', Path.DirectorySeparatorChar));
             DemandPlainAncestors(fullPath);
@@ -145,12 +148,19 @@ public static class CliApplication
             if (bytes.Length > 4 * 1024 * 1024) throw new PathFailure("source.size", "An Engine source input exceeds the supported limit.");
             sourceBytes.Add(path, bytes);
         }
-        try { ValidatePinnedInputs(sourceBytes); }
+        try
+        {
+            ValidatePinnedInputs(sourceBytes);
+            if (profile == SmallApiTemplateFiles.Profile && !SmallApiTemplateFiles.PackagePolicy(sourceBytes["Directory.Packages.props"]))
+                throw new PathFailure("source.packages", "Engine package policy does not match the supported Small API profile.");
+        }
         catch (Exception failure) when (failure is JsonException or System.Xml.XmlException or InvalidOperationException)
         { throw new PathFailure("source.invalid", "Engine source policy must be valid and match the supported experimental template."); }
         var inputs = sourceBytes.Select(pair => new SourceInput(pair.Key, Convert.ToHexStringLower(SHA256.HashData(pair.Value)), pair.Value.LongLength)).ToArray();
         var manifest = JsonSerializer.Serialize(new { schemaVersion = 1, provenance = "observed-source-bytes-not-git-attestation", sourceRoot = engineRoot, inputs }, JsonOptions) + "\n";
-        var files = TemplateFiles.Create(name, engineRoot, sourceBytes["global.json"], sourceBytes["NuGet.Config"], Utf8.GetBytes(manifest));
+        var files = profile == SupportedProfile
+            ? TemplateFiles.Create(name, engineRoot, sourceBytes["global.json"], sourceBytes["NuGet.Config"], Utf8.GetBytes(manifest))
+            : SmallApiTemplateFiles.Create(name, engineRoot, sourceBytes["global.json"], sourceBytes["NuGet.Config"], Utf8.GetBytes(manifest));
 
         var stage = Path.Combine(parent, ".cehpalon-stage-" + Guid.NewGuid().ToString("N"));
         var owned = false;
@@ -177,6 +187,14 @@ public static class CliApplication
         }
         Write(output, new { success = true, status = "passed", profile, name, output = destination, files = files.Keys.ToArray(), sourceInputs = inputs.Length });
         return 0;
+    }
+
+    private static string Profile(Dictionary<string, string> options)
+    {
+        var profile = options.GetValueOrDefault("--profile", SupportedProfile);
+        if (profile is not (SupportedProfile or SmallApiTemplateFiles.Profile))
+            throw new UsageFailure("usage.profile", "Supported profiles are portable-request-reply and small-api.");
+        return profile;
     }
 
     private static void ValidatePinnedInputs(SortedDictionary<string, byte[]> inputs)

@@ -12,4 +12,6 @@ The same verifier also runs [HTTP](Http.ContractTests/README.md) and [GraphQL](G
 
 It also runs [Tooling](Tooling.ContractTests/README.md) filesystem/configuration contracts. The [Samples tooling verifier](https://github.com/Cephalon-Labs/Cehpalon-Engine-Samples/tree/main/tooling) separately invokes the actual CLI and restore/build/runs a newly generated console consumer. Full tooling profiles, transport schemas, performance and distribution qualification remain outstanding.
 
+The [generated Small API verifier](https://github.com/Cephalon-Labs/Cehpalon-Engine-Samples/tree/main/tooling-small-api) separately invokes `new --profile small-api`, builds the actual HTTPS consumer and checks cross-tenant denial, disabled modules and caller-configured serving/cleanup. This fixture-backed profile does not certify a real IdP/provider or production hosting.
+
 W0 correctness, tenant/policy, zero-activation and failure/recovery contracts are indexed in [sample profiles](../docs/w0-profiles.md). Implement each supported provider/profile suite from its canonical protocol; fixture passes cannot substitute for real-provider E2E.

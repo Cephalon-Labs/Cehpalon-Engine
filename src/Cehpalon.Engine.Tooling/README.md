@@ -1,34 +1,36 @@
 # Experimental portable scaffolding CLI
 
 This executable (`cehpalon`) is a bounded early slice of Engine issue #20. It
-generates one real console consumer of unchanged Core, Composition and the typed
-operation-registration generator. It does not generate HTTP, GraphQL, Worker,
-tenant authority, providers or new runtime semantics. Full #20 and platform gates
-remain outstanding; #3 is not changed by this tool.
+generates source-checkout consumers of unchanged Core, Composition and the typed
+operation-registration generator. The default portable-request-reply profile is
+an unprotected console example; small-api adds actual HTTPS/JWT HTTP and optional
+GraphQL through the existing guarded tenant boundary and explicit fixture authority.
+No real IdP/provider, Worker or new runtime semantics are generated. Full #20 and
+platform gates remain outstanding; #3 is not changed by this tool.
 
 ```text
 cehpalon --help
 cehpalon --version
-cehpalon new --name DemoApp --output <new-directory> --engine-root <existing-engine-checkout> [--profile portable-request-reply]
-cehpalon validate --config <file>
+cehpalon new --name DemoApp --output <new-directory> --engine-root <existing-engine-checkout> [--profile portable-request-reply|small-api]
+cehpalon validate --config <file> [--profile portable-request-reply|small-api]
 ```
 
 `CliApplication.Run(string[], TextWriter, TextWriter)` returns 0 for success, 2 for
 usage/configuration rejection, and 3 for path/I/O/source failure. Results are JSON;
 success goes to output and diagnostics to error. Unknown or duplicate options,
 extra positional arguments, unsupported profiles and names outside
-`[A-Z][A-Za-z0-9]{0,63}` are rejected. DOS device names CON/PRN/AUX/NUL/COM1–9/LPT1–9
+`[A-Z][A-Za-z0-9]{0,63}` are rejected. DOS device names CON/PRN/AUX/NUL/COM1Ã¢â‚¬â€œ9/LPT1Ã¢â‚¬â€œ9
 are rejected on every OS. No shells, builds, installs, downloads or services run.
 
-`validate` uses the same bounded Composition compiler and catalog as the generated
-consumer: support `core`, entrypoint `app` depending on core, and entrypoint
+`validate` uses the same bounded Composition compiler and selected catalog as the
+generated consumer. Portable uses support `core`, entrypoint `app` depending on core, and entrypoint
 `optional` depending on core. Validation checks graph compatibility, not whether
 application factories will succeed. Optional is a negative fixture whose consumer
 factory throws if selected; no optional feature is implemented. Configuration is
 UTF-8 and limited to Composition's 1 MiB bound; malformed bytes and invalid graphs
 fail before activation.
 
-`new` writes exactly nine fixed files: Consumer.csproj, Program.cs, Catalog.cs,
+Portable `new` writes exactly nine fixed files: Consumer.csproj, Program.cs, Catalog.cs,
 appsettings.json, appsettings.off.json, global.json, NuGet.Config,
 engine-source.json and README.md. The supplied Engine checkout must contain the
 required source inputs with the supported SDK policy and official-only NuGet
@@ -42,6 +44,32 @@ Spaces, Unicode and XML-escaped ampersands do not receive this rejection.
 Global/feed policy bytes are copied; no package graph is invented by generation.
 The observed manifest hashes selected source inputs and states that it is not a
 git attestation or complete build/input inventory. No git subprocess is invoked.
+
+Small API writes exactly thirteen files: Consumer.csproj, Program.cs, SelfTest.cs,
+FixtureHost.cs, Catalog.cs, four appsettings variants (API-only, API+GraphQL,
+GraphQL-only, all-off), global.json, NuGet.Config, engine-source.json and README.md.
+It observes32selected Engine inputs including Identity/Tenancy/HTTP/GraphQL and
+requires the existing exact JWT/GraphQL package-version policy. It embeds template
+sources in the CLI assembly and does not read a Samples checkout at generation time.
+`validate --profile small-api` rejects unsupported selected Worker/provider modules
+before activation, in addition to Composition graph validation.
+
+The generated Small API runtime has explicit `--self-test --output <new-report>`
+for real localhost HTTPS/JWT/cross-tenant/disabled/cancellation/lifecycle fixture
+checks. It reads all four emitted configurations. `--serve --config <json>
+--certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json>`
+requires caller-provided trust, with PFX password optionally supplied through
+CEHPALON_TLS_PASSWORD. It binds only HTTPS IPv4 loopback/ephemeral port, publishes
+new-only complete readiness JSON, and accepts console `stop` +Enter or Ctrl+C for
+owned cleanup. Off/invalid config constructs no WebApplication/store and reads no key files.
+Only self-test generates ephemeral private fixture keys; none are output.
+The normal server still uses the clearly documented synthetic alice/tenant-a,
+bob/tenant-b membership source and20k memory-store fixture, not real IdP/provider
+integration. Tokens must use the generated README's fixed issuer/audience/RS256/
+at+jwt contract. Caller headers and correlation metadata grant no tenant authority.
+Disabled GraphQL skips service registration and mapping; vendor package presence
+is not activation. These checks do not replace the full Small API workload or timing
+protocol. Compiler-only dependencies must remain absent from consumer runtime.
 
 Output must be a new directory with an already-existing parent. Existing files,
 directories and observed symlink/reparse-point ancestry are rejected. Known
@@ -66,10 +94,11 @@ can change after generation. Future proof must check actual source/build inputs.
 Generated projects inherit ordinary SDK/MSBuild parent policy; the source/output
 parents and inherited build customizations must be trusted.
 
-The generated consumer compiles config before factories, builds its generated
+The portable-request-reply consumer compiles config before factories, builds its generated
 registry inside the enabled app factory, dispatches one echo operation, and reports
 factory/handler/dispatch/disposal counters after cleanup. All-off dispatches no
-work. Plain Core provides no tenant protection. Successful local generation or
+work. Plain Core provides no tenant protection; Small API explicitly wires the
+existing guarded dispatcher with fixture authority. Successful local generation or
 build is not supported-Windows, hosted-CI, AOT/trimming, package-release or
 production qualification. The internal file-operation seam is for deterministic
 partial-write/publication-race contract tests, with no product test switches.

@@ -30,7 +30,7 @@ def main():
     for folder in ['src/Cehpalon.Engine.Core','src/Cehpalon.Engine.Composition','src/Cehpalon.Engine.CodeGeneration','src/Cehpalon.Engine.Identity.Contracts','src/Cehpalon.Engine.Tenancy','src/Cehpalon.Engine.Transports.Http','src/Cehpalon.Engine.Transports.GraphQL','src/Cehpalon.Engine.Tooling','Tests/Tooling.ContractTests','Tests/Http.ContractTests','Tests/GraphQL.ContractTests','Tests/Core.ContractTests','Tests/Composition.ContractTests','Tests/CodeGeneration.ContractTests','Tests/Identity.ContractTests','Tests/Tenancy.ContractTests','Benchmarks/W1.Components','Benchmarks/Tenancy.Components']:
         for path in sorted((ROOT/folder).rglob('*')):
             if not path.is_file() or {'bin','obj','evidence'}.intersection(path.relative_to(ROOT/folder).parts): continue
-            if path.suffix in ('.cs','.csproj','.json','.py'): report['source_sha256'][path.relative_to(ROOT).as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
+            if path.suffix in ('.cs','.csproj','.json','.py') or 'Templates' in path.relative_to(ROOT/folder).parts: report['source_sha256'][path.relative_to(ROOT).as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
     for filename in ['global.json','NuGet.Config','Directory.Packages.props','Cehpalon.Engine.slnx','tools/verify_w1.py']:
         report['source_sha256'][filename]=hashlib.sha256((ROOT/filename).read_bytes()).hexdigest()
     def save(): (output/'manifest.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8',newline='\n')

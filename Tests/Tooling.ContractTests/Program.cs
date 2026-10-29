@@ -689,6 +689,78 @@ Check("invalid-utf8-config-is-rejected-without-modification", () =>
     SameSnapshot(before, parent);
 });
 
+string[] SmallArguments(string target) => [.. NewArguments(target), "--profile", "small-api"];
+string[] smallFiles = ["Catalog.cs", "Consumer.csproj", "FixtureHost.cs", "NuGet.Config", "Program.cs", "README.md", "SelfTest.cs",
+    "appsettings.graphql-only.json", "appsettings.graphql.json", "appsettings.json", "appsettings.off.json", "engine-source.json", "global.json"];
+
+Check("small-api-exact-files-determinism-and-profile-specific-validation", () =>
+{
+    var parent = Scope(); var first = Path.Combine(parent, "first"); var second = Path.Combine(parent, "second");
+    Assert(Run(SmallArguments(first)).Code == 0); Assert(Run(SmallArguments(second)).Code == 0);
+    Assert(Directory.EnumerateFiles(first).Select(Path.GetFileName).Order(StringComparer.Ordinal).SequenceEqual(smallFiles.Order(StringComparer.Ordinal)));
+    SameSnapshot(Snapshot(first), second);
+    foreach (var name in new[] { "appsettings.json", "appsettings.graphql.json", "appsettings.graphql-only.json", "appsettings.off.json" })
+    {
+        var config = Path.Combine(first, name); var before = Snapshot(first);
+        var result = Run("validate", "--profile", "small-api", "--config", config);
+        Assert(result.Code == 0 && result.Error.Length == 0);
+        using var json = JsonDocument.Parse(result.Output);
+        Assert(json.RootElement.GetProperty("profile").GetString() == "small-api");
+        SameSnapshot(before, first);
+    }
+    Assert(Run("validate", "--config", Path.Combine(first, "appsettings.json")).Code == 2,
+        "Small API config must not be silently accepted by the portable catalog.");
+});
+
+foreach (var capability in new[] { "worker", "database", "cache", "broker", "ai", "retrieval" })
+{
+    Check("small-api-pure-validation-rejects-unsupported-" + capability, () =>
+    {
+        var parent = Scope(); var target = Path.Combine(parent, "consumer"); Assert(Run(SmallArguments(target)).Code == 0);
+        var path = Path.Combine(target, "appsettings.json");
+        var config = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!;
+        config["Cehpalon"]!["Modules"]![capability] = new System.Text.Json.Nodes.JsonObject { ["Enabled"] = true };
+        File.WriteAllText(path, config.ToJsonString()); var before = Snapshot(target);
+        var result = Run("validate", "--profile", "small-api", "--config", path);
+        Assert(result.Code == 2 && result.Output.Length == 0); SameSnapshot(before, target);
+    });
+}
+
+for (var position = 1; position <= 13; position++)
+foreach (var after in new[] { false, true })
+{
+    var fault = position; var afterWrite = after;
+    Check($"small-api-write-failure-{fault}-{afterWrite}-preserves-neighbor", () =>
+    {
+        var parent = Scope(); var target = Path.Combine(parent, "consumer"); var neighbor = Path.Combine(parent, "neighbor.txt");
+        File.WriteAllText(neighbor, "unrelated bytes"); var before = Snapshot(parent);
+        var physical = new PhysicalToolingFileSystem(); var writes = 0;
+        var fs = new DelegatingFileSystem((path, bytes) =>
+        {
+            writes++;
+            if (writes == fault && !afterWrite) throw new IOException("SUPER_SECRET_FAILURE");
+            physical.WriteAllBytes(path, bytes);
+            if (writes == fault && afterWrite) throw new IOException("SUPER_SECRET_FAILURE");
+        }, physical.MoveDirectory);
+        var result = Invoke(SmallArguments(target), fs);
+        Assert(result.Code == 3 && writes == fault && !result.Error.Contains("SUPER_SECRET_FAILURE", StringComparison.Ordinal));
+        Assert(!Directory.Exists(target) && !Directory.EnumerateDirectories(parent).Any()); SameSnapshot(before, parent);
+    });
+}
+
+Check("small-api-publication-collision-keeps-outsider-bytes", () =>
+{
+    var parent = Scope(); var target = Path.Combine(parent, "consumer"); var physical = new PhysicalToolingFileSystem();
+    var fs = new DelegatingFileSystem(physical.WriteAllBytes, (stage, destination) =>
+    {
+        Directory.CreateDirectory(destination); File.WriteAllText(Path.Combine(destination, "outsider.txt"), "owned by another writer");
+        physical.MoveDirectory(stage, destination);
+    });
+    Assert(Invoke(SmallArguments(target), fs).Code == 3);
+    Assert(File.ReadAllText(Path.Combine(target, "outsider.txt")) == "owned by another writer");
+    Assert(Directory.EnumerateDirectories(parent).Single() == target && Directory.EnumerateFiles(target).Count() == 1);
+});
+
 var output = new
 {
     schemaVersion = 1,
