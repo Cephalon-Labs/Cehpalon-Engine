@@ -17,6 +17,10 @@ public sealed class OperationRegistryGenerator : IIncrementalGenerator
     private const string AttributeName = "Cehpalon.Engine.Core.OperationAttribute";
     private const string HandlerName = "Cehpalon.Engine.Core.IOperationHandler`2";
     private const string GeneratedName = "Cehpalon.Engine.Generated.OperationRegistrations";
+    private static readonly SymbolDisplayFormat TypeDisplay = SymbolDisplayFormat.FullyQualifiedFormat.WithMiscellaneousOptions(
+        SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers |
+        SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier |
+        SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
     private static readonly DiagnosticDescriptor InvalidId = Rule("CEHGEN001", "Invalid operation ID", "Operation ID must match [a-z][a-z0-9_.-]{{0,127}}; received '{0}'");
     private static readonly DiagnosticDescriptor InvalidHandler = Rule("CEHGEN002", "Unsupported operation handler", "Handler '{0}' must be a concrete non-static, non-generic class with no generic containing type");
     private static readonly DiagnosticDescriptor Inaccessible = Rule("CEHGEN003", "Type cannot be named by generated registration", "Type '{0}' must be accessible from an assembly-level generated class and cannot be file-local");
@@ -51,26 +55,36 @@ public sealed class OperationRegistryGenerator : IIncrementalGenerator
         var attribute = context.Attributes[0];
         // A syntax context contains attributes for its declaration. A partial
         // class can put another annotation on another declaration of this symbol.
-        var operationAttributes = symbol.GetAttributes().Where(a =>
-            SymbolEqualityComparer.Default.Equals(a.AttributeClass, attribute.AttributeClass)).ToArray();
+        var operationAttributeCount = 0;
+        foreach (var candidateAttribute in symbol.GetAttributes())
+            if (SymbolEqualityComparer.Default.Equals(candidateAttribute.AttributeClass, attribute.AttributeClass))
+                operationAttributeCount++;
         var id = attribute.ConstructorArguments.Length == 1 ? attribute.ConstructorArguments[0].Value as string : null;
         if (!ValidId(id)) errors.Add(Diagnostic.Create(InvalidId, location, id ?? "<null>"));
-        if (operationAttributes.Length != 1) errors.Add(Diagnostic.Create(DuplicateAttribute, location, name));
+        if (operationAttributeCount != 1) errors.Add(Diagnostic.Create(DuplicateAttribute, location, name));
         if (symbol.TypeKind != TypeKind.Class || symbol.IsAbstract || symbol.IsStatic || HasGenericContainer(symbol))
             errors.Add(Diagnostic.Create(InvalidHandler, location, name));
         if (!CanName(symbol, context.SemanticModel.Compilation, token))
             errors.Add(Diagnostic.Create(Inaccessible, location, name));
 
         var definition = context.SemanticModel.Compilation.GetTypeByMetadataName(HandlerName);
-        var contracts = symbol.AllInterfaces.Where(i => SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, definition)).ToArray();
+        INamedTypeSymbol? contract = null;
+        var contractCount = 0;
+        if (definition is not null)
+            foreach (var candidateContract in symbol.AllInterfaces)
+                if (SymbolEqualityComparer.Default.Equals(candidateContract.OriginalDefinition, definition))
+                {
+                    contract = candidateContract;
+                    contractCount++;
+                }
         string request = string.Empty, response = string.Empty;
-        if (definition is null || contracts.Length != 1)
+        if (contractCount != 1)
             errors.Add(Diagnostic.Create(InvalidContract, location, name));
         else
         {
-            request = TypeName(contracts[0].TypeArguments[0]);
-            response = TypeName(contracts[0].TypeArguments[1]);
-            foreach (var type in contracts[0].TypeArguments)
+            request = TypeName(contract!.TypeArguments[0]);
+            response = TypeName(contract.TypeArguments[1]);
+            foreach (var type in contract.TypeArguments)
                 if (!CanName(type, context.SemanticModel.Compilation, token))
                     errors.Add(Diagnostic.Create(Inaccessible, location, TypeName(type)));
         }
@@ -104,7 +118,7 @@ public sealed class OperationRegistryGenerator : IIncrementalGenerator
         if (type is IArrayTypeSymbol array) return CanName(array.ElementType, compilation, token);
         if (type is IDynamicTypeSymbol) return true;
         if (type is not INamedTypeSymbol named) return false;
-        if (named.IsUnboundGenericType || named.TypeKind == TypeKind.Error || !compilation.IsSymbolAccessibleWithin(named, compilation.Assembly)) return false;
+        if (named.IsUnboundGenericType || named.TypeKind == TypeKind.Error) return false;
         for (var current = named; current is not null; current = current.ContainingType)
             if (current.IsFileLocal || !compilation.IsSymbolAccessibleWithin(current, compilation.Assembly)) return false;
         foreach (var argument in named.TypeArguments)
@@ -112,11 +126,7 @@ public sealed class OperationRegistryGenerator : IIncrementalGenerator
         return true;
     }
 
-    private static string TypeName(ITypeSymbol type) => type.ToDisplayString(
-        SymbolDisplayFormat.FullyQualifiedFormat.WithMiscellaneousOptions(
-            SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers |
-            SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier |
-            SymbolDisplayMiscellaneousOptions.UseSpecialTypes));
+    private static string TypeName(ITypeSymbol type) => type.ToDisplayString(TypeDisplay);
 
     private static bool ValidId(string? id)
     {
@@ -148,12 +158,20 @@ public sealed class OperationRegistryGenerator : IIncrementalGenerator
             }
         // A partial symbol owns one registration; distinct symbols never merge
         // merely because their display names happen to be identical.
-        var distinct = ordered.GroupBy(c => c.Symbol, SymbolEqualityComparer.Default)
-            .Select(group => group.First()).ToArray();
-        foreach (var group in distinct.GroupBy(c => c.Id, StringComparer.Ordinal).Where(g => g.Count() > 1))
-            foreach (var candidate in group)
+        var symbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        var distinct = new List<Candidate>(ordered.Length);
+        var idCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var candidate in ordered)
+            if (symbols.Add(candidate.Symbol))
             {
-                context.ReportDiagnostic(Diagnostic.Create(DuplicateId, candidate.Location, group.Key));
+                distinct.Add(candidate);
+                idCounts.TryGetValue(candidate.Id, out var count);
+                idCounts[candidate.Id] = count + 1;
+            }
+        foreach (var candidate in distinct)
+            if (idCounts[candidate.Id] > 1)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(DuplicateId, candidate.Location, candidate.Id));
                 invalid = true;
             }
         if (reserved)

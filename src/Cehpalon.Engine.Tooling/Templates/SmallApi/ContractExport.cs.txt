@@ -81,22 +81,7 @@ internal static class ContractExport
             var files = new SortedDictionary<string,byte[]>(StringComparer.Ordinal);
             if (enabled.Contains("api")) files.Add("openapi.json", Utf8.GetBytes(OpenApi(counters).ToJsonString(Json) + "\n"));
             if (enabled.Contains("graphql"))
-            {
-                var services = new ServiceCollection();
-                services.AddLogging();
-                services.AddSingleton<ITransportOperationDispatcher>(new ForbiddenDispatcher(counters));
-                counters.GraphQLRegistrations++;
-                services.AddCehpalonGraphQL(TransportCatalog.GraphQL());
-                counters.GraphQLServices = services.Count(x => (x.ServiceType.FullName ?? "").StartsWith("HotChocolate.", StringComparison.Ordinal));
-                var provider = services.BuildServiceProvider(); counters.GraphQLProvidersCreated++;
-                try
-                {
-                    var executor = await provider.GetRequiredService<IRequestExecutorProvider>().GetExecutorAsync();
-                    counters.GraphQLSchemaBuilds++;
-                    files.Add("schema.graphql", Utf8.GetBytes(executor.Schema.ToString().Replace("\r\n", "\n").TrimEnd() + "\n"));
-                }
-                finally { await provider.DisposeAsync(); counters.GraphQLProvidersDisposed++; }
-            }
+                files.Add("schema.graphql", await GraphQLSchema(counters));
             var artifacts = files.Select(pair => new { name = pair.Key, bytes = pair.Value.LongLength,
                 sha256 = Convert.ToHexStringLower(SHA256.HashData(pair.Value)) }).ToArray();
             files.Add("manifest.json", Utf8.GetBytes(JsonSerializer.Serialize(new
@@ -114,6 +99,26 @@ internal static class ContractExport
             return 0;
         }
         catch { return Failure("export.failure", 3, counters); }
+    }
+
+    // Resolve the vendor executor only in the selected GraphQL mode, inside the
+    // original process clock. The same counters survive failures and publication.
+    private static async Task<byte[]> GraphQLSchema(ExportCounters counters)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<ITransportOperationDispatcher>(new ForbiddenDispatcher(counters));
+        counters.GraphQLRegistrations++;
+        services.AddCehpalonGraphQL(TransportCatalog.GraphQL());
+        counters.GraphQLServices = services.Count(x => (x.ServiceType.FullName ?? "").StartsWith("HotChocolate.", StringComparison.Ordinal));
+        var provider = services.BuildServiceProvider(); counters.GraphQLProvidersCreated++;
+        try
+        {
+            var executor = await provider.GetRequiredService<IRequestExecutorProvider>().GetExecutorAsync();
+            counters.GraphQLSchemaBuilds++;
+            return Utf8.GetBytes(executor.Schema.ToString().Replace("\r\n", "\n").TrimEnd() + "\n");
+        }
+        finally { await provider.DisposeAsync(); counters.GraphQLProvidersDisposed++; }
     }
 
     private static JsonObject OpenApi(ExportCounters counters)

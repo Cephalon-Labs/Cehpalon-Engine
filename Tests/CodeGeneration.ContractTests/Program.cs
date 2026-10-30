@@ -85,6 +85,56 @@ Test("no operation attributes creates no generated code", () => {var result=Run(
 Test("retained incremental driver caches unchanged candidates", () => {var first=Run(new[]{Handler()});var driver=first.Driver.RunGeneratorsAndUpdateCompilation(first.Input,out var compiled,out var diagnostics);var candidateSteps=driver.GetRunResult().Results[0].TrackedSteps["OperationCandidates"];Assert(candidateSteps.SelectMany(s=>s.Outputs).All(o=>o.Reason==IncrementalStepRunReason.Cached || o.Reason==IncrementalStepRunReason.Unchanged));Assert(Text(first)==string.Join("\n",driver.GetRunResult().GeneratedTrees.Select(t=>t.GetText().ToString())));Assert(!diagnostics.Any(d=>d.Severity==DiagnosticSeverity.Error));});
 Test("retained incremental driver refreshes changed operation id", () => {var first=Run(new[]{Handler()});var tree=first.Input.SyntaxTrees.Single();var replacement=CSharpSyntaxTree.ParseText(Handler(id:"changed.run"),(CSharpParseOptions)tree.Options,path:tree.FilePath);var changed=first.Input.ReplaceSyntaxTree(tree,replacement);var driver=first.Driver.RunGeneratorsAndUpdateCompilation(changed,out var compiled,out var diagnostics);var second=new RunResult(driver,compiled,diagnostics,changed);Valid(second);Assert(Text(second).Contains("changed.run",StringComparison.Ordinal));Assert(!Text(second).Contains("echo.run",StringComparison.Ordinal));});
 Test("generation order and culture are deterministic", () => { var previous=CultureInfo.CurrentCulture;try {CultureInfo.CurrentCulture=CultureInfo.GetCultureInfo("tr-TR");var first=Run(new[]{Handler("Zed","z.last"),Handler("Alpha","a.first")});CultureInfo.CurrentCulture=CultureInfo.GetCultureInfo("en-US");var second=Run(new[]{Handler("Alpha","a.first"),Handler("Zed","z.last")});Valid(first);Valid(second);Assert(Text(first)==Text(second));Assert(Text(first).IndexOf("a.first",StringComparison.Ordinal)<Text(first).IndexOf("z.last",StringComparison.Ordinal));Assert(!Text(first).Contains('\r'));}finally{CultureInfo.CurrentCulture=previous;} });
+Test("multiple duplicate-id groups keep deterministic diagnostic order", () =>
+{
+    var result = Run(new[] { Handler("Zed", "duplicate.a", extra: "partial"), Handler("Alpha", "duplicate.a"),
+        Handler("Beta", "duplicate.b"), Handler("Gamma", "duplicate.b"), Handler("Valid", "valid.run"),
+        "namespace Fixture { internal partial class Zed {} }" });
+    var duplicates = result.Diagnostics.Where(d => d.Id == "CEHGEN005").ToArray();
+    Assert(duplicates.Length == 4);
+    Assert(duplicates.Select(d => d.Location.SourceTree!.FilePath).SequenceEqual(new[] { "Input1.cs", "Input0.cs", "Input2.cs", "Input3.cs" }));
+    Assert(result.Driver.GetRunResult().GeneratedTrees.Length == 0);
+});
+Test("partial declaration errors precede semantic duplicate-id deduplication", () =>
+{
+    var result = Run(new[] { Handler("Peer", "duplicate.run", extra: "partial"),
+        imports + "namespace Fixture { [Operation(\"duplicate.run\")] internal partial class Peer {} }", Handler("Other", "duplicate.run") });
+    Assert(result.Diagnostics.Count(d => d.Id == "CEHGEN007") == 2, "Each annotated partial declaration must report its duplicate attribute");
+    Assert(result.Diagnostics.Count(d => d.Id == "CEHGEN005") == 2, "Each distinct symbol must report the duplicate ID exactly once");
+    Assert(result.Diagnostics.Take(2).All(d => d.Id == "CEHGEN007"), "Declaration errors must remain before duplicate-ID diagnostics");
+    Assert(result.Driver.GetRunResult().GeneratedTrees.Length == 0);
+});
+Test("retained driver changes and reverts one id among multiple handlers", () =>
+{
+    var first = Run(new[] { Handler("First", "first.run"), Handler("Second", "second.run") });
+    var tree = first.Input.SyntaxTrees.First();
+    var replacement = CSharpSyntaxTree.ParseText(Handler("First", "changed.run"), (CSharpParseOptions)tree.Options, path: tree.FilePath);
+    var changed = first.Input.ReplaceSyntaxTree(tree, replacement);
+    var driver = first.Driver.RunGeneratorsAndUpdateCompilation(changed, out var compiled, out var diagnostics);
+    var second = new RunResult(driver, compiled, diagnostics, changed); Valid(second);
+    Assert(Text(second).Contains("changed.run", StringComparison.Ordinal) && Text(second).Contains("second.run", StringComparison.Ordinal));
+    var reverted = changed.ReplaceSyntaxTree(replacement, tree);
+    driver = driver.RunGeneratorsAndUpdateCompilation(reverted, out compiled, out diagnostics);
+    var final = new RunResult(driver, compiled, diagnostics, reverted); Valid(final);
+    Assert(Text(first) == Text(final), "Reverted valid inputs must restore exact source bytes");
+});
+Test("retained driver refreshes inherited contract changed in another tree", () =>
+{
+    string Base(string type) => imports + "namespace Fixture { internal class Base : IOperationHandler<" + type + "," + type +
+        "> { public ValueTask<OperationResult<" + type + ">> HandleAsync(" + type + " request, OperationContext context, CancellationToken token) => new(OperationResult<" + type + ">.Success(request)); } }";
+    var first = Run(new[] { imports + "namespace Fixture { [Operation(\"inherited.run\")] internal sealed class Echo : Base {} }", Base("int") });
+    var tree = first.Input.SyntaxTrees.Last();
+    var replacement = CSharpSyntaxTree.ParseText(Base("string"), (CSharpParseOptions)tree.Options, path: tree.FilePath);
+    var changed = first.Input.ReplaceSyntaxTree(tree, replacement);
+    var driver = first.Driver.RunGeneratorsAndUpdateCompilation(changed, out var compiled, out var diagnostics);
+    var second = new RunResult(driver, compiled, diagnostics, changed); Valid(second);
+    Assert(Text(second).Contains("builder.Register<string, string>", StringComparison.Ordinal));
+    Assert(!Text(second).Contains("builder.Register<int, int>", StringComparison.Ordinal));
+    var reverted = changed.ReplaceSyntaxTree(replacement, tree);
+    driver = driver.RunGeneratorsAndUpdateCompilation(reverted, out compiled, out diagnostics);
+    var final = new RunResult(driver, compiled, diagnostics, reverted); Valid(final);
+    Assert(Text(first) == Text(final));
+});
 Test("pre-cancelled generator run propagates cancellation", () => {using var source=new CancellationTokenSource();source.Cancel();try {Run(new[]{Handler()},source.Token);throw new Exception("Expected cancellation");}catch(OperationCanceledException){} });
 Test("actual emitted registry stays lazy and dispatches via Core", () =>
 {
