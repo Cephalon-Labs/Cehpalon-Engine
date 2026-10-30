@@ -22,6 +22,7 @@ static class Runner
         .Split(Path.PathSeparator).Append(typeof(OperationAttribute).Assembly.Location).Distinct(StringComparer.Ordinal)
         .Select(path => MetadataReference.CreateFromFile(path)).ToArray();
     static readonly JsonSerializerOptions Json = new() { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    static readonly JsonSerializerOptions JournalJson = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     static readonly int[] Sizes = [1, 3, 32];
     static readonly string[] States = ["fresh", "noop", "edit"];
 
@@ -70,7 +71,7 @@ static class Runner
                         {
                             report.FailedAttempt = new { phase = pair < 2 ? "primer" : "measurement", size, state, variant = order[index], caseIndex,
                                 pairSequence = pair, orderInPair = index, context.Version, actualIds = context.Ids, failure = error.ToString() };
-                            raw.WriteLine(JsonSerializer.Serialize(new { failedAttempt = report.FailedAttempt }, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+                            raw.WriteLine(JsonSerializer.Serialize(new { failedAttempt = report.FailedAttempt }, JournalJson));
                             throw;
                         }
                         var row = new Measurement(size, state, order[index], caseIndex, pair, pair < 2 ? -1 : (pair - 2) / 3,
@@ -79,7 +80,7 @@ static class Runner
                             artifact.AllocatedBytes, artifact.Gc0, artifact.Gc1, artifact.Gc2, artifact.EmitSuccess,
                             context.SourceHash, Hash(artifact.Registry), artifact.PeHash, artifact.Pe.Length, artifact.Diagnostics);
                         (pair < 2 ? report.Primers : report.Measurements).Add(row);
-                        raw.WriteLine(JsonSerializer.Serialize(new { phase = pair < 2 ? "primer" : "measurement", row }, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+                        raw.WriteLine(JsonSerializer.Serialize(new { phase = pair < 2 ? "primer" : "measurement", row }, JournalJson));
                         if (!artifact.EmitSuccess) throw new InvalidOperationException("Emit or generator diagnostics failed: " + string.Join("\n", artifact.Diagnostics));
                         AssertRegistry(context, artifact.Registry);
                         if (order[index] == "generator") lastGenerator = artifact; else lastManual = artifact;
