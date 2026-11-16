@@ -70,3 +70,71 @@ public static class OperationId
         return value!;
     }
 }
+
+/// <summary>An opt-in, in-process concurrency limit shared by the operations that use this instance.</summary>
+public sealed class OperationConcurrencyBudget
+{
+    /// <summary>Generic overload result for adapters that choose to expose this budget.</summary>
+    public const string CapacityExceededCode = "operation.capacity_exceeded";
+
+    private int active;
+
+    public OperationConcurrencyBudget(int maximumConcurrentOperations)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumConcurrentOperations);
+        MaximumConcurrentOperations = maximumConcurrentOperations;
+    }
+
+    public int MaximumConcurrentOperations { get; }
+
+    /// <summary>Dispatch immediately or return a capacity failure. Admitted work holds capacity through cleanup.</summary>
+    public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest, TResponse>(
+        OperationDispatcher dispatcher, string id, TRequest request, OperationContext context,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(dispatcher);
+        OperationId.RequireValid(id);
+        ArgumentNullException.ThrowIfNull(context);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (TryEnter())
+            return DispatchAdmittedAsync<TRequest, TResponse>(dispatcher, id, request, context, cancellationToken);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(Rejected<TResponse>.Result);
+    }
+
+    private bool TryEnter()
+    {
+        var observed = Volatile.Read(ref active);
+        while (observed < MaximumConcurrentOperations)
+        {
+            var previous = Interlocked.CompareExchange(ref active, observed + 1, observed);
+            if (previous == observed)
+                return true;
+            observed = previous;
+        }
+
+        return false;
+    }
+
+    private async ValueTask<OperationResult<TResponse>> DispatchAdmittedAsync<TRequest, TResponse>(
+        OperationDispatcher dispatcher, string id, TRequest request, OperationContext context,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await dispatcher.DispatchAsync<TRequest, TResponse>(id, request, context, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref active);
+        }
+    }
+
+    private static class Rejected<T>
+    {
+        internal static readonly OperationResult<T> Result = OperationResult<T>.Failure(
+            new OperationError(CapacityExceededCode, "Operation capacity is temporarily unavailable."));
+    }
+}

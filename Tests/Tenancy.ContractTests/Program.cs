@@ -139,6 +139,30 @@ await Check("parallel-tenant-invocations-have-independent-contexts",async()=>
     var results=await Task.WhenAll(Enumerable.Range(0,40).Select(async i=>await dispatcher.DispatchAsync<Request,int>("document.read",new(i%2==0?"A":"B","shared"),new("parallel"))));
     Assert(results.Where((_,i)=>i%2==0).All(x=>x.IsSuccess&&x.Value==10)&&results.Where((_,i)=>i%2!=0).All(x=>x.IsSuccess&&x.Value==20)&&f.Created==40&&f.Disposed==40);
 });
+await Check("shared-budget-keeps-unauthorized-denial-and-skips-authorized-factory-at-capacity", async () =>
+{
+    var budget = new OperationConcurrencyBudget(1);
+    var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var holder = new OperationDispatcher(new OperationRegistryBuilder()
+        .Register<int, int>("capacity.hold", () => new HoldingOperation(gate.Task)).Build());
+    var pending = budget.DispatchAsync<int, int>(holder, "capacity.hold", 1, new("held")).AsTask();
+    try
+    {
+        var f = new Fixture();
+        var protectedDispatcher = f.Build(budget);
+        AssertDenied(await protectedDispatcher.DispatchAsync<Request, int>("document.read", new("B", "shared"), new("blocked")), f);
+        var result = await protectedDispatcher.DispatchAsync<Request, int>("document.read", new("A", "shared"), new("full"));
+        Assert(result.Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+        Assert(f.Created == 0 && f.IdentityCalls == 2 && f.MembershipCalls == 2 && f.PolicyCalls == 1);
+        gate.SetResult();
+        Assert((await pending).IsSuccess);
+        Assert((await protectedDispatcher.DispatchAsync<Request, int>("document.read", new("A", "shared"), new("available"))).Value == 10);
+        Assert(f.Created == 1 && f.Disposed == 1 && f.IdentityCalls == 3 && f.MembershipCalls == 3 && f.PolicyCalls == 2);
+    }
+    finally { gate.TrySetResult(); }
+});
+await Check("budget-does-not-queue-and-keeps-permits-during-cleanup", BudgetChecks.ConcurrentCleanup);
+await Check("budget-releases-permits-after-factory-fault-and-cancellation", BudgetChecks.FailureRecovery);
 await Check("business-failure-result-is-preserved-and-owned-handler-disposed",async()=>
 {var f=new Fixture{BusinessFailure=true};var result=await f.Call();Assert(!result.IsSuccess&&result.Error.Code=="business.invalid"&&f.Disposed==1);});
 await Check("unexpected-handler-and-cleanup-faults-both-preserved",async()=>
@@ -192,8 +216,13 @@ sealed class Fixture:IIdentitySource,ITenantMembershipSource,IResourceScopeSourc
     public string? ScopeMismatch,LastLookupTenant,LastHandledTenant,LastHandledNested;public TenantOperationContext? Captured;
     public readonly Dictionary<string,Action> Hooks=new(StringComparer.Ordinal);
     public void Hook(string at) { if(Hooks.TryGetValue(at,out var action)) action(); }
-    public TenantOperationDispatcher Build()=>new(new TenantOperationRegistryBuilder().Register<Request,int>("document.read","document.read","document",x=>x.Copy(),x=>new(new(x.Tenant),x.Id),()=>
-    {Interlocked.Increment(ref Created);Hook("factory");return NullHandler?null!:new Handler(this);}).Build(),new(this,Trust,this,this,TimeSpan.FromSeconds(30),DefaultPolicy?null:this,Clock));
+    public TenantOperationDispatcher Build(OperationConcurrencyBudget? budget = null)
+    {
+        var registry = new TenantOperationRegistryBuilder().Register<Request,int>("document.read","document.read","document",x=>x.Copy(),x=>new(new(x.Tenant),x.Id),()=>
+        {Interlocked.Increment(ref Created);Hook("factory");return NullHandler?null!:new Handler(this);}).Build();
+        var security = new TenantSecurityServices(this,Trust,this,this,TimeSpan.FromSeconds(30),DefaultPolicy?null:this,Clock);
+        return budget is null ? new(registry, security) : new(registry, security, budget);
+    }
     public ValueTask<OperationResult<int>> Call(Request? request=null,OperationContext? context=null,CancellationToken token=default)=>Build().DispatchAsync<Request,int>("document.read",request??new("A","shared"),context??new("fixture"),token);
     public async ValueTask<IdentitySnapshot?> ResolveAsync(CancellationToken token)
     {Interlocked.Increment(ref IdentityCalls);Hook("identity");await Task.Yield();return Anonymous?null:IdentityOverride??new(Principal,"fixture",Now.AddMinutes(-1),Now.AddHours(1));}

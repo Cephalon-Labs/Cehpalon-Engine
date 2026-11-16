@@ -12,6 +12,8 @@ var outputArgument = args.SingleOrDefault(a => a.StartsWith("--output=", StringC
     ?? throw new ArgumentException("--output=<new-file.json> is required");
 var outputPath = Path.GetFullPath(outputArgument[9..]);
 if (File.Exists(outputPath)) throw new IOException("Preserve previous results; choose a new output path.");
+if (args.Contains("--observe-dispatch-budget", StringComparer.Ordinal))
+    return await DispatchBudgetObservation.RunAsync(outputPath);
 var context = new OperationContext("w1-component-benchmark");
 var dispatcher = new OperationDispatcher(new OperationRegistryBuilder()
     .Register<int,int>("bench.echo", () => new EchoHandler()).Build());

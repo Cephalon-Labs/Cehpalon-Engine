@@ -57,14 +57,20 @@ public sealed class TenantOperationDispatcher
 {
     private readonly TenantOperationRegistry registry;
     private readonly TenantSecurityServices services;
+    private readonly OperationConcurrencyBudget? budget;
     public TenantOperationDispatcher(TenantOperationRegistry registry,TenantSecurityServices services)
     { this.registry=registry??throw new ArgumentNullException(nameof(registry)); this.services=services??throw new ArgumentNullException(nameof(services)); }
+
+    /// <summary>Apply a shared capacity budget after fresh authorization and through owned-handler cleanup.</summary>
+    public TenantOperationDispatcher(TenantOperationRegistry registry, TenantSecurityServices services, OperationConcurrencyBudget budget)
+        : this(registry, services) => this.budget = budget ?? throw new ArgumentNullException(nameof(budget));
+
     public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest,TResponse>(string operationId,TRequest request,OperationContext correlation,CancellationToken cancellationToken=default)
     {
         OperationId.RequireValid(operationId); ArgumentNullException.ThrowIfNull(correlation); cancellationToken.ThrowIfCancellationRequested();
         if(!registry.TryGet(operationId,out var registration)) return ValueTask.FromResult(OperationResult<TResponse>.Failure(new("operation.not_found","The requested operation is not registered.")));
         if(registration is not TenantRegistration<TRequest,TResponse> typed) return ValueTask.FromResult(OperationResult<TResponse>.Failure(new("operation.contract_mismatch","The requested operation does not use these request/response contracts.")));
-        return typed.DispatchAsync(request,correlation,services,cancellationToken);
+        return typed.DispatchAsync(request,correlation,services,budget,cancellationToken);
     }
 }
 
@@ -82,7 +88,8 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         this.operationId=operationId; this.action=action; this.kind=kind; this.freeze=freeze; this.select=select;
         core=new(new OperationRegistryBuilder().Register<AuthorizedInvocation,TResponse>(operationId,()=>new HandlerBridge(factory,origin,operationId)).Build());
     }
-    internal async ValueTask<OperationResult<TResponse>> DispatchAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,CancellationToken token)
+    internal async ValueTask<OperationResult<TResponse>> DispatchAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
+        OperationConcurrencyBudget? budget,CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         var frozen=freeze(request);
@@ -109,7 +116,14 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         if(maximum<expires) expires=maximum;
         using var lease=new AuthorizationLease(services.TimeProvider,now,expires);
         var context=new TenantOperationContext(access,correlation,lease,origin);
-        try { return await core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId,new(frozen,context),correlation,token).ConfigureAwait(false); }
+        try
+        {
+            var invocation = new AuthorizedInvocation(frozen, context);
+            var work = budget is null
+                ? core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId, invocation, correlation, token)
+                : budget.DispatchAsync<AuthorizedInvocation,TResponse>(core, operationId, invocation, correlation, token);
+            return await work.ConfigureAwait(false);
+        }
         catch(TenantAccessDeniedException) { return Denied(); }
     }
     private static bool ValidMembership(IdentitySnapshot identity,TenantId tenant,TenantMembershipSnapshot? membership,DateTimeOffset now)

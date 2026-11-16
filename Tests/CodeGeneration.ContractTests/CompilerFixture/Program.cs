@@ -19,6 +19,10 @@ try
 }
 catch (OperationCanceledException) { }
 if (factory.Calls != 1) throw new InvalidOperationException("Cancellation created a handler");
+var budget = new OperationConcurrencyBudget(1);
+var bounded = await budget.DispatchAsync<EchoRequest, EchoReply>(dispatcher, "fixture.echo", new("bounded"), new("consumer"));
+if (!bounded.IsSuccess || bounded.Value.Text != "bounded:injected" || factory.Calls != 2 || EchoHandler.Disposed != 2)
+    throw new InvalidOperationException("Generated dispatch through the concurrency budget failed");
 Console.WriteLine(JsonSerializer.Serialize(new { passed = true, handler_factory_calls = factory.Calls, handler_disposals = EchoHandler.Disposed, result = result.Value.Text, scope = "Actual SDK compiler analyzer load, generated typed registration and Core dispatch; no transport or hosted CI proof" }));
 
 internal sealed record EchoRequest(string Text);
