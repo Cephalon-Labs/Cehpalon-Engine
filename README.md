@@ -1,6 +1,6 @@
 # Cehpalon Engine
 
-Private MIT-licensed .NET engine program. Baseline: 2026-10-27.
+MIT-licensed .NET engine program. Baseline: 2026-10-27.
 
 Goal: a small host-agnostic core with optional modules, reusable business handlers and configuration-selected supported transports, topology and capability profiles.
 
