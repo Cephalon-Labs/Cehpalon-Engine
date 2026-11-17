@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Cehpalon.Engine.Core;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -12,6 +13,84 @@ namespace PortableConsumers.Generated;
 
 public static class SelfTest
 {
+public static async Task<int> RunCapacity(string output)
+{
+    output = Path.GetFullPath(output);
+    if (File.Exists(output)) throw new IOException("Use a new report path.");
+    using var tls = new TlsFixture();
+    using var jwt = new JwtFixture();
+    await using var host = new FixtureHost();
+    var configuration = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "appsettings.graphql.json"), Encoding.UTF8);
+    await host.Start(configuration, tls, jwt, maximumConcurrentOperations: 1);
+    using var client = tls.Client(host.Address);
+    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+    var store = host.Store;
+    var release = CatalogStore.NewSignal();
+    store.WriteRelease = release;
+    store.DelayWrites = true;
+
+    async Task<(HttpStatusCode Status, string? Code)> Post(string path, object body, string subject, bool graphQL = false)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = JsonContent.Create(body) };
+        request.Headers.Authorization = new("Bearer", jwt.Token(subject));
+        using var response = await client.SendAsync(request, deadline.Token);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(deadline.Token));
+        var root = json.RootElement;
+        string? code = graphQL
+            ? root.TryGetProperty("errors", out var errors) ? errors[0].GetProperty("extensions").GetProperty("code").GetString() : null
+            : root.TryGetProperty("code", out var value) ? value.GetString() : null;
+        return (response.StatusCode, code);
+    }
+
+    Task<(HttpStatusCode Status, string? Code)> Read(string subject, string tenant, bool graphQL)
+    {
+        var input = new GetItem(tenant, 1);
+        return graphQL
+            ? Post("/graphql", new { query = "query($input:GetItemInput!){catalogItem(input:$input){id}}", variables = new { input } }, subject, true)
+            : Post("/api/catalog/get", input, subject);
+    }
+
+    var pending = Post("/api/catalog/set", new SetLabel("tenant-a", 1, 0, "held"), "alice");
+    try
+    {
+        await store.WriteEntered.Task.WaitAsync(deadline.Token);
+        foreach (var graphQL in new[] { false, true })
+        {
+            var denial = graphQL ? HttpStatusCode.OK : HttpStatusCode.Forbidden;
+            if (await Read("alice", "tenant-b", graphQL) != (denial, "access.denied")
+                || await Read("bob", "tenant-a", graphQL) != (denial, "access.denied"))
+                throw new InvalidOperationException("Tenant denial changed under saturation.");
+            var overload = graphQL ? HttpStatusCode.OK : HttpStatusCode.ServiceUnavailable;
+            if (await Read("alice", "tenant-a", graphQL) != (overload, OperationConcurrencyBudget.CapacityExceededCode))
+                throw new InvalidOperationException("The transport did not share the host budget.");
+        }
+        if (store.Factories != 1 || store.Reads != 0 || store.Writes != 0 || store.Disposals != 0)
+            throw new InvalidOperationException("Rejected work reached business or the held operation ended prematurely.");
+    }
+    finally
+    {
+        release.TrySetResult();
+        await pending;
+    }
+    if (await pending != (HttpStatusCode.OK, null)
+        || await Read("alice", "tenant-a", graphQL: true) != (HttpStatusCode.OK, null))
+        throw new InvalidOperationException("An operation failed after releasing capacity.");
+    await host.DisposeAsync();
+    if (store.Factories != 2 || store.Disposals != 2 || store.Reads != 1 || store.Writes != 1
+        || host.Counters.HostDisposals != 1 || host.Counters.ForbiddenFactories != 0)
+        throw new InvalidOperationException("The admitted work and host did not clean up exactly once.");
+
+    Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+    await using var file = new FileStream(output, FileMode.CreateNew, FileAccess.Write);
+    await JsonSerializer.SerializeAsync(file, new
+    {
+        status = "passed", maximumConcurrentOperations = 1,
+        saturated = new { http = 503, graphQL = 200, code = OperationConcurrencyBudget.CapacityExceededCode },
+        crossTenantDenials = 4, store = new { store.Factories, store.Disposals, store.Reads, store.Writes }
+    });
+    return 0;
+}
+
 public static async Task<int> Run(string output)
 {
 output=Path.GetFullPath(output);

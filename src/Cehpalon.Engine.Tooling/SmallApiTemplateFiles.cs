@@ -130,6 +130,12 @@ algorithm RS256 and type at+jwt; validated subject alice has tenant-a membership
 bob has tenant-b. Both tenants share IDs in the bounded synthetic memory store.
 Membership/resource/policy are fresh fixture authority, not real provider integration.
 Caller tenant/role/subject headers and Core correlation metadata grant no authority.
+Optional --max-concurrent-operations <positive-int> on --serve sets one in-process
+business-handler limit shared by the enabled HTTP and GraphQL entrypoints. Admission
+follows tenant authorization and capacity is held through handler cleanup. Full
+capacity returns operation.capacity_exceeded. Run --self-test-capacity --output
+<new-report.json> for the bounded protected HTTPS fixture.
+
 Type `stop` followed by Enter, or Ctrl+C, for awaited listener/handler cleanup and
 a stopped JSON report. Redirected stdin EOF alone keeps the host alive without
 polling; an explicit stop command or Ctrl+C remains necessary.

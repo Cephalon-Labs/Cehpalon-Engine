@@ -40,6 +40,7 @@ public sealed class CatalogStore : IResourceScopeSource
     public int Factories, Constructors, Reads, Writes, Disposals;
     public bool WrongOwner, Revoked, MissingPolicy, DelayWrites;
     public TaskCompletionSource WriteEntered = NewSignal(), CancelObserved = NewSignal();
+    public TaskCompletionSource? WriteRelease { get; set; }
     public static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
     public CatalogStore()
     {
@@ -71,7 +72,11 @@ public sealed class CatalogStore : IResourceScopeSource
         if (DelayWrites)
         {
             WriteEntered.TrySetResult();
-            try { await Task.Delay(TimeSpan.FromSeconds(5),ct); }
+            try
+            {
+                if (WriteRelease is { } release) await release.Task.WaitAsync(ct);
+                else await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            }
             catch(OperationCanceledException) { CancelObserved.TrySetResult(); throw; }
         }
         ct.ThrowIfCancellationRequested();

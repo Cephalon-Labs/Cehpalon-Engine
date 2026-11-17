@@ -59,7 +59,7 @@ public sealed class ValidatedIdentity(HttpContext http) : IIdentitySource
     }
 }
 
-public sealed class SampleDispatcher(CatalogStore store) : ITransportOperationDispatcher
+public sealed class SampleDispatcher(CatalogStore store, OperationConcurrencyBudget? budget) : ITransportOperationDispatcher
 {
     public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest,TResponse>(HttpContext http,string id,TRequest request,OperationContext context,CancellationToken ct)
     {
@@ -69,7 +69,9 @@ public sealed class SampleDispatcher(CatalogStore store) : ITransportOperationDi
             .Register<ListItems,ItemPage>("catalog.list","catalog.list","catalog",r=>r with{},r=>new(new(r.Tenant),"catalog"),Factory)
             .Register<SetLabel,Item>("catalog.set","catalog.set","catalog",r=>r with{},r=>new(new(r.Tenant),"catalog"),Factory).Build();
         var services=new TenantSecurityServices(new ValidatedIdentity(http),new IdentityTrustPolicy([JwtFixture.Issuer],[JwtBearerDefaults.AuthenticationScheme]),new Memberships(store),store,TimeSpan.FromSeconds(30),store.MissingPolicy?null:new CatalogPolicy());
-        var tenant=new TenantOperationDispatcher(registry,services);
+        var tenant = budget is null
+            ? new TenantOperationDispatcher(registry, services)
+            : new TenantOperationDispatcher(registry, services, budget);
         var core=new OperationRegistryBuilder();
         Cehpalon.Engine.Generated.OperationRegistrations.RegisterAll(core,new GatewayFactory(tenant));
         return new OperationDispatcher(core.Build()).DispatchAsync<TRequest,TResponse>(id,request,context,ct);
@@ -121,7 +123,8 @@ public sealed class FixtureHost : IAsyncDisposable
     public Uri Address=>new(Application!.Urls.Single());
     private ActivationLease? lease;
     public static string Config(bool api,bool graphql,bool worker=false)=>System.Text.Json.JsonSerializer.Serialize(new{Cehpalon=new{SchemaVersion=1,Architecture="Modular",Topology="SingleProcess",Pattern="RequestReply",Modules=new{api=new{Enabled=api},graphql=new{Enabled=graphql},worker=new{Enabled=worker}}}});
-    public Task Start(string configuration,TlsFixture tls,JwtFixture jwt) => Start(configuration,tls.Server,jwt.PublicKey);
+    public Task Start(string configuration, TlsFixture tls, JwtFixture jwt, int? maximumConcurrentOperations = null) =>
+        Start(configuration, tls.Server, jwt.PublicKey, maximumConcurrentOperations);
     public static ActivationPlan Compile(string configuration)
     {
         var descriptors=new List<ModuleDescriptor>{new("host",ModuleRole.Support),new("api",ModuleRole.EntryPoint,["host"]),new("graphql",ModuleRole.EntryPoint,["host"])};
@@ -132,8 +135,11 @@ public sealed class FixtureHost : IAsyncDisposable
         if(plan.ActivationOrder.Any(x=>x is not("host" or "api" or "graphql"))) throw new ArgumentException("Unsupported sample capability.");
         return plan;
     }
-    public async Task Start(string configuration,X509Certificate2 certificate,SecurityKey publicKey)
+    public async Task Start(string configuration, X509Certificate2 certificate, SecurityKey publicKey,
+        int? maximumConcurrentOperations = null)
     {
+        if (maximumConcurrentOperations is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumConcurrentOperations));
         var plan=Compile(configuration);
         var enabled=plan.ActivationOrder.ToHashSet(StringComparer.Ordinal);
         var registrations=new List<ModuleRegistration>();
@@ -144,7 +150,8 @@ public sealed class FixtureHost : IAsyncDisposable
             var builder=WebApplication.CreateSlimBuilder(new WebApplicationOptions{Args=[],EnvironmentName="Production"});
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(k=>k.Listen(IPAddress.Loopback,0,l=>{l.Protocols=HttpProtocols.Http1;l.UseHttps(certificate);}));
-            builder.Services.AddSingleton<ITransportOperationDispatcher>(new SampleDispatcher(Store));
+            var budget = maximumConcurrentOperations is int limit ? new OperationConcurrencyBudget(limit) : null;
+            builder.Services.AddSingleton<ITransportOperationDispatcher>(new SampleDispatcher(Store, budget));
             builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o=>
             {
                 o.MapInboundClaims=false;o.IncludeErrorDetails=false;
