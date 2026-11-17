@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
@@ -15,7 +16,9 @@ async Task Check(string name, Func<Task> action)
 { try { await action(); checks.Add(new { name, passed = true }); } catch (Exception error) { failed++; checks.Add(new { name, passed = false, error = error.ToString() }); } }
 Task Sync(Action action) { action(); return Task.CompletedTask; }
 OperationBinding<Request,Response> binding = new("catalog.read", request => request.Tenant is "A" or "B" && request.Id >= 0 ? null : new("bad.validation", "private validation detail"));
-var builder = new GraphQLOperationCatalog.Builder().AddQuery("catalogItem", binding).AddMutation("setLabel", binding);
+OperationBinding<Request,Response> budgetBinding = new("catalog.budget", _ => null);
+var builder = new GraphQLOperationCatalog.Builder().AddQuery("catalogItem", binding).AddMutation("setLabel", binding)
+    .AddQuery("budgetedItem", budgetBinding);
 var catalog = builder.Build();
 await Check("catalog-preflight-does-not-register-graphql-or-activate-business", () => Sync(() =>
 {
@@ -44,6 +47,7 @@ application.Use(async (http, next) =>
     await next(http);
 });
 application.MapCehpalonGraphQL();
+application.MapPost("/budget", (HttpContext http) => OperationHttpAdapter.ExecuteAsync(http, budgetBinding));
 await application.StartAsync();
 var url = application.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
 using var client = new HttpClient { BaseAddress = new Uri(url) };
@@ -72,6 +76,38 @@ await Check("access-denial-is-generic-semantic-graphql-error",async () =>
 { Fixture.Reset();var r=await Post(Query(1,"B"));Assert(r.Status==200 && Code(r.Body)=="access.denied" && !r.Body.Contains("tenant B secret"),r.Body); });
 await Check("domain-error-code-is-preserved",async () =>
 { Fixture.Reset();var r=await Post(Query(2));Assert(r.Status==200 && Code(r.Body)=="catalog.conflict",r.Body); });
+await Check("reserved-capacity-message-is-generic-in-graphql", async () =>
+{
+    var response = await Post(Query(7));
+    Assert(response.Status == 200 && Code(response.Body) == OperationConcurrencyBudget.CapacityExceededCode, response.Body);
+    Assert(!response.Body.Contains("private"), response.Body);
+});
+await Check("http-and-graphql-share-actual-budget-and-admit-after-release", async () =>
+{
+    var fixture = (Fixture)application.Services.GetRequiredService<ITransportOperationDispatcher>();
+    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+    const string query = "{budgetedItem(input:{tenant:\"A\",id:2}){id}}";
+    var held = client.PostAsJsonAsync("/budget", new Request("A", 1), deadline.Token);
+    try
+    {
+        await fixture.BudgetEntered.Task.WaitAsync(deadline.Token);
+        using var http = await client.PostAsJsonAsync("/budget", new Request("A", 2), deadline.Token);
+        Assert(http.StatusCode == HttpStatusCode.ServiceUnavailable);
+        using var problem = JsonDocument.Parse(await http.Content.ReadAsStringAsync(deadline.Token));
+        Assert(problem.RootElement.GetProperty("code").GetString() == OperationConcurrencyBudget.CapacityExceededCode);
+        var saturated = await Post(Envelope(query)).WaitAsync(deadline.Token);
+        Assert(saturated.Status == 200 && Code(saturated.Body) == OperationConcurrencyBudget.CapacityExceededCode, saturated.Body);
+        Assert(fixture.BudgetFactories == 1);
+    }
+    finally
+    {
+        fixture.BudgetRelease.TrySetResult();
+        using var admitted = await held;
+        Assert(admitted.StatusCode == HttpStatusCode.OK);
+    }
+    var recovered = await Post(Envelope(query)).WaitAsync(deadline.Token);
+    Assert(recovered.Status == 200 && !recovered.Body.Contains("errors") && fixture.BudgetFactories == 2, recovered.Body);
+});
 foreach(var id in new[]{3,4,6})
 await Check("unexpected-fault-is-safe-internal-error-"+id,async () =>
 { Fixture.Reset();var r=await Post(Query(id));Assert(r.Status==200 && Code(r.Body)=="internal.error" && !r.Body.Contains("secret") && !r.Body.Contains("exception",StringComparison.OrdinalIgnoreCase),r.Body); });
@@ -129,16 +165,49 @@ public sealed record Request(string Tenant,int Id);
 public sealed record Response(string Tenant,int Id,string Label,Response? Child=null);
 public sealed class Fixture : ITransportOperationDispatcher
 {
+    private readonly OperationConcurrencyBudget budget = new(1);
+    private readonly OperationDispatcher dispatcher;
+    public TaskCompletionSource BudgetEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource BudgetRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public int BudgetFactories { get; private set; }
+
+    public Fixture()
+    {
+        dispatcher = new(new OperationRegistryBuilder().Register<Request, Response>("catalog.budget", () =>
+        {
+            BudgetFactories++;
+            return new BudgetedOperation(this);
+        }).Build());
+    }
+
+    private sealed class BudgetedOperation(Fixture fixture) : IOperationHandler<Request, Response>
+    {
+        public async ValueTask<OperationResult<Response>> HandleAsync(Request request, OperationContext context, CancellationToken token)
+        {
+            if (request.Id == 1)
+            {
+                fixture.BudgetEntered.TrySetResult();
+                await fixture.BudgetRelease.Task.WaitAsync(token);
+            }
+            return OperationResult<Response>.Success(new(request.Tenant, request.Id, "budgeted"));
+        }
+    }
+
     public static int Calls; public static string LastOperation=""; public static int CorrelationLength;
     public static TaskCompletionSource Entered=new(TaskCreationOptions.RunContinuationsAsynchronously), Cancelled=new(TaskCreationOptions.RunContinuationsAsynchronously);
     public static void Reset(){Calls=0;LastOperation="";CorrelationLength=0;Entered=new(TaskCreationOptions.RunContinuationsAsynchronously);Cancelled=new(TaskCreationOptions.RunContinuationsAsynchronously);}
     public async ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest,TResponse>(HttpContext httpContext,string operationId,TRequest request,OperationContext operationContext,CancellationToken cancellationToken)
     {
+        if (operationId == "catalog.budget")
+            return await budget.DispatchAsync<TRequest, TResponse>(dispatcher, operationId, request,
+                operationContext, cancellationToken);
         Interlocked.Increment(ref Calls);LastOperation=operationId;CorrelationLength=operationContext.CorrelationId.Length;
         var input=(Request)(object)request!;
         if(input.Tenant=="B") return OperationResult<TResponse>.Failure(new("access.denied","tenant B secret"));
         if(input.Id==2) return OperationResult<TResponse>.Failure(new("catalog.conflict","Revision conflict."));
         if(input.Id==3) throw new InvalidOperationException("secret exception");
+        if(input.Id==7) return OperationResult<TResponse>.Failure(new(
+            OperationConcurrencyBudget.CapacityExceededCode, "private capacity details"));
         if(input.Id==4) throw new OperationCanceledException("secret cancelled but request active");
         if(input.Id==6) throw new HotChocolate.GraphQLException(HotChocolate.ErrorBuilder.New().SetMessage("secret GraphQL exception").SetExtension("private","secret").Build());
         if(input.Id==5){Entered.TrySetResult();try{await Task.Delay(Timeout.InfiniteTimeSpan,cancellationToken);}catch(OperationCanceledException){Cancelled.TrySetResult();throw;}}

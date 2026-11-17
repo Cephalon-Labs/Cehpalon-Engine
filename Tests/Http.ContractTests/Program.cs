@@ -205,6 +205,20 @@ await Check("denial-has-generic-problem-and-no-owner-detail", async () =>
     await OperationHttpAdapter.ExecuteAsync(context, binding);
     Assert(context.Response.StatusCode == 403 && Body(context).Contains("Access denied.") && !Body(context).Contains("secret"));
 });
+await Check("capacity-error-is-generic-service-unavailable", async () =>
+{
+    var probe = new Probe
+    {
+        ResultError = new OperationError(OperationConcurrencyBudget.CapacityExceededCode, "private ceiling and queue details")
+    };
+    var context = Context(probe: probe);
+    await OperationHttpAdapter.ExecuteAsync(context, binding);
+    using var json = JsonDocument.Parse(Body(context));
+    Assert(context.Response.StatusCode == 503 && json.RootElement.GetProperty("status").GetInt32() == 503);
+    Assert(json.RootElement.GetProperty("code").GetString() == OperationConcurrencyBudget.CapacityExceededCode);
+    Assert(!Body(context).Contains("private"));
+    Assert(!context.Response.Headers.ContainsKey("Retry-After"));
+});
 await Check("intentional-business-errors-have-explicit-status", async () =>
 {
     foreach (var (code, status) in new[] { ("resource.not_found", 404), ("resource.conflict", 409), ("catalog.failure", 422), ("validation.failed", 400) })

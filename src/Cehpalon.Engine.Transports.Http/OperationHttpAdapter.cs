@@ -149,8 +149,7 @@ public static class OperationHttpAdapter
             }
             else
             {
-                var error = result.Error;
-                if (error.Code == TransportErrors.AccessDeniedCode) error = TransportErrors.AccessDenied();
+                var error = TransportErrors.ForClient(result.Error);
                 await WriteErrorAsync(context, ErrorStatusCode(error), error);
             }
         }
@@ -170,6 +169,7 @@ public static class OperationHttpAdapter
             TransportErrors.ValidationCode => 400,
             "resource.not_found" => 404,
             "resource.conflict" => 409,
+            OperationConcurrencyBudget.CapacityExceededCode => 503,
             TransportErrors.InternalCode => 500,
             _ => 422
         };

@@ -95,7 +95,7 @@ public sealed class GraphQLOperationCatalog
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
             catch { throw Error(TransportErrors.InternalError()); }
             // Only adapter-created protocol errors are emitted; exceptions from host components are always sanitized.
-            return result.IsSuccess ? result.Value : throw Error(result.Error.Code == TransportErrors.AccessDeniedCode ? TransportErrors.AccessDenied() : result.Error);
+            return result.IsSuccess ? result.Value : throw Error(TransportErrors.ForClient(result.Error));
         }
 
         private static GraphQLException Error(OperationError error) => new(ErrorBuilder.New()

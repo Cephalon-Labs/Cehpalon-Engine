@@ -39,4 +39,15 @@ public static class TransportErrors
     public static OperationError ValidationFailed() => new(ValidationCode, "Request validation failed.");
     public static OperationError AccessDenied() => new(AccessDeniedCode, "Access denied.");
     public static OperationError InternalError() => new(InternalCode, "An internal error occurred.");
+
+    private static readonly OperationError CapacityUnavailable = new(
+        OperationConcurrencyBudget.CapacityExceededCode, "Operation capacity is temporarily unavailable.");
+
+    /// <summary>Use fixed public messages for reserved authority and capacity failures.</summary>
+    public static OperationError ForClient(OperationError error) => error.Code switch
+    {
+        AccessDeniedCode => AccessDenied(),
+        OperationConcurrencyBudget.CapacityExceededCode => CapacityUnavailable,
+        _ => error
+    };
 }
