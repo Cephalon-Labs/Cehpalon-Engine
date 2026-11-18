@@ -77,7 +77,10 @@ public sealed class OperationConcurrencyBudget
     /// <summary>Generic overload result for adapters that choose to expose this budget.</summary>
     public const string CapacityExceededCode = "operation.capacity_exceeded";
 
-    private int active;
+    private const int Closed = int.MinValue;
+    // The sign bit closes admissions; the remaining bits hold the active count.
+    private int admission;
+    private TaskCompletionSource? drained;
 
     public OperationConcurrencyBudget(int maximumConcurrentOperations)
     {
@@ -86,6 +89,19 @@ public sealed class OperationConcurrencyBudget
     }
 
     public int MaximumConcurrentOperations { get; }
+
+    /// <summary>Close admissions permanently and wait until all admitted operations finish cleanup.</summary>
+    /// <remarks>Cancellation only cancels this wait. Admitted work continues and admissions stay closed.</remarks>
+    public Task DrainAsync(CancellationToken cancellationToken = default)
+    {
+        var completion = LazyInitializer.EnsureInitialized(ref drained,
+            static () => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        var previous = Interlocked.Or(ref admission, Closed);
+        if (previous is 0 or Closed)
+            completion.TrySetResult();
+
+        return completion.Task.WaitAsync(cancellationToken);
+    }
 
     /// <summary>Dispatch immediately or return a capacity failure. Admitted work holds capacity through cleanup.</summary>
     public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest, TResponse>(
@@ -105,10 +121,10 @@ public sealed class OperationConcurrencyBudget
 
     private bool TryEnter()
     {
-        var observed = Volatile.Read(ref active);
-        while (observed < MaximumConcurrentOperations)
+        var observed = Volatile.Read(ref admission);
+        while (observed >= 0 && observed < MaximumConcurrentOperations)
         {
-            var previous = Interlocked.CompareExchange(ref active, observed + 1, observed);
+            var previous = Interlocked.CompareExchange(ref admission, observed + 1, observed);
             if (previous == observed)
                 return true;
             observed = previous;
@@ -128,7 +144,8 @@ public sealed class OperationConcurrencyBudget
         }
         finally
         {
-            Interlocked.Decrement(ref active);
+            if (Interlocked.Decrement(ref admission) == Closed)
+                Volatile.Read(ref drained)!.TrySetResult();
         }
     }
 

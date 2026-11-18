@@ -165,6 +165,8 @@ await Check("budget-does-not-queue-and-keeps-permits-during-cleanup", BudgetChec
 await Check("budget-releases-permits-after-factory-fault-and-cancellation", BudgetChecks.FailureRecovery);
 await Check("tenant-budget-is-shared-while-tenant-cleanup-retains-capacity", BudgetChecks.TenantLimits);
 await Check("tenant-budget-recovers-from-factory-cancellation-and-cleanup-fault", BudgetChecks.TenantFailureRecovery);
+await Check("core-budget-drain-closes-spare-capacity-and-waits-through-cleanup", BudgetChecks.DrainCore);
+await Check("tenant-budget-drain-preserves-fresh-authorization-and-independent-waits", BudgetChecks.DrainTenants);
 await Check("business-failure-result-is-preserved-and-owned-handler-disposed",async()=>
 {var f=new Fixture{BusinessFailure=true};var result=await f.Call();Assert(!result.IsSuccess&&result.Error.Code=="business.invalid"&&f.Disposed==1);});
 await Check("unexpected-handler-and-cleanup-faults-both-preserved",async()=>

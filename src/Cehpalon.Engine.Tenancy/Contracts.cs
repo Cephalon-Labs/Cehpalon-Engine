@@ -159,6 +159,7 @@ public sealed class TenantOperationConcurrencyBudget
     private readonly object gate = new();
     private readonly Dictionary<TenantId, int> activeByTenant = new();
     private int active;
+    private TaskCompletionSource? drained;
 
     public TenantOperationConcurrencyBudget(int maximumConcurrentOperations, int maximumConcurrentOperationsPerTenant)
     {
@@ -171,6 +172,23 @@ public sealed class TenantOperationConcurrencyBudget
 
     public int MaximumConcurrentOperations { get; }
     public int MaximumConcurrentOperationsPerTenant { get; }
+
+    /// <summary>Close all tenant admissions permanently and wait until admitted cleanup completes.</summary>
+    /// <remarks>Cancellation only cancels this wait. Admitted work continues and admissions stay closed.</remarks>
+    public Task DrainAsync(CancellationToken cancellationToken = default)
+    {
+        Task completion;
+        lock (gate)
+        {
+            drained ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (active == 0)
+                drained.TrySetResult();
+
+            completion = drained.Task;
+        }
+
+        return completion.WaitAsync(cancellationToken);
+    }
 
     internal async ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest, TResponse>(
         TenantId authorizedTenant, OperationDispatcher dispatcher, string operationId, TRequest request,
@@ -197,7 +215,8 @@ public sealed class TenantOperationConcurrencyBudget
                     activeByTenant.Remove(authorizedTenant);
                 else
                     activeByTenant[authorizedTenant] = remaining;
-                active--;
+                if (--active == 0)
+                    drained?.TrySetResult();
             }
         }
     }
@@ -206,7 +225,7 @@ public sealed class TenantOperationConcurrencyBudget
     {
         lock (gate)
         {
-            if (active >= MaximumConcurrentOperations)
+            if (drained is not null || active >= MaximumConcurrentOperations)
                 return false;
 
             activeByTenant.TryGetValue(tenant, out var current);

@@ -25,13 +25,14 @@ internal static class Program
                     "--self-test --output <new-report.json>",
                     "--self-test-capacity --output <new-report.json>",
                     "--self-test-tenant-capacity --output <new-report.json>",
+                    "--self-test-drain --output <new-report.json>",
                     "--export-contracts --config <json> --output <new-directory>",
                     "--serve --config <json> --certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json> [--max-concurrent-operations <positive-int> [--max-concurrent-operations-per-tenant <positive-int>]]" },
                     scope = "Experimental fixture-backed Small API. Type stop + Enter or Ctrl+C for owned shutdown." }, Json));
                 return 0;
             }
-            if (args.Length == 0 || args[0] is not ("--self-test" or "--self-test-capacity" or "--self-test-tenant-capacity" or "--serve" or "--export-contracts")) return Failure("usage.command", 2);
-            var required = args[0] switch { "--self-test" or "--self-test-capacity" or "--self-test-tenant-capacity" => new[] { "--output" }, "--export-contracts" => new[] { "--config", "--output" },
+            if (args.Length == 0 || args[0] is not ("--self-test" or "--self-test-capacity" or "--self-test-tenant-capacity" or "--self-test-drain" or "--serve" or "--export-contracts")) return Failure("usage.command", 2);
+            var required = args[0] switch { "--self-test" or "--self-test-capacity" or "--self-test-tenant-capacity" or "--self-test-drain" => new[] { "--output" }, "--export-contracts" => new[] { "--config", "--output" },
                 _ => new[] { "--config", "--certificate", "--public-key", "--ready" } };
             options = new Dictionary<string, string>(StringComparer.Ordinal);
             for (var i = 1; i < args.Length; i += 2)
@@ -43,6 +44,7 @@ internal static class Program
             if (args[0] == "--self-test") return await SelfTest.Run(options["--output"]);
             if (args[0] == "--self-test-capacity") return await SelfTest.RunCapacity(options["--output"]);
             if (args[0] == "--self-test-tenant-capacity") return await SelfTest.RunCapacity(options["--output"], tenantLimited: true);
+            if (args[0] == "--self-test-drain") return await SelfTest.RunDrain(options["--output"]);
             if (args[0] == "--export-contracts") return await ContractExport.Run(options["--config"], options["--output"]);
         }
         catch (Exception)

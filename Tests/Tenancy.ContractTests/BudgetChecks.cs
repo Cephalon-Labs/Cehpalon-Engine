@@ -131,6 +131,91 @@ internal static class BudgetChecks
         Verify(fixture.Created == 3 && fixture.Disposed == 3);
     }
 
+    internal static async Task DrainCore()
+    {
+        var releaseSuccess = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFault = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factories = 0;
+        var registry = new OperationRegistryBuilder().Register<int, int>("drain.own", () =>
+            new HoldingOperation(Interlocked.Increment(ref factories) == 1 ? releaseSuccess.Task : releaseFault.Task)).Build();
+        var dispatcher = new OperationDispatcher(registry);
+        var other = new OperationDispatcher(registry);
+        var idle = new OperationConcurrencyBudget(int.MaxValue);
+        Verify(idle.DrainAsync().IsCompletedSuccessfully);
+        Verify((await idle.DispatchAsync<int, int>(dispatcher, "drain.own", 0, Context)).Error.Code
+               == OperationConcurrencyBudget.CapacityExceededCode && factories == 0);
+
+        var budget = new OperationConcurrencyBudget(3);
+        var success = budget.DispatchAsync<int, int>(dispatcher, "drain.own", 1, Context).AsTask();
+        var fault = budget.DispatchAsync<int, int>(other, "drain.own", 2, Context).AsTask();
+        try
+        {
+            using var cancel = new CancellationTokenSource();
+            var canceledWait = budget.DrainAsync(cancel.Token);
+            var first = budget.DrainAsync();
+            var second = budget.DrainAsync();
+            Verify(!first.IsCompleted && !second.IsCompleted);
+            Verify((await budget.DispatchAsync<int, int>(other, "drain.own", 3, Context)).Error.Code
+                   == OperationConcurrencyBudget.CapacityExceededCode && factories == 2);
+            cancel.Cancel();
+            await VerifyCanceled(canceledWait);
+            Verify(!first.IsCompleted && !second.IsCompleted && !success.IsCompleted);
+            releaseSuccess.SetResult();
+            Verify((await success.WaitAsync(TimeSpan.FromSeconds(5))).Value == 1 && !first.IsCompleted);
+            releaseFault.SetException(new InvalidDataException("cleanup"));
+            await Throws<InvalidDataException>(() => new ValueTask<OperationResult<int>>(fault));
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+            Verify(budget.DrainAsync().IsCompletedSuccessfully);
+            Verify((await budget.DispatchAsync<int, int>(dispatcher, "drain.own", 4, Context)).Error.Code
+                   == OperationConcurrencyBudget.CapacityExceededCode && factories == 2);
+        }
+        finally
+        {
+            releaseSuccess.TrySetResult();
+            releaseFault.TrySetResult();
+        }
+    }
+
+    internal static async Task DrainTenants()
+    {
+        var budget = new TenantOperationConcurrencyBudget(2, 1);
+        var holder = HeldFixture();
+        var other = new Fixture();
+        var holderDispatch = holder.Build(tenantBudget: budget);
+        var otherDispatch = other.Build(tenantBudget: budget);
+        var pending = TenantCall(holderDispatch, "A").AsTask();
+        try
+        {
+            await holder.CleanupEntered!.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            using var cancel = new CancellationTokenSource();
+            cancel.Cancel();
+            await VerifyCanceled(budget.DrainAsync(cancel.Token));
+            var first = budget.DrainAsync();
+            var second = budget.DrainAsync();
+            Verify(!first.IsCompleted && !second.IsCompleted);
+            Verify((await TenantCall(otherDispatch, "C")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+            Verify((await TenantCall(otherDispatch, "B")).Error.Code == "access.denied");
+            Verify(other.Created == 0 && other.IdentityCalls == 2 && holder.Disposed == 0);
+            holder.CleanupRelease!.SetResult();
+            Verify((await pending.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess && holder.Disposed == 1);
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+            Verify(budget.DrainAsync().IsCompletedSuccessfully);
+            Verify((await TenantCall(otherDispatch, "A")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+            Verify(new TenantOperationConcurrencyBudget(1, 1).DrainAsync().IsCompletedSuccessfully);
+        }
+        finally
+        {
+            holder.CleanupRelease!.TrySetResult();
+        }
+    }
+
+    private static async Task VerifyCanceled(Task task)
+    {
+        try { await task.WaitAsync(TimeSpan.FromSeconds(5)); }
+        catch (OperationCanceledException) { return; }
+        throw new InvalidOperationException("Expected the drain waiter to cancel.");
+    }
+
     private static Fixture HeldFixture() => new()
     {
         MemberB = true,

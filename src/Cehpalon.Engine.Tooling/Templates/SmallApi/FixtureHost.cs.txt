@@ -186,7 +186,7 @@ public sealed class FixtureHost : IAsyncDisposable
                 if(enabled.Contains("graphql")) app.MapCehpalonGraphQL("/graphql");
                 Counters.Endpoints=((Microsoft.AspNetCore.Routing.IEndpointRouteBuilder)app).DataSources.SelectMany(x=>x.Endpoints).Count();
                 await app.StartAsync(ct);
-                return new HostResource(app,Counters);
+                return new HostResource(app, Counters, budget, tenantBudget);
             }
             catch {await app.DisposeAsync();Application=null;throw;}
         }));
@@ -197,6 +197,23 @@ public sealed class FixtureHost : IAsyncDisposable
     }
     public async ValueTask DisposeAsync() {if(lease is not null) await lease.DisposeAsync();}
     private sealed class NoResource:IAsyncDisposable {public ValueTask DisposeAsync()=>ValueTask.CompletedTask;}
-    private sealed class HostResource(WebApplication app,ActivationCounters counters):IAsyncDisposable
-    {public async ValueTask DisposeAsync(){using var ct=new CancellationTokenSource(TimeSpan.FromSeconds(5));try{await app.StopAsync(ct.Token);}finally{await app.DisposeAsync();Interlocked.Increment(ref counters.HostDisposals);}}}
+    private sealed class HostResource(WebApplication app, ActivationCounters counters,
+        OperationConcurrencyBudget? budget, TenantOperationConcurrencyBudget? tenantBudget) : IAsyncDisposable
+    {
+        public async ValueTask DisposeAsync()
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var drained = tenantBudget?.DrainAsync() ?? budget?.DrainAsync() ?? Task.CompletedTask;
+            try
+            {
+                await app.StopAsync(timeout.Token);
+                await drained.WaitAsync(timeout.Token);
+            }
+            finally
+            {
+                await app.DisposeAsync();
+                Interlocked.Increment(ref counters.HostDisposals);
+            }
+        }
+    }
 }

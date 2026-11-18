@@ -13,6 +13,57 @@ namespace PortableConsumers.Generated;
 
 public static class SelfTest
 {
+public static async Task<int> RunDrain(string output)
+{
+    output = Path.GetFullPath(output);
+    if (File.Exists(output)) throw new IOException("Use a new report path.");
+    using var tls = new TlsFixture();
+    using var jwt = new JwtFixture();
+    var configuration = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), Encoding.UTF8);
+    var observations = new List<object>();
+    foreach (var tenantLimited in new[] { false, true })
+    {
+        await using var host = new FixtureHost();
+        await host.Start(configuration, tls, jwt, 2, tenantLimited ? 1 : null);
+        using var client = tls.Client(host.Address);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/catalog/set")
+        {
+            Content = JsonContent.Create(new SetLabel("tenant-a", 1, 0, "during-shutdown"))
+        };
+        request.Headers.Authorization = new("Bearer", jwt.Token());
+        var store = host.Store;
+        var release = CatalogStore.NewSignal();
+        store.WriteRelease = release;
+        store.DelayWrites = true;
+        var pending = client.SendAsync(request, deadline.Token);
+        try
+        {
+            await store.WriteEntered.Task.WaitAsync(deadline.Token);
+            var stopping = host.DisposeAsync().AsTask();
+            if (stopping.IsCompleted || store.Writes != 0 || store.Disposals != 0)
+                throw new InvalidOperationException("Shutdown did not wait for the admitted write.");
+            release.SetResult();
+            await stopping.WaitAsync(deadline.Token);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        using var response = await pending;
+        if (response.StatusCode != HttpStatusCode.OK || store.Factories != 1 || store.Writes != 1
+            || store.Disposals != 1 || host.Counters.HostDisposals != 1)
+            throw new InvalidOperationException("The admitted write or its owned cleanup did not complete.");
+        observations.Add(new { tenantLimited, http = (int)response.StatusCode, store.Factories, store.Writes,
+            store.Disposals, host.Counters.HostDisposals, waitedForRelease = true });
+    }
+
+    Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+    await using var file = new FileStream(output, FileMode.CreateNew, FileAccess.Write);
+    await JsonSerializer.SerializeAsync(file, new { status = "passed", observations });
+    return 0;
+}
+
 public static async Task<int> RunCapacity(string output, bool tenantLimited = false)
 {
     output = Path.GetFullPath(output);
