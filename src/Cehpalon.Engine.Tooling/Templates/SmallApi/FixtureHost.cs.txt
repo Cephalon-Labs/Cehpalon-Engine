@@ -59,7 +59,7 @@ public sealed class ValidatedIdentity(HttpContext http) : IIdentitySource
     }
 }
 
-public sealed class SampleDispatcher(CatalogStore store, OperationConcurrencyBudget? budget) : ITransportOperationDispatcher
+public sealed class SampleDispatcher(CatalogStore store, OperationConcurrencyBudget? budget, TenantOperationConcurrencyBudget? tenantBudget) : ITransportOperationDispatcher
 {
     public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest,TResponse>(HttpContext http,string id,TRequest request,OperationContext context,CancellationToken ct)
     {
@@ -69,9 +69,9 @@ public sealed class SampleDispatcher(CatalogStore store, OperationConcurrencyBud
             .Register<ListItems,ItemPage>("catalog.list","catalog.list","catalog",r=>r with{},r=>new(new(r.Tenant),"catalog"),Factory)
             .Register<SetLabel,Item>("catalog.set","catalog.set","catalog",r=>r with{},r=>new(new(r.Tenant),"catalog"),Factory).Build();
         var services=new TenantSecurityServices(new ValidatedIdentity(http),new IdentityTrustPolicy([JwtFixture.Issuer],[JwtBearerDefaults.AuthenticationScheme]),new Memberships(store),store,TimeSpan.FromSeconds(30),store.MissingPolicy?null:new CatalogPolicy());
-        var tenant = budget is null
-            ? new TenantOperationDispatcher(registry, services)
-            : new TenantOperationDispatcher(registry, services, budget);
+        var tenant = tenantBudget is not null
+            ? TenantOperationDispatcher.WithTenantConcurrencyBudget(registry, services, tenantBudget)
+            : budget is null ? new TenantOperationDispatcher(registry, services) : new(registry, services, budget);
         var core=new OperationRegistryBuilder();
         Cehpalon.Engine.Generated.OperationRegistrations.RegisterAll(core,new GatewayFactory(tenant));
         return new OperationDispatcher(core.Build()).DispatchAsync<TRequest,TResponse>(id,request,context,ct);
@@ -123,8 +123,9 @@ public sealed class FixtureHost : IAsyncDisposable
     public Uri Address=>new(Application!.Urls.Single());
     private ActivationLease? lease;
     public static string Config(bool api,bool graphql,bool worker=false)=>System.Text.Json.JsonSerializer.Serialize(new{Cehpalon=new{SchemaVersion=1,Architecture="Modular",Topology="SingleProcess",Pattern="RequestReply",Modules=new{api=new{Enabled=api},graphql=new{Enabled=graphql},worker=new{Enabled=worker}}}});
-    public Task Start(string configuration, TlsFixture tls, JwtFixture jwt, int? maximumConcurrentOperations = null) =>
-        Start(configuration, tls.Server, jwt.PublicKey, maximumConcurrentOperations);
+    public Task Start(string configuration, TlsFixture tls, JwtFixture jwt,
+        int? maximumConcurrentOperations = null, int? maximumConcurrentOperationsPerTenant = null) =>
+        Start(configuration, tls.Server, jwt.PublicKey, maximumConcurrentOperations, maximumConcurrentOperationsPerTenant);
     public static ActivationPlan Compile(string configuration)
     {
         var descriptors=new List<ModuleDescriptor>{new("host",ModuleRole.Support),new("api",ModuleRole.EntryPoint,["host"]),new("graphql",ModuleRole.EntryPoint,["host"])};
@@ -136,10 +137,13 @@ public sealed class FixtureHost : IAsyncDisposable
         return plan;
     }
     public async Task Start(string configuration, X509Certificate2 certificate, SecurityKey publicKey,
-        int? maximumConcurrentOperations = null)
+        int? maximumConcurrentOperations = null, int? maximumConcurrentOperationsPerTenant = null)
     {
         if (maximumConcurrentOperations is <= 0)
             throw new ArgumentOutOfRangeException(nameof(maximumConcurrentOperations));
+        if (maximumConcurrentOperationsPerTenant is int perTenant &&
+            (maximumConcurrentOperations is not int total || perTenant <= 0 || perTenant > total))
+            throw new ArgumentOutOfRangeException(nameof(maximumConcurrentOperationsPerTenant));
         var plan=Compile(configuration);
         var enabled=plan.ActivationOrder.ToHashSet(StringComparer.Ordinal);
         var registrations=new List<ModuleRegistration>();
@@ -150,8 +154,11 @@ public sealed class FixtureHost : IAsyncDisposable
             var builder=WebApplication.CreateSlimBuilder(new WebApplicationOptions{Args=[],EnvironmentName="Production"});
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(k=>k.Listen(IPAddress.Loopback,0,l=>{l.Protocols=HttpProtocols.Http1;l.UseHttps(certificate);}));
-            var budget = maximumConcurrentOperations is int limit ? new OperationConcurrencyBudget(limit) : null;
-            builder.Services.AddSingleton<ITransportOperationDispatcher>(new SampleDispatcher(Store, budget));
+            var tenantBudget = maximumConcurrentOperationsPerTenant is int tenantLimit
+                ? new TenantOperationConcurrencyBudget(maximumConcurrentOperations!.Value, tenantLimit) : null;
+            var budget = tenantBudget is null && maximumConcurrentOperations is int limit
+                ? new OperationConcurrencyBudget(limit) : null;
+            builder.Services.AddSingleton<ITransportOperationDispatcher>(new SampleDispatcher(Store, budget, tenantBudget));
             builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o=>
             {
                 o.MapInboundClaims=false;o.IncludeErrorDetails=false;

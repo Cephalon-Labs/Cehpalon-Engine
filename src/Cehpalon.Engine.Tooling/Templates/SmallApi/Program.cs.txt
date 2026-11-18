@@ -11,6 +11,7 @@ namespace PortableConsumers.Generated;
 internal static class Program
 {
     private const string ConcurrencyOption = "--max-concurrent-operations";
+    private const string TenantConcurrencyOption = "--max-concurrent-operations-per-tenant";
     private static readonly JsonSerializerOptions Json = new() { IncludeFields = true };
     private static readonly UTF8Encoding Utf8 = new(false, true);
     public static async Task<int> Main(string[] args)
@@ -23,23 +24,25 @@ internal static class Program
                 Console.WriteLine(JsonSerializer.Serialize(new { status = "passed", commands = new[] {
                     "--self-test --output <new-report.json>",
                     "--self-test-capacity --output <new-report.json>",
+                    "--self-test-tenant-capacity --output <new-report.json>",
                     "--export-contracts --config <json> --output <new-directory>",
-                    "--serve --config <json> --certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json> [--max-concurrent-operations <positive-int>]" },
+                    "--serve --config <json> --certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json> [--max-concurrent-operations <positive-int> [--max-concurrent-operations-per-tenant <positive-int>]]" },
                     scope = "Experimental fixture-backed Small API. Type stop + Enter or Ctrl+C for owned shutdown." }, Json));
                 return 0;
             }
-            if (args.Length == 0 || args[0] is not ("--self-test" or "--self-test-capacity" or "--serve" or "--export-contracts")) return Failure("usage.command", 2);
-            var required = args[0] switch { "--self-test" or "--self-test-capacity" => new[] { "--output" }, "--export-contracts" => new[] { "--config", "--output" },
+            if (args.Length == 0 || args[0] is not ("--self-test" or "--self-test-capacity" or "--self-test-tenant-capacity" or "--serve" or "--export-contracts")) return Failure("usage.command", 2);
+            var required = args[0] switch { "--self-test" or "--self-test-capacity" or "--self-test-tenant-capacity" => new[] { "--output" }, "--export-contracts" => new[] { "--config", "--output" },
                 _ => new[] { "--config", "--certificate", "--public-key", "--ready" } };
             options = new Dictionary<string, string>(StringComparer.Ordinal);
             for (var i = 1; i < args.Length; i += 2)
                 if (!(required.Contains(args[i], StringComparer.Ordinal)
-                    || args[0] == "--serve" && args[i] == ConcurrencyOption) || i + 1 >= args.Length
+                    || args[0] == "--serve" && args[i] is ConcurrencyOption or TenantConcurrencyOption) || i + 1 >= args.Length
                     || string.IsNullOrWhiteSpace(args[i + 1]) || args[i + 1].StartsWith("--", StringComparison.Ordinal)
                     || !options.TryAdd(args[i], args[i + 1])) return Failure("usage.option", 2);
             if (required.Any(key => !options.ContainsKey(key))) return Failure("usage.required", 2);
             if (args[0] == "--self-test") return await SelfTest.Run(options["--output"]);
             if (args[0] == "--self-test-capacity") return await SelfTest.RunCapacity(options["--output"]);
+            if (args[0] == "--self-test-tenant-capacity") return await SelfTest.RunCapacity(options["--output"], tenantLimited: true);
             if (args[0] == "--export-contracts") return await ContractExport.Run(options["--config"], options["--output"]);
         }
         catch (Exception)
@@ -59,10 +62,16 @@ internal static class Program
             int? maximumConcurrentOperations = null;
             if (options.TryGetValue(ConcurrencyOption, out var limit))
             {
-                if (limit.Length > 10 || !limit.All(c => c is >= '0' and <= '9')
-                    || !int.TryParse(limit, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
+                if (!TryParseLimit(limit, out var parsed))
                     return Failure("usage.max_concurrent_operations", 2);
                 maximumConcurrentOperations = parsed;
+            }
+            int? maximumConcurrentOperationsPerTenant = null;
+            if (options.TryGetValue(TenantConcurrencyOption, out var tenantLimit))
+            {
+                if (maximumConcurrentOperations is not int total || !TryParseLimit(tenantLimit, out var parsed) || parsed > total)
+                    return Failure("usage.max_concurrent_operations_per_tenant", 2);
+                maximumConcurrentOperationsPerTenant = parsed;
             }
             var ready = Path.GetFullPath(options["--ready"]);
             if (File.Exists(ready) || Directory.Exists(ready)) return Failure("ready.exists", 3);
@@ -96,7 +105,8 @@ internal static class Program
             // or readiness publication fails.
             await using var host = new FixtureHost();
             observed = host.Counters;
-            await host.Start(configuration, certificate, new RsaSecurityKey(rsa.ExportParameters(false)), maximumConcurrentOperations);
+            await host.Start(configuration, certificate, new RsaSecurityKey(rsa.ExportParameters(false)),
+                maximumConcurrentOperations, maximumConcurrentOperationsPerTenant);
             await Ready(ready, new { status = "ready", address = host.Address.AbsoluteUri, counters = host.Counters,
                 scope = "Fixture-backed tenant memberships/store; not real IdP/provider or production qualification." });
             using var stop = new CancellationTokenSource();
@@ -115,6 +125,13 @@ internal static class Program
             // Never expose input text, token, key, path or vendor exception details.
             return Failure("consumer.failure", 3, observed);
         }
+    }
+
+    private static bool TryParseLimit(string value, out int limit)
+    {
+        limit = 0;
+        return value.Length <= 10 && value.All(c => c is >= '0' and <= '9')
+            && int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out limit) && limit > 0;
     }
 
     private static async Task ConsoleLifetime(CancellationToken cancellationToken)

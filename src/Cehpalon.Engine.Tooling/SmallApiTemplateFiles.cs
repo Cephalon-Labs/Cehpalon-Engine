@@ -134,7 +134,11 @@ Optional --max-concurrent-operations <positive-int> on --serve sets one in-proce
 business-handler limit shared by the enabled HTTP and GraphQL entrypoints. Admission
 follows tenant authorization and capacity is held through handler cleanup. Full
 capacity returns operation.capacity_exceeded. Run --self-test-capacity --output
-<new-report.json> for the bounded protected HTTPS fixture.
+<new-report.json> for the bounded protected HTTPS fixture. Optional
+--max-concurrent-operations-per-tenant <positive-int> requires a host limit at least
+as large. Both limits count admitted business operations. The partition key is the
+authorized tenant. Run --self-test-tenant-capacity --output <new-report.json>
+to verify that another tenant can use spare host capacity.
 
 Type `stop` followed by Enter, or Ctrl+C, for awaited listener/handler cleanup and
 a stopped JSON report. Redirected stdin EOF alone keeps the host alive without

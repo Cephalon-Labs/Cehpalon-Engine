@@ -13,7 +13,7 @@ namespace PortableConsumers.Generated;
 
 public static class SelfTest
 {
-public static async Task<int> RunCapacity(string output)
+public static async Task<int> RunCapacity(string output, bool tenantLimited = false)
 {
     output = Path.GetFullPath(output);
     if (File.Exists(output)) throw new IOException("Use a new report path.");
@@ -21,7 +21,9 @@ public static async Task<int> RunCapacity(string output)
     using var jwt = new JwtFixture();
     await using var host = new FixtureHost();
     var configuration = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "appsettings.graphql.json"), Encoding.UTF8);
-    await host.Start(configuration, tls, jwt, maximumConcurrentOperations: 1);
+    var totalLimit = tenantLimited ? 2 : 1;
+    int? tenantLimit = tenantLimited ? 1 : null;
+    await host.Start(configuration, tls, jwt, totalLimit, tenantLimit);
     using var client = tls.Client(host.Address);
     using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
     var store = host.Store;
@@ -50,6 +52,7 @@ public static async Task<int> RunCapacity(string output)
             : Post("/api/catalog/get", input, subject);
     }
 
+    var peerTenantReads = 0;
     var pending = Post("/api/catalog/set", new SetLabel("tenant-a", 1, 0, "held"), "alice");
     try
     {
@@ -62,9 +65,16 @@ public static async Task<int> RunCapacity(string output)
                 throw new InvalidOperationException("Tenant denial changed under saturation.");
             var overload = graphQL ? HttpStatusCode.OK : HttpStatusCode.ServiceUnavailable;
             if (await Read("alice", "tenant-a", graphQL) != (overload, OperationConcurrencyBudget.CapacityExceededCode))
-                throw new InvalidOperationException("The transport did not share the host budget.");
+                throw new InvalidOperationException("The transport did not share the expected budget.");
+            if (tenantLimited)
+            {
+                if (await Read("bob", "tenant-b", graphQL) != (HttpStatusCode.OK, null))
+                    throw new InvalidOperationException("Another tenant could not use spare host capacity.");
+                peerTenantReads++;
+            }
         }
-        if (store.Factories != 1 || store.Reads != 0 || store.Writes != 0 || store.Disposals != 0)
+        if (store.Factories != 1 + peerTenantReads || store.Reads != peerTenantReads || store.Writes != 0
+            || store.Disposals != peerTenantReads || (tenantLimited && peerTenantReads != 2))
             throw new InvalidOperationException("Rejected work reached business or the held operation ended prematurely.");
     }
     finally
@@ -76,7 +86,7 @@ public static async Task<int> RunCapacity(string output)
         || await Read("alice", "tenant-a", graphQL: true) != (HttpStatusCode.OK, null))
         throw new InvalidOperationException("An operation failed after releasing capacity.");
     await host.DisposeAsync();
-    if (store.Factories != 2 || store.Disposals != 2 || store.Reads != 1 || store.Writes != 1
+    if (store.Factories != 2 + peerTenantReads || store.Disposals != 2 + peerTenantReads || store.Reads != 1 + peerTenantReads || store.Writes != 1
         || host.Counters.HostDisposals != 1 || host.Counters.ForbiddenFactories != 0)
         throw new InvalidOperationException("The admitted work and host did not clean up exactly once.");
 
@@ -84,7 +94,7 @@ public static async Task<int> RunCapacity(string output)
     await using var file = new FileStream(output, FileMode.CreateNew, FileAccess.Write);
     await JsonSerializer.SerializeAsync(file, new
     {
-        status = "passed", maximumConcurrentOperations = 1,
+        status = "passed", maximumConcurrentOperations = totalLimit, maximumConcurrentOperationsPerTenant = tenantLimit, peerTenantReads,
         saturated = new { http = 503, graphQL = 200, code = OperationConcurrencyBudget.CapacityExceededCode },
         crossTenantDenials = 4, store = new { store.Factories, store.Disposals, store.Reads, store.Writes }
     });

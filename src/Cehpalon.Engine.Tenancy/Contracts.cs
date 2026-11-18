@@ -152,3 +152,76 @@ internal static class Values
         return value;
     }
 }
+
+/// <summary>Limits total and per-tenant in-flight business operations after fresh tenant authorization.</summary>
+public sealed class TenantOperationConcurrencyBudget
+{
+    private readonly object gate = new();
+    private readonly Dictionary<TenantId, int> activeByTenant = new();
+    private int active;
+
+    public TenantOperationConcurrencyBudget(int maximumConcurrentOperations, int maximumConcurrentOperationsPerTenant)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumConcurrentOperations);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumConcurrentOperationsPerTenant);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maximumConcurrentOperationsPerTenant, maximumConcurrentOperations);
+        MaximumConcurrentOperations = maximumConcurrentOperations;
+        MaximumConcurrentOperationsPerTenant = maximumConcurrentOperationsPerTenant;
+    }
+
+    public int MaximumConcurrentOperations { get; }
+    public int MaximumConcurrentOperationsPerTenant { get; }
+
+    internal async ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest, TResponse>(
+        TenantId authorizedTenant, OperationDispatcher dispatcher, string operationId, TRequest request,
+        OperationContext correlation, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!TryAdmit(authorizedTenant))
+        {
+            token.ThrowIfCancellationRequested();
+            return Rejected<TResponse>.Result;
+        }
+
+        try
+        {
+            return await dispatcher.DispatchAsync<TRequest, TResponse>(operationId, request, correlation, token)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (gate)
+            {
+                var remaining = activeByTenant[authorizedTenant] - 1;
+                if (remaining == 0)
+                    activeByTenant.Remove(authorizedTenant);
+                else
+                    activeByTenant[authorizedTenant] = remaining;
+                active--;
+            }
+        }
+    }
+
+    private bool TryAdmit(TenantId tenant)
+    {
+        lock (gate)
+        {
+            if (active >= MaximumConcurrentOperations)
+                return false;
+
+            activeByTenant.TryGetValue(tenant, out var current);
+            if (current >= MaximumConcurrentOperationsPerTenant)
+                return false;
+
+            activeByTenant[tenant] = current + 1;
+            active++;
+            return true;
+        }
+    }
+
+    private static class Rejected<T>
+    {
+        internal static readonly OperationResult<T> Result = OperationResult<T>.Failure(
+            new OperationError(OperationConcurrencyBudget.CapacityExceededCode, "Operation capacity is temporarily unavailable."));
+    }
+}

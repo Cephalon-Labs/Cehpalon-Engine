@@ -1,4 +1,5 @@
 using Cehpalon.Engine.Core;
+using Cehpalon.Engine.Tenancy;
 
 internal sealed class HoldingOperation(Task cleanup) : IOperationHandler<int, int>, IAsyncDisposable
 {
@@ -65,6 +66,81 @@ internal static class BudgetChecks
         await Throws<OperationCanceledException>(() => budget.DispatchAsync<int, int>(dispatcher, "capacity.cancel", 0, Context, cancel.Token));
         Verify((await budget.DispatchAsync<int, int>(dispatcher, "capacity.ok", 42, Context)).Value == 42);
     }
+
+    internal static async Task TenantLimits()
+    {
+        var budget = new TenantOperationConcurrencyBudget(2, 1);
+        var a = HeldFixture();
+        var b = HeldFixture();
+        var fa = a.Build(tenantBudget: budget);
+        var fb = b.Build(tenantBudget: budget);
+        var outsider = new Fixture();
+        var noMembershipB = outsider.Build(tenantBudget: budget);
+        var pendingA = TenantCall(fa, "A").AsTask();
+        Task<OperationResult<int>>? pendingB = null;
+        try
+        {
+            await a.CleanupEntered!.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Verify((await TenantCall(fb, "A")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+            Verify(b.Created == 0 && a.Reads == 1 && a.Disposed == 0);
+
+            pendingB = TenantCall(fb, "B").AsTask();
+            await b.CleanupEntered!.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Verify((await TenantCall(noMembershipB, "B")).Error.Code == "access.denied");
+            Verify((await TenantCall(noMembershipB, "C")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+            var rejected = await Task.WhenAll(Enumerable.Range(0, 32).Select(i =>
+                Task.Run(async () => await TenantCall(i % 2 == 0 ? fa : fb, i % 2 == 0 ? "B" : "A"))));
+            Verify(rejected.All(x => x.Error.Code == OperationConcurrencyBudget.CapacityExceededCode));
+            Verify(a.Created == 1 && b.Created == 1 && outsider.Created == 0);
+
+            a.CleanupRelease!.SetResult();
+            Verify((await pendingA).IsSuccess && a.Disposed == 1);
+            Verify((await TenantCall(noMembershipB, "C")).IsSuccess && outsider.Disposed == 1);
+            Verify((await TenantCall(fa, "B")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+        }
+        finally
+        {
+            a.CleanupRelease!.TrySetResult();
+            b.CleanupRelease!.TrySetResult();
+        }
+        Verify((await pendingB!).IsSuccess && b.Disposed == 1);
+        Verify((await TenantCall(fa, "B")).IsSuccess && a.Disposed == 2);
+    }
+
+    internal static async Task TenantFailureRecovery()
+    {
+        foreach (var (total, tenant) in new[] { (0, 1), (1, 0), (1, 2) })
+        {
+            try { _ = new TenantOperationConcurrencyBudget(total, tenant); throw new InvalidOperationException("Expected invalid limits"); }
+            catch (ArgumentOutOfRangeException) { }
+        }
+
+        var budget = new TenantOperationConcurrencyBudget(1, 1);
+        var fixture = new Fixture();
+        var dispatcher = fixture.Build(tenantBudget: budget);
+        using var cancel = new CancellationTokenSource();
+        fixture.Hooks["factory"] = cancel.Cancel;
+        await Throws<OperationCanceledException>(() => TenantCall(dispatcher, "A", cancel.Token));
+        Verify(fixture.Created == 1 && fixture.Disposed == 1 && fixture.Reads == 0);
+        fixture.Hooks.Clear();
+
+        fixture.CleanupFailure = true;
+        await Throws<InvalidDataException>(() => TenantCall(dispatcher, "A"));
+        fixture.CleanupFailure = false;
+        Verify((await TenantCall(dispatcher, "A")).IsSuccess);
+        Verify(fixture.Created == 3 && fixture.Disposed == 3);
+    }
+
+    private static Fixture HeldFixture() => new()
+    {
+        MemberB = true,
+        CleanupEntered = new(TaskCreationOptions.RunContinuationsAsynchronously),
+        CleanupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously)
+    };
+
+    private static ValueTask<OperationResult<int>> TenantCall(
+        TenantOperationDispatcher dispatcher, string tenant, CancellationToken token = default) =>
+        dispatcher.DispatchAsync<Request, int>("document.read", new(tenant, "shared"), Context, token);
 
     private static async ValueTask Throws<T>(Func<ValueTask<OperationResult<int>>> action) where T : Exception
     {

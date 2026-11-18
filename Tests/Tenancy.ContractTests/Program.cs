@@ -163,6 +163,8 @@ await Check("shared-budget-keeps-unauthorized-denial-and-skips-authorized-factor
 });
 await Check("budget-does-not-queue-and-keeps-permits-during-cleanup", BudgetChecks.ConcurrentCleanup);
 await Check("budget-releases-permits-after-factory-fault-and-cancellation", BudgetChecks.FailureRecovery);
+await Check("tenant-budget-is-shared-while-tenant-cleanup-retains-capacity", BudgetChecks.TenantLimits);
+await Check("tenant-budget-recovers-from-factory-cancellation-and-cleanup-fault", BudgetChecks.TenantFailureRecovery);
 await Check("business-failure-result-is-preserved-and-owned-handler-disposed",async()=>
 {var f=new Fixture{BusinessFailure=true};var result=await f.Call();Assert(!result.IsSuccess&&result.Error.Code=="business.invalid"&&f.Disposed==1);});
 await Check("unexpected-handler-and-cleanup-faults-both-preserved",async()=>
@@ -216,11 +218,14 @@ sealed class Fixture:IIdentitySource,ITenantMembershipSource,IResourceScopeSourc
     public string? ScopeMismatch,LastLookupTenant,LastHandledTenant,LastHandledNested;public TenantOperationContext? Captured;
     public readonly Dictionary<string,Action> Hooks=new(StringComparer.Ordinal);
     public void Hook(string at) { if(Hooks.TryGetValue(at,out var action)) action(); }
-    public TenantOperationDispatcher Build(OperationConcurrencyBudget? budget = null)
+    public TaskCompletionSource? CleanupEntered, CleanupRelease;
+    public TenantOperationDispatcher Build(OperationConcurrencyBudget? budget = null, TenantOperationConcurrencyBudget? tenantBudget = null)
     {
         var registry = new TenantOperationRegistryBuilder().Register<Request,int>("document.read","document.read","document",x=>x.Copy(),x=>new(new(x.Tenant),x.Id),()=>
         {Interlocked.Increment(ref Created);Hook("factory");return NullHandler?null!:new Handler(this);}).Build();
         var security = new TenantSecurityServices(this,Trust,this,this,TimeSpan.FromSeconds(30),DefaultPolicy?null:this,Clock);
+        if (tenantBudget is not null)
+            return TenantOperationDispatcher.WithTenantConcurrencyBudget(registry, security, tenantBudget);
         return budget is null ? new(registry, security) : new(registry, security, budget);
     }
     public ValueTask<OperationResult<int>> Call(Request? request=null,OperationContext? context=null,CancellationToken token=default)=>Build().DispatchAsync<Request,int>("document.read",request??new("A","shared"),context??new("fixture"),token);
@@ -243,6 +248,13 @@ sealed class Handler(Fixture fixture):ITenantOperationHandler<Request,int>,IAsyn
         fixture.LastHandledTenant=request.Tenant;fixture.LastHandledNested=request.Nested[0];Interlocked.Increment(ref fixture.Reads);
         return ValueTask.FromResult(fixture.BusinessFailure?OperationResult<int>.Failure(new("business.invalid","Business rejected.")):OperationResult<int>.Success(context.Tenant.Equals(Fixture.A)?10:20));
     }
-    public ValueTask DisposeAsync(){Interlocked.Increment(ref fixture.Disposed);if(fixture.CleanupDenial)throw new TenantAccessDeniedException();if(fixture.CleanupFailure)throw new InvalidDataException("cleanup failed");return ValueTask.CompletedTask;}
+    public async ValueTask DisposeAsync()
+    {
+        fixture.CleanupEntered?.TrySetResult();
+        if (fixture.CleanupRelease is not null) await fixture.CleanupRelease.Task;
+        Interlocked.Increment(ref fixture.Disposed);
+        if (fixture.CleanupDenial) throw new TenantAccessDeniedException();
+        if (fixture.CleanupFailure) throw new InvalidDataException("cleanup failed");
+    }
     public void Dispose()=>throw new Exception("Async disposal must be preferred");
 }

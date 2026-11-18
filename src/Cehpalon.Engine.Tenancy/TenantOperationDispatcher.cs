@@ -58,6 +58,7 @@ public sealed class TenantOperationDispatcher
     private readonly TenantOperationRegistry registry;
     private readonly TenantSecurityServices services;
     private readonly OperationConcurrencyBudget? budget;
+    private readonly TenantOperationConcurrencyBudget? tenantBudget;
     public TenantOperationDispatcher(TenantOperationRegistry registry,TenantSecurityServices services)
     { this.registry=registry??throw new ArgumentNullException(nameof(registry)); this.services=services??throw new ArgumentNullException(nameof(services)); }
 
@@ -65,12 +66,21 @@ public sealed class TenantOperationDispatcher
     public TenantOperationDispatcher(TenantOperationRegistry registry, TenantSecurityServices services, OperationConcurrencyBudget budget)
         : this(registry, services) => this.budget = budget ?? throw new ArgumentNullException(nameof(budget));
 
+    private TenantOperationDispatcher(TenantOperationRegistry registry, TenantSecurityServices services,
+        TenantOperationConcurrencyBudget tenantBudget)
+        : this(registry, services) => this.tenantBudget = tenantBudget ?? throw new ArgumentNullException(nameof(tenantBudget));
+
+    /// <summary>Share a total and per-tenant capacity budget across protected dispatchers.</summary>
+    public static TenantOperationDispatcher WithTenantConcurrencyBudget(
+        TenantOperationRegistry registry, TenantSecurityServices services, TenantOperationConcurrencyBudget tenantBudget)
+        => new(registry, services, tenantBudget);
+
     public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest,TResponse>(string operationId,TRequest request,OperationContext correlation,CancellationToken cancellationToken=default)
     {
         OperationId.RequireValid(operationId); ArgumentNullException.ThrowIfNull(correlation); cancellationToken.ThrowIfCancellationRequested();
         if(!registry.TryGet(operationId,out var registration)) return ValueTask.FromResult(OperationResult<TResponse>.Failure(new("operation.not_found","The requested operation is not registered.")));
         if(registration is not TenantRegistration<TRequest,TResponse> typed) return ValueTask.FromResult(OperationResult<TResponse>.Failure(new("operation.contract_mismatch","The requested operation does not use these request/response contracts.")));
-        return typed.DispatchAsync(request,correlation,services,budget,cancellationToken);
+        return typed.DispatchAsync(request,correlation,services,budget,tenantBudget,cancellationToken);
     }
 }
 
@@ -89,7 +99,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         core=new(new OperationRegistryBuilder().Register<AuthorizedInvocation,TResponse>(operationId,()=>new HandlerBridge(factory,origin,operationId)).Build());
     }
     internal async ValueTask<OperationResult<TResponse>> DispatchAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
-        OperationConcurrencyBudget? budget,CancellationToken token)
+        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         var frozen=freeze(request);
@@ -119,6 +129,10 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         try
         {
             var invocation = new AuthorizedInvocation(frozen, context);
+            if (tenantBudget is not null)
+                return await tenantBudget.DispatchAsync<AuthorizedInvocation, TResponse>(
+                    resource.Tenant, core, operationId, invocation, correlation, token).ConfigureAwait(false);
+
             var work = budget is null
                 ? core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId, invocation, correlation, token)
                 : budget.DispatchAsync<AuthorizedInvocation,TResponse>(core, operationId, invocation, correlation, token);
