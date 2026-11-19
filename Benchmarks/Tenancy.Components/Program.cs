@@ -6,6 +6,8 @@ using Cehpalon.Engine.Identity;
 using Cehpalon.Engine.Tenancy;
 
 var output=Path.GetFullPath(args.Single(x=>x.StartsWith("--output=",StringComparison.Ordinal))[9..]);
+if (args.Contains("--observe-budget-metrics", StringComparer.Ordinal))
+    return await BudgetSnapshotObservation.RunAsync(output, observeMetrics: true);
 if (args.Contains("--observe-budget-contention", StringComparer.Ordinal))
     return await BudgetContentionObservation.RunAsync(output);
 if (args.Contains("--observe-budget-snapshots", StringComparer.Ordinal))

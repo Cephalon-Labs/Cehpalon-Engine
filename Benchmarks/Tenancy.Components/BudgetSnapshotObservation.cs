@@ -11,7 +11,7 @@ internal static class BudgetSnapshotObservation
     private const int Iterations = 1_000_000;
     private const int Repetitions = 5;
 
-    internal static async Task<int> RunAsync(string output)
+    internal static async Task<int> RunAsync(string output, bool observeMetrics = false)
     {
         if (File.Exists(output))
             throw new IOException("Retain previous results; use a new file.");
@@ -32,8 +32,11 @@ internal static class BudgetSnapshotObservation
             TimeSpan.FromHours(1), authority, new FixedClock());
         var tenantDispatcher = TenantOperationDispatcher.WithTenantConcurrencyBudget(tenantRegistry, services, tenant);
         var context = new OperationContext("snapshot-observer");
-        var stages = new List<Stage>();
-        stages.Add(Observe("idle-open", core, tenant, 0, false));
+        var stages = new List<object>();
+        object ObserveStage(string name, int active, bool closed) => observeMetrics
+            ? BudgetMetricsObservation.Observe(name, core, tenant, active, closed)
+            : Observe(name, core, tenant, active, closed);
+        stages.Add(ObserveStage("idle-open", 0, false));
 
         var coreWork = core.DispatchAsync<int, int>(coreDispatcher, "snapshots.read", 7, context).AsTask();
         var tenantWork = tenantDispatcher.DispatchAsync<ReadRequest, int>(
@@ -43,20 +46,20 @@ internal static class BudgetSnapshotObservation
             if (coreWork.IsCompleted || tenantWork.IsCompleted || owned.Created != 2 || owned.Disposed != 0)
                 throw new InvalidOperationException("Both operations must be waiting in owned cleanup.");
 
-            stages.Add(Observe("cleanup-open", core, tenant, 1, false));
+            stages.Add(ObserveStage("cleanup-open", 1, false));
             var coreDrain = core.DrainAsync();
             var tenantDrain = tenant.DrainAsync();
             if (coreDrain.IsCompleted || tenantDrain.IsCompleted)
                 throw new InvalidOperationException("Drain completed before cleanup release.");
 
-            stages.Add(Observe("cleanup-closed", core, tenant, 1, true));
+            stages.Add(ObserveStage("cleanup-closed", 1, true));
             release.SetResult();
             await Task.WhenAll(coreDrain, tenantDrain).WaitAsync(TimeSpan.FromSeconds(10));
             if ((await coreWork).Value != 7 || (await tenantWork).Value != 11
                 || owned.Created != 2 || owned.Disposed != 2)
                 throw new InvalidOperationException("Operation results or cleanup ownership differed.");
 
-            stages.Add(Observe("drained", core, tenant, 0, true));
+            stages.Add(ObserveStage("drained", 0, true));
         }
         finally
         {
@@ -69,8 +72,11 @@ internal static class BudgetSnapshotObservation
             observedAtUtc = DateTimeOffset.UtcNow,
             framework = RuntimeInformation.FrameworkDescription,
             os = RuntimeInformation.OSDescription,
-            scope = "Serial aggregate snapshot observation including typed delegate and checksum cost",
-            warmup = Warmup, iterations = Iterations, repetitions = Repetitions,
+            scope = observeMetrics ? "Periodic MeterListener collection including eight validation callbacks"
+                : "Serial aggregate snapshot observation including typed delegate and checksum cost",
+            warmup = observeMetrics ? 0 : Warmup,
+            iterations = observeMetrics ? BudgetMetricsObservation.Collections : Iterations,
+            repetitions = observeMetrics ? 1 : Repetitions,
             stopwatchFrequency = Stopwatch.Frequency,
             created = owned.Created, disposed = owned.Disposed, stages
         };

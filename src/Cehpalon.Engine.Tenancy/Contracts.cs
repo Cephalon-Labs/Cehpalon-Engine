@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using Cehpalon.Engine.Core;
 using Cehpalon.Engine.Identity;
 
@@ -185,6 +186,27 @@ public sealed class TenantOperationConcurrencyBudget
         var observed = Volatile.Read(ref snapshotState);
         return new(new(MaximumConcurrentOperations, (int)(observed & int.MaxValue), observed < 0),
             MaximumConcurrentOperationsPerTenant, (int)((observed >> 32) & int.MaxValue));
+    }
+
+    /// <summary>Create aggregate gauges without tenant tags. The caller owns and disposes the meter.</summary>
+    public Meter CreateMetrics()
+    {
+        var meter = new Meter("Cehpalon.Engine.Tenancy.Budget");
+        try
+        {
+            meter.CreateObservableGauge("cehpalon.operation_budget.active", () => GetSnapshot().Total.ActiveOperations, "{operation}");
+            meter.CreateObservableGauge("cehpalon.operation_budget.capacity", () => MaximumConcurrentOperations, "{operation}");
+            meter.CreateObservableGauge("cehpalon.operation_budget.closed", () => GetSnapshot().Total.IsAdmissionClosed ? 1 : 0,
+                description: "One after admission is permanently closed, otherwise zero.");
+            meter.CreateObservableGauge("cehpalon.operation_budget.active_tenants", () => GetSnapshot().ActiveTenants, "{tenant}");
+            meter.CreateObservableGauge("cehpalon.operation_budget.tenant_capacity", () => MaximumConcurrentOperationsPerTenant, "{operation}");
+            return meter;
+        }
+        catch
+        {
+            meter.Dispose();
+            throw;
+        }
     }
 
     // Called only while holding gate. Readers observe one complete published state.

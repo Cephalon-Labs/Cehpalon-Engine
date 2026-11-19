@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics.Metrics;
 
 namespace Cehpalon.Engine.Core;
 
@@ -99,6 +100,25 @@ public sealed class OperationConcurrencyBudget
     {
         var observed = Volatile.Read(ref admission);
         return new(MaximumConcurrentOperations, observed & int.MaxValue, observed < 0);
+    }
+
+    /// <summary>Create aggregate gauges. The caller owns the returned meter and controls collection.</summary>
+    public Meter CreateMetrics()
+    {
+        var meter = new Meter("Cehpalon.Engine.Core.Budget");
+        try
+        {
+            meter.CreateObservableGauge("cehpalon.operation_budget.active", () => GetSnapshot().ActiveOperations, "{operation}");
+            meter.CreateObservableGauge("cehpalon.operation_budget.capacity", () => MaximumConcurrentOperations, "{operation}");
+            meter.CreateObservableGauge("cehpalon.operation_budget.closed", () => GetSnapshot().IsAdmissionClosed ? 1 : 0,
+                description: "One after admission is permanently closed, otherwise zero.");
+            return meter;
+        }
+        catch
+        {
+            meter.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Close admissions permanently and wait until all admitted operations finish cleanup.</summary>

@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using Cehpalon.Engine.Core;
 using Cehpalon.Engine.Tenancy;
 
@@ -260,6 +261,83 @@ internal static class BudgetChecks
             Verify(held.IsAdmissionClosed && held.ActiveOperations is >= 1 and <= 4);
         }
         finally { release.TrySetResult(); }
+    }
+
+    internal static async Task MetricsLifecycle()
+    {
+        var core = new OperationConcurrencyBudget(2);
+        var tenant = new TenantOperationConcurrencyBudget(2, 1);
+        var fixture = HeldFixture();
+        var tenantWork = TenantCall(fixture.Build(tenantBudget: tenant), "A").AsTask();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factories = 0;
+        var dispatcher = new OperationDispatcher(new OperationRegistryBuilder()
+            .Register<int, int>("metrics.hold", () => { factories++; return new HoldingOperation(release.Task); })
+            .Register<int, int>("metrics.ok", () => { factories++; return new HoldingOperation(Task.CompletedTask); }).Build());
+        var coreWork = core.DispatchAsync<int, int>(dispatcher, "metrics.hold", 1, Context).AsTask();
+        using var listener = new MeterListener();
+        var values = new Dictionary<string, int>(StringComparer.Ordinal);
+        var callbackFault = false;
+        listener.InstrumentPublished = (instrument, observer) =>
+        {
+            if (instrument.Meter.Name is "Cehpalon.Engine.Core.Budget" or "Cehpalon.Engine.Tenancy.Budget")
+                observer.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<int>((instrument, value, tags, _) =>
+        {
+            Verify(tags.IsEmpty);
+            if (callbackFault) throw new IOException("observer failed");
+            Verify(values.TryAdd(instrument.Meter.Name + "/" + instrument.Name, value));
+        });
+        listener.Start();
+        using var coreMeter = core.CreateMetrics();
+        using var tenantMeter = tenant.CreateMetrics();
+        void Collect(int active, int closed)
+        {
+            values.Clear();
+            listener.RecordObservableInstruments();
+            Verify(values.Count == 8);
+            foreach (var name in new[] { coreMeter.Name, tenantMeter.Name })
+            {
+                Verify(values[name + "/cehpalon.operation_budget.active"] == active);
+                Verify(values[name + "/cehpalon.operation_budget.capacity"] == 2);
+                Verify(values[name + "/cehpalon.operation_budget.closed"] == closed);
+            }
+            Verify(values[tenantMeter.Name + "/cehpalon.operation_budget.active_tenants"] == active);
+            Verify(values[tenantMeter.Name + "/cehpalon.operation_budget.tenant_capacity"] == 1);
+        }
+        try
+        {
+            await fixture.CleanupEntered!.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Verify(factories == 1 && fixture.Created == 1 && values.Count == 0);
+            Collect(1, 0);
+            callbackFault = true;
+            Exception? observed = null;
+            try { listener.RecordObservableInstruments(); }
+            catch (Exception error) { observed = error; }
+            Verify(observed is IOException or AggregateException);
+            Verify((await core.DispatchAsync<int, int>(dispatcher, "metrics.ok", 2, Context)).Value == 2);
+            callbackFault = false;
+            var coreDrain = core.DrainAsync();
+            var tenantDrain = tenant.DrainAsync();
+            Collect(1, 1);
+            release.SetResult();
+            fixture.CleanupRelease!.SetResult();
+            await Task.WhenAll(coreWork, tenantWork, coreDrain, tenantDrain).WaitAsync(TimeSpan.FromSeconds(5));
+            Collect(0, 1);
+            Verify(factories == 2 && fixture.Created == 1 && fixture.Disposed == 1);
+            coreMeter.Dispose();
+            tenantMeter.Dispose();
+            values.Clear();
+            listener.RecordObservableInstruments();
+            Verify(values.Count == 0);
+        }
+        finally
+        {
+            release.TrySetResult();
+            fixture.CleanupRelease!.TrySetResult();
+            await Task.WhenAll(coreWork, tenantWork).WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     private static async Task VerifyCanceled(Task task)
