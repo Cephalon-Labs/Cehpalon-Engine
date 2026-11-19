@@ -6,6 +6,8 @@ using Cehpalon.Engine.Identity;
 using Cehpalon.Engine.Tenancy;
 
 var output=Path.GetFullPath(args.Single(x=>x.StartsWith("--output=",StringComparison.Ordinal))[9..]);
+if (args.Contains("--observe-budget-snapshots", StringComparer.Ordinal))
+    return await BudgetSnapshotObservation.RunAsync(output);
 if(File.Exists(output)) throw new IOException("Retain previous results; use a new file.");
 const int iterations=10_000,warmup=1_000,repetitions=5;
 var authority=new FixtureAuthority();
