@@ -189,9 +189,9 @@ public sealed class TenantOperationConcurrencyBudget
     }
 
     /// <summary>Create aggregate gauges without tenant tags. The caller owns and disposes the meter.</summary>
-    public Meter CreateMetrics()
+    public Meter CreateMetrics(string meterName = "Cehpalon.Engine.Tenancy.Budget")
     {
-        var meter = new Meter("Cehpalon.Engine.Tenancy.Budget");
+        var meter = new Meter(meterName);
         try
         {
             meter.CreateObservableGauge("cehpalon.operation_budget.active", () => GetSnapshot().Total.ActiveOperations, "{operation}");

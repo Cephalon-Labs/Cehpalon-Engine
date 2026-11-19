@@ -280,7 +280,7 @@ internal static class BudgetChecks
         var callbackFault = false;
         listener.InstrumentPublished = (instrument, observer) =>
         {
-            if (instrument.Meter.Name is "Cehpalon.Engine.Core.Budget" or "Cehpalon.Engine.Tenancy.Budget")
+            if (instrument.Meter.Name is "Cehpalon.Engine.Core.Budget" or "Cehpalon.Engine.Test.TenantBudget")
                 observer.EnableMeasurementEvents(instrument);
         };
         listener.SetMeasurementEventCallback<int>((instrument, value, tags, _) =>
@@ -291,7 +291,7 @@ internal static class BudgetChecks
         });
         listener.Start();
         using var coreMeter = core.CreateMetrics();
-        using var tenantMeter = tenant.CreateMetrics();
+        using var tenantMeter = tenant.CreateMetrics("Cehpalon.Engine.Test.TenantBudget");
         void Collect(int active, int closed)
         {
             values.Clear();

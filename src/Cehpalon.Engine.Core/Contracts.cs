@@ -103,9 +103,9 @@ public sealed class OperationConcurrencyBudget
     }
 
     /// <summary>Create aggregate gauges. The caller owns the returned meter and controls collection.</summary>
-    public Meter CreateMetrics()
+    public Meter CreateMetrics(string meterName = "Cehpalon.Engine.Core.Budget")
     {
-        var meter = new Meter("Cehpalon.Engine.Core.Budget");
+        var meter = new Meter(meterName);
         try
         {
             meter.CreateObservableGauge("cehpalon.operation_budget.active", () => GetSnapshot().ActiveOperations, "{operation}");
