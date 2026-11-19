@@ -110,6 +110,7 @@ internal static class Program
             await host.Start(configuration, certificate, new RsaSecurityKey(rsa.ExportParameters(false)),
                 maximumConcurrentOperations, maximumConcurrentOperationsPerTenant);
             await Ready(ready, new { status = "ready", address = host.Address.AbsoluteUri, counters = host.Counters,
+                capacity = host.CapacitySnapshot, tenantCapacity = host.TenantCapacitySnapshot,
                 scope = "Fixture-backed tenant memberships/store; not real IdP/provider or production qualification." });
             using var stop = new CancellationTokenSource();
             ConsoleCancelEventHandler cancel = (_, e) => { e.Cancel = true; stop.Cancel(); };
@@ -119,6 +120,7 @@ internal static class Program
             finally { Console.CancelKeyPress -= cancel; }
             await host.DisposeAsync();
             Console.WriteLine(JsonSerializer.Serialize(new { status = "stopped", counters = host.Counters,
+                capacity = host.CapacitySnapshot, tenantCapacity = host.TenantCapacitySnapshot,
                 store = new { host.Store.Factories, host.Store.Constructors, host.Store.Reads, host.Store.Writes, host.Store.Disposals } }, Json));
             return 0;
         }

@@ -71,6 +71,10 @@ public static class OperationId
     }
 }
 
+/// <summary>A point-in-time aggregate observation. Reading it does not reserve capacity.</summary>
+public readonly record struct OperationConcurrencySnapshot(
+    int MaximumConcurrentOperations, int ActiveOperations, bool IsAdmissionClosed);
+
 /// <summary>An opt-in, in-process concurrency limit shared by the operations that use this instance.</summary>
 public sealed class OperationConcurrencyBudget
 {
@@ -89,6 +93,13 @@ public sealed class OperationConcurrencyBudget
     }
 
     public int MaximumConcurrentOperations { get; }
+
+    /// <summary>Read a coherent, detached view of the aggregate admission state.</summary>
+    public OperationConcurrencySnapshot GetSnapshot()
+    {
+        var observed = Volatile.Read(ref admission);
+        return new(MaximumConcurrentOperations, observed & int.MaxValue, observed < 0);
+    }
 
     /// <summary>Close admissions permanently and wait until all admitted operations finish cleanup.</summary>
     /// <remarks>Cancellation only cancels this wait. Admitted work continues and admissions stay closed.</remarks>

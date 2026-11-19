@@ -140,7 +140,9 @@ as large. Both limits count admitted business operations. The partition key is t
 authorized tenant. Run --self-test-tenant-capacity --output <new-report.json>
 to verify that another tenant can use spare host capacity. The host closes both
 kinds of budget at shutdown and waits for admitted work within the shutdown
-timeout. Run --self-test-drain --output <new-report.json> for that lifecycle check.
+timeout. Readiness and the post-cleanup stopped report include aggregate capacity
+snapshots when a budget is configured. Tenant snapshots contain counts only.
+Run --self-test-drain --output <new-report.json> for that lifecycle check.
 
 Type `stop` followed by Enter, or Ctrl+C, for awaited listener/handler cleanup and
 a stopped JSON report. Redirected stdin EOF alone keeps the host alive without

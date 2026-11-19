@@ -70,6 +70,7 @@ internal static class BudgetChecks
     internal static async Task TenantLimits()
     {
         var budget = new TenantOperationConcurrencyBudget(2, 1);
+        Verify(budget.GetSnapshot() == new TenantOperationConcurrencySnapshot(new(2, 0, false), 1, 0));
         var a = HeldFixture();
         var b = HeldFixture();
         var fa = a.Build(tenantBudget: budget);
@@ -86,6 +87,8 @@ internal static class BudgetChecks
 
             pendingB = TenantCall(fb, "B").AsTask();
             await b.CleanupEntered!.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var full = budget.GetSnapshot();
+            Verify(full == new TenantOperationConcurrencySnapshot(new(2, 2, false), 1, 2));
             Verify((await TenantCall(noMembershipB, "B")).Error.Code == "access.denied");
             Verify((await TenantCall(noMembershipB, "C")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
             var rejected = await Task.WhenAll(Enumerable.Range(0, 32).Select(i =>
@@ -95,6 +98,8 @@ internal static class BudgetChecks
 
             a.CleanupRelease!.SetResult();
             Verify((await pendingA).IsSuccess && a.Disposed == 1);
+            Verify(budget.GetSnapshot() == new TenantOperationConcurrencySnapshot(new(2, 1, false), 1, 1));
+            Verify(full == new TenantOperationConcurrencySnapshot(new(2, 2, false), 1, 2));
             Verify((await TenantCall(noMembershipB, "C")).IsSuccess && outsider.Disposed == 1);
             Verify((await TenantCall(fa, "B")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
         }
@@ -105,6 +110,7 @@ internal static class BudgetChecks
         }
         Verify((await pendingB!).IsSuccess && b.Disposed == 1);
         Verify((await TenantCall(fa, "B")).IsSuccess && a.Disposed == 2);
+        Verify(budget.GetSnapshot() == new TenantOperationConcurrencySnapshot(new(2, 0, false), 1, 0));
     }
 
     internal static async Task TenantFailureRecovery()
@@ -146,6 +152,7 @@ internal static class BudgetChecks
                == OperationConcurrencyBudget.CapacityExceededCode && factories == 0);
 
         var budget = new OperationConcurrencyBudget(3);
+        Verify(budget.GetSnapshot() == new OperationConcurrencySnapshot(3, 0, false));
         var success = budget.DispatchAsync<int, int>(dispatcher, "drain.own", 1, Context).AsTask();
         var fault = budget.DispatchAsync<int, int>(other, "drain.own", 2, Context).AsTask();
         try
@@ -154,6 +161,7 @@ internal static class BudgetChecks
             var canceledWait = budget.DrainAsync(cancel.Token);
             var first = budget.DrainAsync();
             var second = budget.DrainAsync();
+            Verify(budget.GetSnapshot() == new OperationConcurrencySnapshot(3, 2, true));
             Verify(!first.IsCompleted && !second.IsCompleted);
             Verify((await budget.DispatchAsync<int, int>(other, "drain.own", 3, Context)).Error.Code
                    == OperationConcurrencyBudget.CapacityExceededCode && factories == 2);
@@ -162,10 +170,12 @@ internal static class BudgetChecks
             Verify(!first.IsCompleted && !second.IsCompleted && !success.IsCompleted);
             releaseSuccess.SetResult();
             Verify((await success.WaitAsync(TimeSpan.FromSeconds(5))).Value == 1 && !first.IsCompleted);
+            Verify(budget.GetSnapshot() == new OperationConcurrencySnapshot(3, 1, true));
             releaseFault.SetException(new InvalidDataException("cleanup"));
             await Throws<InvalidDataException>(() => new ValueTask<OperationResult<int>>(fault));
             await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
             Verify(budget.DrainAsync().IsCompletedSuccessfully);
+            Verify(budget.GetSnapshot() == new OperationConcurrencySnapshot(3, 0, true));
             Verify((await budget.DispatchAsync<int, int>(dispatcher, "drain.own", 4, Context)).Error.Code
                    == OperationConcurrencyBudget.CapacityExceededCode && factories == 2);
         }
@@ -193,6 +203,7 @@ internal static class BudgetChecks
             var first = budget.DrainAsync();
             var second = budget.DrainAsync();
             Verify(!first.IsCompleted && !second.IsCompleted);
+            Verify(budget.GetSnapshot() == new TenantOperationConcurrencySnapshot(new(2, 1, true), 1, 1));
             Verify((await TenantCall(otherDispatch, "C")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
             Verify((await TenantCall(otherDispatch, "B")).Error.Code == "access.denied");
             Verify(other.Created == 0 && other.IdentityCalls == 2 && holder.Disposed == 0);
@@ -200,6 +211,7 @@ internal static class BudgetChecks
             Verify((await pending.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess && holder.Disposed == 1);
             await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
             Verify(budget.DrainAsync().IsCompletedSuccessfully);
+            Verify(budget.GetSnapshot() == new TenantOperationConcurrencySnapshot(new(2, 0, true), 1, 0));
             Verify((await TenantCall(otherDispatch, "A")).Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
             Verify(new TenantOperationConcurrencyBudget(1, 1).DrainAsync().IsCompletedSuccessfully);
         }
@@ -207,6 +219,47 @@ internal static class BudgetChecks
         {
             holder.CleanupRelease!.TrySetResult();
         }
+    }
+
+    internal static async Task SnapshotRace()
+    {
+        var budget = new OperationConcurrencyBudget(4);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factories = 0;
+        var dispatcher = new OperationDispatcher(new OperationRegistryBuilder()
+            .Register<int, int>("snapshot.race", () =>
+            {
+                Interlocked.Increment(ref factories);
+                entered.TrySetResult();
+                return new HoldingOperation(release.Task);
+            }).Build());
+        var workers = Enumerable.Range(0, 32).Select(i => Task.Run(async () =>
+        {
+            await start.Task;
+            var call = budget.DispatchAsync<int, int>(dispatcher, "snapshot.race", i, Context);
+            var snapshot = budget.GetSnapshot();
+            Verify(snapshot.MaximumConcurrentOperations == 4 && snapshot.ActiveOperations is >= 0 and <= 4);
+            return await call;
+        })).ToArray();
+        start.SetResult();
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var drain = budget.DrainAsync();
+            var held = budget.GetSnapshot();
+            Verify(held.IsAdmissionClosed && held.ActiveOperations is >= 1 and <= 4);
+            release.SetResult();
+            var results = await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(5));
+            await drain.WaitAsync(TimeSpan.FromSeconds(5));
+            Verify(results.Count(result => result.IsSuccess) == factories && factories is >= 1 and <= 4);
+            Verify(results.Where(result => !result.IsSuccess).All(result =>
+                result.Error.Code == OperationConcurrencyBudget.CapacityExceededCode));
+            Verify(budget.GetSnapshot() == new OperationConcurrencySnapshot(4, 0, true));
+            Verify(held.IsAdmissionClosed && held.ActiveOperations is >= 1 and <= 4);
+        }
+        finally { release.TrySetResult(); }
     }
 
     private static async Task VerifyCanceled(Task task)

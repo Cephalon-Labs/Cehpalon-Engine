@@ -153,6 +153,10 @@ internal static class Values
     }
 }
 
+/// <summary>Aggregate capacity observation containing counts only, with no tenant identities.</summary>
+public readonly record struct TenantOperationConcurrencySnapshot(
+    OperationConcurrencySnapshot Total, int MaximumConcurrentOperationsPerTenant, int ActiveTenants);
+
 /// <summary>Limits total and per-tenant in-flight business operations after fresh tenant authorization.</summary>
 public sealed class TenantOperationConcurrencyBudget
 {
@@ -172,6 +176,16 @@ public sealed class TenantOperationConcurrencyBudget
 
     public int MaximumConcurrentOperations { get; }
     public int MaximumConcurrentOperationsPerTenant { get; }
+
+    /// <summary>Read total and active-tenant counts together under the admission lock.</summary>
+    public TenantOperationConcurrencySnapshot GetSnapshot()
+    {
+        lock (gate)
+        {
+            return new(new(MaximumConcurrentOperations, active, drained is not null),
+                MaximumConcurrentOperationsPerTenant, activeByTenant.Count);
+        }
+    }
 
     /// <summary>Close all tenant admissions permanently and wait until admitted cleanup completes.</summary>
     /// <remarks>Cancellation only cancels this wait. Admitted work continues and admissions stay closed.</remarks>

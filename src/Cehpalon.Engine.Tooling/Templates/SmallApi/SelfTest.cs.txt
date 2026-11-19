@@ -37,10 +37,16 @@ public static async Task<int> RunDrain(string output)
         store.WriteRelease = release;
         store.DelayWrites = true;
         var pending = client.SendAsync(request, deadline.Token);
+        OperationConcurrencySnapshot? held = null, closing = null;
         try
         {
             await store.WriteEntered.Task.WaitAsync(deadline.Token);
+            held = host.CapacitySnapshot;
             var stopping = host.DisposeAsync().AsTask();
+            closing = host.CapacitySnapshot;
+            if (held != new OperationConcurrencySnapshot(2, 1, false)
+                || closing != new OperationConcurrencySnapshot(2, 1, true))
+                throw new InvalidOperationException("Snapshot did not reflect the admitted write and closed admission.");
             if (stopping.IsCompleted || store.Writes != 0 || store.Disposals != 0)
                 throw new InvalidOperationException("Shutdown did not wait for the admitted write.");
             release.SetResult();
@@ -54,8 +60,13 @@ public static async Task<int> RunDrain(string output)
         if (response.StatusCode != HttpStatusCode.OK || store.Factories != 1 || store.Writes != 1
             || store.Disposals != 1 || host.Counters.HostDisposals != 1)
             throw new InvalidOperationException("The admitted write or its owned cleanup did not complete.");
+        var completed = host.CapacitySnapshot;
+        if (completed != new OperationConcurrencySnapshot(2, 0, true)
+            || tenantLimited && host.TenantCapacitySnapshot?.ActiveTenants != 0)
+            throw new InvalidOperationException("Snapshot retained active capacity after cleanup.");
         observations.Add(new { tenantLimited, http = (int)response.StatusCode, store.Factories, store.Writes,
-            store.Disposals, host.Counters.HostDisposals, waitedForRelease = true });
+            store.Disposals, host.Counters.HostDisposals, waitedForRelease = true,
+            held, closing, completed, tenantCapacity = host.TenantCapacitySnapshot });
     }
 
     Directory.CreateDirectory(Path.GetDirectoryName(output)!);

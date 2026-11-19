@@ -117,6 +117,11 @@ public sealed class ActivationCounters
 public sealed class FixtureHost : IAsyncDisposable
 {
     private CatalogStore? store;
+    private OperationConcurrencyBudget? budget;
+    private TenantOperationConcurrencyBudget? tenantBudget;
+    public OperationConcurrencySnapshot? CapacitySnapshot =>
+        tenantBudget is not null ? tenantBudget.GetSnapshot().Total : budget?.GetSnapshot();
+    public TenantOperationConcurrencySnapshot? TenantCapacitySnapshot => tenantBudget?.GetSnapshot();
     public CatalogStore Store => store ?? throw new InvalidOperationException("Catalog module has not activated.");
     public ActivationCounters Counters {get;}=new();
     public WebApplication? Application {get;private set;}
@@ -154,9 +159,9 @@ public sealed class FixtureHost : IAsyncDisposable
             var builder=WebApplication.CreateSlimBuilder(new WebApplicationOptions{Args=[],EnvironmentName="Production"});
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(k=>k.Listen(IPAddress.Loopback,0,l=>{l.Protocols=HttpProtocols.Http1;l.UseHttps(certificate);}));
-            var tenantBudget = maximumConcurrentOperationsPerTenant is int tenantLimit
+            tenantBudget = maximumConcurrentOperationsPerTenant is int tenantLimit
                 ? new TenantOperationConcurrencyBudget(maximumConcurrentOperations!.Value, tenantLimit) : null;
-            var budget = tenantBudget is null && maximumConcurrentOperations is int limit
+            budget = tenantBudget is null && maximumConcurrentOperations is int limit
                 ? new OperationConcurrencyBudget(limit) : null;
             builder.Services.AddSingleton<ITransportOperationDispatcher>(new SampleDispatcher(Store, budget, tenantBudget));
             builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o=>
