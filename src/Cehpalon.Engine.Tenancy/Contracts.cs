@@ -163,6 +163,8 @@ public sealed class TenantOperationConcurrencyBudget
     private readonly object gate = new();
     private readonly Dictionary<TenantId, int> activeByTenant = new();
     private int active;
+    // Low 31 bits hold operations, bits 32-62 hold tenants, and the sign bit closes admissions.
+    private long snapshotState;
     private TaskCompletionSource? drained;
 
     public TenantOperationConcurrencyBudget(int maximumConcurrentOperations, int maximumConcurrentOperationsPerTenant)
@@ -177,14 +179,21 @@ public sealed class TenantOperationConcurrencyBudget
     public int MaximumConcurrentOperations { get; }
     public int MaximumConcurrentOperationsPerTenant { get; }
 
-    /// <summary>Read total and active-tenant counts together under the admission lock.</summary>
+    /// <summary>Read a coherent aggregate published by the admission, release or close operation.</summary>
     public TenantOperationConcurrencySnapshot GetSnapshot()
     {
-        lock (gate)
-        {
-            return new(new(MaximumConcurrentOperations, active, drained is not null),
-                MaximumConcurrentOperationsPerTenant, activeByTenant.Count);
-        }
+        var observed = Volatile.Read(ref snapshotState);
+        return new(new(MaximumConcurrentOperations, (int)(observed & int.MaxValue), observed < 0),
+            MaximumConcurrentOperationsPerTenant, (int)((observed >> 32) & int.MaxValue));
+    }
+
+    // Called only while holding gate. Readers observe one complete published state.
+    private void PublishSnapshot()
+    {
+        var state = ((long)activeByTenant.Count << 32) | (uint)active;
+        if (drained is not null)
+            state |= long.MinValue;
+        Volatile.Write(ref snapshotState, state);
     }
 
     /// <summary>Close all tenant admissions permanently and wait until admitted cleanup completes.</summary>
@@ -195,6 +204,7 @@ public sealed class TenantOperationConcurrencyBudget
         lock (gate)
         {
             drained ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
+            PublishSnapshot();
             if (active == 0)
                 drained.TrySetResult();
 
@@ -229,7 +239,9 @@ public sealed class TenantOperationConcurrencyBudget
                     activeByTenant.Remove(authorizedTenant);
                 else
                     activeByTenant[authorizedTenant] = remaining;
-                if (--active == 0)
+                active--;
+                PublishSnapshot();
+                if (active == 0)
                     drained?.TrySetResult();
             }
         }
@@ -248,6 +260,7 @@ public sealed class TenantOperationConcurrencyBudget
 
             activeByTenant[tenant] = current + 1;
             active++;
+            PublishSnapshot();
             return true;
         }
     }
