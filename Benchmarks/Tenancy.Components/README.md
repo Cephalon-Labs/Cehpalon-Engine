@@ -11,3 +11,5 @@ dotnet Tenancy.Components.dll --observe-budget-snapshots --output=<new-json-path
 ```
 
 The recorded loops include typed delegate calls and checksum calculations. The cached-value lanes run the same loop with detached snapshots. The report retains all five repetitions. Read the [protocol](https://github.com/Cephalon-Labs/Cehpalon-Engine-Docs/blob/main/internal/validation/budget-snapshot-observation.md) before measuring.
+
+Use `--observe-budget-contention --output=<new-json-path>` for the separately declared concurrent observer series. Four dedicated producer threads run fixture-authorized tenant operations while a fifth thread either waits or continuously reads aggregate snapshots. Both modes retain exact operation and cleanup counts. [Concurrent protocol](https://github.com/Cephalon-Labs/Cehpalon-Engine-Docs/blob/main/internal/validation/budget-contention-observation.md)
