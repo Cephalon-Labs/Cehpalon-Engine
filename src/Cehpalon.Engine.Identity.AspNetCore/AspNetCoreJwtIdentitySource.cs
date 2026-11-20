@@ -14,6 +14,7 @@ public sealed class AspNetCoreJwtIdentitySource : IIdentitySource
     private readonly IHttpContextAccessor accessor;
     private readonly string scheme;
     private readonly TimeProvider clock;
+    private readonly string? sessionClaimType;
     public AspNetCoreJwtIdentitySource(IHttpContextAccessor accessor, string authenticationScheme, TimeProvider? timeProvider = null)
     {
         this.accessor = accessor ?? throw new ArgumentNullException(nameof(accessor));
@@ -22,6 +23,11 @@ public sealed class AspNetCoreJwtIdentitySource : IIdentitySource
             throw new ArgumentException("Invalid authentication scheme.", nameof(authenticationScheme));
         scheme = authenticationScheme; clock = timeProvider ?? TimeProvider.System;
     }
+    /// <summary>Explicit session claim mapping; wrap this source with SessionValidatingIdentitySource to check authority.</summary>
+    public AspNetCoreJwtIdentitySource(IHttpContextAccessor accessor, string authenticationScheme, TimeProvider? timeProvider, string sessionClaimType)
+        : this(accessor, authenticationScheme, timeProvider)
+        => this.sessionClaimType = new PrincipalId(sessionClaimType, "session-mapping").Issuer;
+
     public async ValueTask<IdentitySnapshot?> ResolveAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -49,7 +55,9 @@ public sealed class AspNetCoreJwtIdentitySource : IIdentitySource
             var after = DateTimeOffset.FromUnixTimeSeconds(afterSeconds);
             var now = clock.GetUtcNow();
             if (before > now || now >= after) return null;
-            return new(new(issuer, subject), scheme, before, after);
+            var sessionId = sessionClaimType is null ? null : Single(sessionClaimType);
+            if (sessionClaimType is not null && sessionId is null) return null;
+            return new(new(issuer, subject), scheme, before, after, sessionId);
         }
         catch (ArgumentException) { return null; }
     }

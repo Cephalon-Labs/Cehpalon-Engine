@@ -63,3 +63,28 @@ public sealed class TicketPropertyIdentityMapper : IAuthenticatedTicketIdentityM
         catch (ArgumentException) { return null; }
     }
 }
+
+/// <summary>Opt-in unique session claim mapping on the same established cookie/custom ticket mapped by the inner mapper.</summary>
+public sealed class SessionBoundTicketIdentityMapper : IAuthenticatedTicketIdentityMapper
+{
+    private readonly IAuthenticatedTicketIdentityMapper inner;
+    private readonly string claimType;
+    public SessionBoundTicketIdentityMapper(IAuthenticatedTicketIdentityMapper innerMapper, string sessionClaimType = "sid")
+    {
+        inner = innerMapper ?? throw new ArgumentNullException(nameof(innerMapper));
+        claimType = new PrincipalId(sessionClaimType, "session-mapping").Issuer;
+    }
+    public IdentitySnapshot? Map(AuthenticationTicket ticket, string authenticationScheme, DateTimeOffset observedAtUtc)
+    {
+        ArgumentNullException.ThrowIfNull(ticket);
+        var identity = inner.Map(ticket, authenticationScheme, observedAtUtc);
+        if (identity is null) return null;
+        var claims = ticket.Principal.Claims.Take(257).ToArray();
+        if (claims.Length > 256) return null;
+        var sessions = claims.Where(c => StringComparer.Ordinal.Equals(c.Type, claimType)).Take(2).ToArray();
+        if (sessions.Length != 1 || (identity.SessionId is not null &&
+            !StringComparer.Ordinal.Equals(identity.SessionId, sessions[0].Value))) return null;
+        try { return new(identity.Principal, identity.AuthenticationScheme, identity.NotBeforeUtc, identity.ExpiresAtUtc, sessions[0].Value); }
+        catch (ArgumentException) { return null; }
+    }
+}

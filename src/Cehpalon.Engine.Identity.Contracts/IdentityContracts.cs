@@ -33,9 +33,14 @@ public sealed class PrincipalId : IEquatable<PrincipalId>
 public sealed class IdentitySnapshot
 {
     public const int MaximumSchemeLength = 128;
+    public const int MaximumSessionIdLength = 256;
 
     public IdentitySnapshot(PrincipalId principal, string authenticationScheme,
         DateTimeOffset notBeforeUtc, DateTimeOffset expiresAtUtc)
+        : this(principal, authenticationScheme, notBeforeUtc, expiresAtUtc, null) { }
+
+    public IdentitySnapshot(PrincipalId principal, string authenticationScheme,
+        DateTimeOffset notBeforeUtc, DateTimeOffset expiresAtUtc, string? sessionId)
     {
         ArgumentNullException.ThrowIfNull(principal);
         if (expiresAtUtc <= notBeforeUtc)
@@ -44,9 +49,11 @@ public sealed class IdentitySnapshot
         AuthenticationScheme = IdentityText.Require(authenticationScheme, MaximumSchemeLength, nameof(authenticationScheme));
         NotBeforeUtc = notBeforeUtc.ToUniversalTime();
         ExpiresAtUtc = expiresAtUtc.ToUniversalTime();
+        SessionId = sessionId is null ? null : IdentityText.Require(sessionId, MaximumSessionIdLength, nameof(sessionId));
     }
 
     public PrincipalId Principal { get; }
+    public string? SessionId { get; }
     public string AuthenticationScheme { get; }
     public DateTimeOffset NotBeforeUtc { get; }
     public DateTimeOffset ExpiresAtUtc { get; }
@@ -60,6 +67,83 @@ public sealed class IdentitySnapshot
 public interface IIdentitySource
 {
     ValueTask<IdentitySnapshot?> ResolveAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>Bounded session authority facts from a configured trusted source; construction is not authority.</summary>
+public sealed class SessionStatusSnapshot
+{
+    public SessionStatusSnapshot(PrincipalId principal, string authenticationScheme, string sessionId, bool isActive,
+        DateTimeOffset notBeforeUtc, DateTimeOffset expiresAtUtc)
+    {
+        Principal = principal ?? throw new ArgumentNullException(nameof(principal));
+        AuthenticationScheme = IdentityText.Require(authenticationScheme, IdentitySnapshot.MaximumSchemeLength, nameof(authenticationScheme));
+        SessionId = IdentityText.Require(sessionId, IdentitySnapshot.MaximumSessionIdLength, nameof(sessionId));
+        if (expiresAtUtc <= notBeforeUtc) throw new ArgumentException("Session validity must have a positive interval.", nameof(expiresAtUtc));
+        IsActive = isActive; NotBeforeUtc = notBeforeUtc.ToUniversalTime(); ExpiresAtUtc = expiresAtUtc.ToUniversalTime();
+    }
+    public PrincipalId Principal { get; }
+    public string AuthenticationScheme { get; }
+    public string SessionId { get; }
+    public bool IsActive { get; }
+    public DateTimeOffset NotBeforeUtc { get; }
+    public DateTimeOffset ExpiresAtUtc { get; }
+}
+
+/// <summary>Trusted application session authority. Resolve afresh; null/inactive denies and faults/cancellation propagate.</summary>
+public interface IIdentitySessionStatusSource
+{
+    ValueTask<SessionStatusSnapshot?> ResolveAsync(IdentitySnapshot identity, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Optional fresh session-status observation after established authentication, including cached host tickets.
+/// This is not a live revocation subscription or atomic transaction with later admission/business execution.
+/// </summary>
+public sealed class SessionValidatingIdentitySource : IIdentitySource
+{
+    private readonly IIdentitySource inner;
+    private readonly IIdentitySessionStatusSource sessions;
+    private readonly TimeSpan maximumLifetime;
+    private readonly TimeProvider clock;
+    public SessionValidatingIdentitySource(IIdentitySource inner, IIdentitySessionStatusSource statusSource,
+        TimeSpan maximumObservationLifetime, TimeProvider? timeProvider = null)
+    {
+        this.inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        sessions = statusSource ?? throw new ArgumentNullException(nameof(statusSource));
+        if (maximumObservationLifetime <= TimeSpan.Zero || maximumObservationLifetime > TimeSpan.FromMinutes(5))
+            throw new ArgumentOutOfRangeException(nameof(maximumObservationLifetime), "The observation lifetime must be positive and at most five minutes.");
+        maximumLifetime = maximumObservationLifetime; clock = timeProvider ?? TimeProvider.System;
+    }
+    public async ValueTask<IdentitySnapshot?> ResolveAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var before = clock.GetUtcNow(); var started = clock.GetTimestamp();
+        var identity = await inner.ResolveAsync(cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (identity is null || identity.SessionId is null) return null;
+        var authenticatedAt = clock.GetUtcNow(); var authenticatedTimestamp = clock.GetTimestamp();
+        var authenticationElapsed = clock.GetElapsedTime(started, authenticatedTimestamp);
+        if (authenticatedAt < before || authenticatedTimestamp < started || authenticationElapsed < TimeSpan.Zero ||
+            authenticationElapsed >= maximumLifetime || identity.NotBeforeUtc > authenticatedAt || authenticatedAt >= identity.ExpiresAtUtc) return null;
+        var status = await sessions.ResolveAsync(identity, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        var after = clock.GetUtcNow(); var ended = clock.GetTimestamp();
+        var elapsed = clock.GetElapsedTime(started, ended);
+        if (after < authenticatedAt || ended < authenticatedTimestamp || elapsed < authenticationElapsed || elapsed >= maximumLifetime ||
+            identity.NotBeforeUtc > after || after >= identity.ExpiresAtUtc || status is null || !status.IsActive ||
+            !status.Principal.Equals(identity.Principal) || !StringComparer.Ordinal.Equals(status.AuthenticationScheme, identity.AuthenticationScheme) ||
+            !StringComparer.Ordinal.Equals(status.SessionId, identity.SessionId) || status.NotBeforeUtc > after || after >= status.ExpiresAtUtc) return null;
+        var notBefore = identity.NotBeforeUtc > status.NotBeforeUtc ? identity.NotBeforeUtc : status.NotBeforeUtc;
+        if (after > notBefore) notBefore = after;
+        var expires = identity.ExpiresAtUtc < status.ExpiresAtUtc ? identity.ExpiresAtUtc : status.ExpiresAtUtc;
+        var utcCap = AddBounded(before, maximumLifetime); var remainingCap = AddBounded(after, maximumLifetime - elapsed);
+        if (utcCap < expires) expires = utcCap;
+        if (remainingCap < expires) expires = remainingCap;
+        return expires > after && expires > notBefore
+            ? new(identity.Principal, identity.AuthenticationScheme, notBefore, expires, identity.SessionId) : null;
+    }
+    private static DateTimeOffset AddBounded(DateTimeOffset value, TimeSpan duration)
+        => duration.Ticks > DateTimeOffset.MaxValue.UtcTicks - value.UtcTicks ? DateTimeOffset.MaxValue : value.Add(duration);
 }
 
 /// <summary>

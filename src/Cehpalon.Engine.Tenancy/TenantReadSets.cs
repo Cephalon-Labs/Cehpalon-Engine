@@ -234,10 +234,11 @@ public sealed class TenantReadSetDispatcher
             cancellationToken.ThrowIfCancellationRequested();
             try { run.DemandActive(); } catch (TenantAccessDeniedException) { return null; }
             if (fresh is null || !fresh.Principal.Equals(run.Identity!.Principal)
-                || !StringComparer.Ordinal.Equals(fresh.AuthenticationScheme, run.Identity.AuthenticationScheme)) return null;
+                || !StringComparer.Ordinal.Equals(fresh.AuthenticationScheme, run.Identity.AuthenticationScheme)
+                || !StringComparer.Ordinal.Equals(fresh.SessionId, run.Identity.SessionId)) return null;
             var before = fresh.NotBeforeUtc > run.Start ? fresh.NotBeforeUtc : run.Start;
             var after = fresh.ExpiresAtUtc < run.Expires ? fresh.ExpiresAtUtc : run.Expires;
-            return after > before ? new(fresh.Principal, fresh.AuthenticationScheme, before, after) : null;
+            return after > before ? new(fresh.Principal, fresh.AuthenticationScheme, before, after, fresh.SessionId) : null;
         }
     }
 }
