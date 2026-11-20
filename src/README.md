@@ -7,6 +7,7 @@ The first experimental implementation slices are:
 - [CodeGeneration](Cehpalon.Engine.CodeGeneration/README.md): compile-time typed operation registration through an opt-in incremental analyzer. Roslyn is not a Core/consumer runtime dependency.
 - [Identity.Contracts](Cehpalon.Engine.Identity.Contracts/README.md): immutable identity representations and exact trust/time acceptance for configured sources; no JWT parser/authentication implementation.
 - [Identity.AspNetCore](Cehpalon.Engine.Identity.AspNetCore/README.md): optional explicit-scheme authenticated JWT ticket bridge; established host handlers own cryptographic validation.
+- [Identity.JwtBearer](Cehpalon.Engine.Identity.JwtBearer/README.md): frozen appsettings profiles selecting algorithm, public JWKS, trusted supplied keys or HTTPS metadata. Established handlers own cryptography; cookie/custom ticket mapping is also pluggable.
 - [Authorization](Cehpalon.Engine.Authorization/README.md): optional default-deny RBAC/ABAC over fresh principal/tenant/resource/version-bound facts, with fact validity bounding the operation lease.
 - [Tenancy](Cehpalon.Engine.Tenancy/README.md): fresh authority checks, immutable checked scope and owned tenant handlers over a private Core bridge. Caller metadata is not authority; provider checks and protocol adapters remain required.
 
