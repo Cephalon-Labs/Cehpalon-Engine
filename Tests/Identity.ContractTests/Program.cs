@@ -231,7 +231,10 @@ await Check("source contract permits asynchronous cancellation propagation",asyn
 await Check("identity value shapes contain no raw token, claims, role or tenant authority bag",()=>Sync(()=>
 {
     var names=typeof(IdentitySnapshot).GetProperties().Select(p=>p.Name).ToArray();
-    Assert(names.Order().SequenceEqual(new[]{"AuthenticationScheme","ExpiresAtUtc","NotBeforeUtc","Principal"}.Order()));
+    Assert(names.Order().SequenceEqual(new[]{"AuthenticationScheme","ExpiresAtUtc","NotBeforeUtc","Principal","SessionId"}.Order()));
+    var session=typeof(IdentitySnapshot).GetProperty(nameof(IdentitySnapshot.SessionId))!;
+    Assert(session.PropertyType==typeof(string) && session.SetMethod is null);
+    Assert(new System.Reflection.NullabilityInfoContext().Create(session).ReadState==System.Reflection.NullabilityState.Nullable);
     Assert(typeof(IIdentitySource).GetMethods().Single().GetParameters().Single().ParameterType==typeof(CancellationToken));
 }));
 await Check("identity assembly references BCL only and not Core or provider frameworks",()=>Sync(()=>
