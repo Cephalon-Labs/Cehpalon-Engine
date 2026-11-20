@@ -133,7 +133,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         { throw new AggregateException("Operation and required audit persistence failed.",executionFailure,auditFailure); }
         if(executionFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(executionFailure).Throw();
         return result!.IsSuccess && authority is not null && !authority.Identity.SatisfiesObservationConstraints()
-            ? Denied() : result;
+            ? Denied() : result!;
     }
 
     private async ValueTask<OperationResult<TResponse>> DispatchCoreAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,

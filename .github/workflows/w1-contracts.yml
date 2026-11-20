@@ -8,6 +8,8 @@ on:
       - Tests/Core.ContractTests/**
       - Tests/Composition.ContractTests/**
       - Tests/CodeGeneration.ContractTests/**
+      - Tests/Observation.ContractTests/**
+      - Tests/AuditTrail.ContractTests/**
       - Tests/Session.ContractTests/**
       - Tests/KeyRing.ContractTests/**
       - Tests/Jwe.ContractTests/**
