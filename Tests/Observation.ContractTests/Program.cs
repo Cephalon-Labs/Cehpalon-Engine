@@ -95,6 +95,12 @@ await Check("expiry during terminal read-set audit still withholds successful ro
 {var f=new Fixture();f.BatchTerminalHook=()=>f.Clock.Mono(3);var r=await f.Batch();Require(!r.IsSuccess&&f.Factories==2&&f.Disposals==2);});
 await Check("unconstrained legacy success retains existing semantics without observation checks",async()=>
 {var f=new Fixture{Decorate=false};f.HandlerHook=()=>f.Clock.Mono(90);var r=await f.Dispatch();Require(r.IsSuccess&&f.Disposals==1);});
+await Check("terminal audit expiry withholds success after cleanup without rewriting processing history",async()=>
+{var f=new Fixture();f.TerminalHook=()=>f.Clock.Mono(3);var r=await f.Dispatch();Require(!r.IsSuccess&&f.Factories==1&&f.Disposals==1&&f.Events.Count==2&&f.Events.Last().Outcome==TenantAuditOutcome.Succeeded);});
+await Check("unconstrained terminal audit retains existing success semantics",async()=>
+{var f=new Fixture{Decorate=false};f.TerminalHook=()=>f.Clock.Mono(90);var r=await f.Dispatch();Require(r.IsSuccess&&f.Disposals==1&&f.Events.Last().Outcome==TenantAuditOutcome.Succeeded);});
+await Check("terminal persistence fault precedes successful-result observation veto",async()=>
+{var f=new Fixture();f.TerminalHook=()=>{f.Clock.Mono(3);throw new IOException("Controlled terminal failure.");};await Throws<TenantAuditWriteException>(async()=>await f.Dispatch());Require(f.Disposals==1);});
 await Check("required audit contains no raw session identifier or added observation state",async()=>
 {var f=new Fixture();f.PolicyHook=()=>f.Clock.Mono(3);await f.Dispatch();var text=JsonSerializer.Serialize(f.Events);Require(!text.Contains("session-a",StringComparison.Ordinal)&&!text.Contains("Observation",StringComparison.Ordinal)&&f.Events.All(e=>e.AuthorizedTenant is null));});
 await Check("disabled composition creates no observation or session provider work",async()=>
@@ -115,7 +121,7 @@ sealed class Clock:TimeProvider
 sealed class Fixture:IIdentitySource,IIdentitySessionStatusSource,ITenantMembershipSource,IResourceScopeSource,ITenantAccessPolicy,ITenantReadSetSource,ITenantAuditSink
 {
  public Clock Clock{get;}=new();public TimeSpan Cap=TimeSpan.FromSeconds(2),IdentityLifetime=TimeSpan.FromMinutes(5),StatusLifetime=TimeSpan.FromMinutes(5);public TimeSpan? ChildStatusLifetime;public bool Decorate=true,BusinessFailure,DemandAfterHook;public int StatusCalls,Factories,Executions,Disposals,LastBudgetActive;
- public Action? StatusHook,MembershipHook,ResourceHook,PolicyHook,AuthorizationHook,GrantHook,HandlerHook,DisposeHook,FactoryHook,AfterFirst,BatchAuthorizationHook,BatchTerminalHook;
+ public Action? StatusHook,MembershipHook,ResourceHook,PolicyHook,AuthorizationHook,GrantHook,HandlerHook,DisposeHook,FactoryHook,AfterFirst,BatchAuthorizationHook,BatchTerminalHook,TerminalHook;
  public List<TenantAuditEvent> Events{get;}=[];
  public ValueTask<IdentitySnapshot?> ResolveAsync(CancellationToken token){token.ThrowIfCancellationRequested();return ValueTask.FromResult<IdentitySnapshot?>(new(new("issuer","alice"),"Bearer",Clock.Now.AddMinutes(-1),Clock.Now+IdentityLifetime,"session-a"));}
  public ValueTask<SessionStatusSnapshot?> ResolveAsync(IdentitySnapshot i,CancellationToken token){token.ThrowIfCancellationRequested();StatusCalls++;StatusHook?.Invoke();var lifetime=StatusCalls>1&&ChildStatusLifetime.HasValue?ChildStatusLifetime.Value:StatusLifetime;return ValueTask.FromResult<SessionStatusSnapshot?>(new(i.Principal,i.AuthenticationScheme,i.SessionId!,true,Clock.Now.AddMinutes(-1),Clock.Now+lifetime));}
@@ -125,7 +131,7 @@ sealed class Fixture:IIdentitySource,IIdentitySessionStatusSource,ITenantMembers
  public ValueTask<ResourceScopeSnapshot?> ResolveAsync(TenantId t,string kind,string id,CancellationToken token){ResourceHook?.Invoke();return ValueTask.FromResult<ResourceScopeSnapshot?>(new(t,kind,id,"r1"));}
  public ValueTask<bool> IsAllowedAsync(TenantAccessRequest r,CancellationToken token){PolicyHook?.Invoke();return ValueTask.FromResult(true);}
  public ValueTask<TenantReadSetSnapshot?> ResolveAsync(TenantReadSetRequest r,CancellationToken token){GrantHook?.Invoke();return ValueTask.FromResult<TenantReadSetSnapshot?>(new(r.Identity.Principal,r.OperationId,r.ResourceKind,r.ResourceId,[new("A"),new("B")],Clock.Now.AddMinutes(-1),Clock.Now.AddMinutes(5),"g1"));}
- public ValueTask AppendAsync(TenantAuditEvent e,CancellationToken token){Events.Add(e);if(e.OperationId=="document.read_all"&&e.AuthorizedTenant is null){if(e.Stage==TenantAuditStage.Authorization)BatchAuthorizationHook?.Invoke();else BatchTerminalHook?.Invoke();}else if(e.Stage==TenantAuditStage.Authorization)AuthorizationHook?.Invoke();return ValueTask.CompletedTask;}
+ public ValueTask AppendAsync(TenantAuditEvent e,CancellationToken token){Events.Add(e);if(e.OperationId=="document.read_all"&&e.AuthorizedTenant is null){if(e.Stage==TenantAuditStage.Authorization)BatchAuthorizationHook?.Invoke();else BatchTerminalHook?.Invoke();}else if(e.Stage==TenantAuditStage.Authorization)AuthorizationHook?.Invoke();else TerminalHook?.Invoke();return ValueTask.CompletedTask;}
  public void At(string phase,Action action){switch(phase){case "membership":MembershipHook=action;break;case "resource":ResourceHook=action;break;case "policy":PolicyHook=action;break;case "audit":AuthorizationHook=action;break;case "handler":HandlerHook=action;break;case "cleanup":DisposeHook=action;break;case "grant":GrantHook=action;break;case "batch-audit":BatchAuthorizationHook=action;break;default:throw new ArgumentException("Phase");}}
  public async ValueTask<OperationResult<string>> Dispatch(CancellationToken token=default,string? capacity=null)
  {
