@@ -397,6 +397,31 @@ public sealed class TenantChangeAuditRecorder
         context.DemandAccess(context.Tenant, context.Resource.Kind, context.Resource.ResourceId, context.Action);
         validatedRegistry?.DemandContextBinding(context);
     }
+    /// <summary>
+    /// Prepare before invoking one trusted mutation, then await its required trail before returning its result.
+    /// Once invocation starts, every failure conservatively reports possible committed effects. A returned
+    /// receipt's completion uses the private write deadline independently of pending caller cancellation;
+    /// cancellation is checked again before returning. No receipt can be invented when the mutation throws.
+    /// This does not make mutation and trail persistence atomic or provide retries or rollback.
+    /// </summary>
+    public async ValueTask<TResult> ExecuteAsync<TResult>(TenantOperationContext context,
+        Func<CancellationToken, ValueTask<TenantChangeAuditMutation<TResult>>> mutation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        var preparation = Prepare(context, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            var changed = await mutation(cancellationToken).ConfigureAwait(false)
+                ?? throw new ArgumentException("The trusted mutation returned no change receipt.", nameof(mutation));
+            await preparation.CompleteAsync(changed.Receipt, changed.ValuesFactory, CancellationToken.None).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            return changed.Result;
+        }
+        catch (TenantChangeAuditWriteException) { throw; }
+        catch (Exception failure) { throw new TenantChangeAuditWriteException(failure); }
+    }
     public async ValueTask RecordAsync(TenantOperationContext context, TenantChangeReceipt receipt,
         Func<TenantChangeStates>? valuesFactory = null, CancellationToken cancellationToken = default)
     {
@@ -436,6 +461,23 @@ public sealed class TenantChangeAuditRecorder
             !StringComparer.Ordinal.Equals(context.OperationId, receipt.OperationId) || !StringComparer.Ordinal.Equals(context.Resource.Version, receipt.AuthorizationResourceVersion))
             throw new TenantAccessDeniedException();
     }
+}
+/// <summary>
+/// Application-reported mutation result, receipt and optional lazy states for ExecuteAsync.
+/// The receipt reports the application's claim; construction does not prove a database commit.
+/// </summary>
+public sealed class TenantChangeAuditMutation<TResult>
+{
+    public TenantChangeAuditMutation(TenantChangeReceipt receipt, TResult result,
+        Func<TenantChangeStates>? valuesFactory = null)
+    {
+        Receipt = receipt ?? throw new ArgumentNullException(nameof(receipt));
+        Result = result;
+        ValuesFactory = valuesFactory;
+    }
+    public TenantChangeReceipt Receipt { get; }
+    public TResult Result { get; }
+    internal Func<TenantChangeStates>? ValuesFactory { get; }
 }
 /// <summary>
 /// Opaque single-attempt recording preparation bound to its original recorder and checked context.
