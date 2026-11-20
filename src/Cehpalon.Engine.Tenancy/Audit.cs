@@ -329,9 +329,10 @@ public sealed class TenantChangeAuditRecorder
     private readonly ITenantChangeAuditSink sink;
     private readonly TimeSpan timeout;
     private readonly TimeProvider clock;
-    private TenantChangeAuditRecorder(TenantChangeAuditPolicy policy, ITenantChangeAuditSink sink, TimeSpan? writeTimeout, TimeProvider? timeProvider)
+    private readonly TenantOperationRegistry? validatedRegistry;
+    private TenantChangeAuditRecorder(TenantChangeAuditPolicy policy, ITenantChangeAuditSink sink, TimeSpan? writeTimeout, TimeProvider? timeProvider, TenantOperationRegistry? validatedRegistry = null)
     {
-        this.policy = policy; this.sink = sink; timeout = writeTimeout ?? TimeSpan.FromSeconds(5); clock = timeProvider ?? TimeProvider.System;
+        this.policy = policy; this.sink = sink; this.validatedRegistry = validatedRegistry; timeout = writeTimeout ?? TimeSpan.FromSeconds(5); clock = timeProvider ?? TimeProvider.System;
         if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromMinutes(1)) throw new ArgumentOutOfRangeException(nameof(writeTimeout));
     }
     public static TenantChangeAuditRecorder? Activate(TenantChangeAuditPolicy policy, Func<ITenantChangeAuditSink>? sinkFactory = null,
@@ -342,6 +343,59 @@ public sealed class TenantChangeAuditRecorder
         ArgumentNullException.ThrowIfNull(sinkFactory);
         if (writeTimeout is { } bound && (bound <= TimeSpan.Zero || bound > TimeSpan.FromMinutes(1))) throw new ArgumentOutOfRangeException(nameof(writeTimeout));
         return new(policy, sinkFactory() ?? throw new ArgumentException("The trusted trail sink factory returned null."), writeTimeout, timeProvider);
+    }
+    /// <summary>
+    /// Validate actual frozen registration metadata and explicit audited operation requirements before loading the sink.
+    /// A validated recorder accepts checked contexts only from this exact registry instance.
+    /// Disabled mode skips the catalog, required enumeration and provider factory entirely.
+    /// </summary>
+    public static TenantChangeAuditRecorder? ActivateValidated(TenantChangeAuditPolicy policy, TenantOperationRegistry? registry,
+        IEnumerable<string>? requiredOperationIds, Func<ITenantChangeAuditSink>? sinkFactory = null,
+        TimeSpan? writeTimeout = null, TimeProvider? timeProvider = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        ArgumentNullException.ThrowIfNull(registry); ArgumentNullException.ThrowIfNull(requiredOperationIds);
+        ArgumentNullException.ThrowIfNull(sinkFactory);
+        if (writeTimeout is { } bound && (bound <= TimeSpan.Zero || bound > TimeSpan.FromMinutes(1)))
+            throw new ArgumentOutOfRangeException(nameof(writeTimeout));
+        var actual = registry.DescribeOperations().ToDictionary(x => x.OperationId, StringComparer.Ordinal);
+        foreach (var rule in policy.Rules)
+            if (!actual.TryGetValue(rule.OperationId, out var registered) ||
+                !StringComparer.Ordinal.Equals(rule.Action, registered.Action) ||
+                !StringComparer.Ordinal.Equals(rule.ResourceKind, registered.ResourceKind))
+                throw new ArgumentException("An audit rule does not match the registered operation/action/resource kind: " + rule.OperationId, nameof(policy));
+        var required = requiredOperationIds.Take(129).ToArray();
+        if (required.Length > 128) throw new ArgumentException("At most128 required audited operations are supported.", nameof(requiredOperationIds));
+        var distinct = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var operationId in required)
+        {
+            Cehpalon.Engine.Core.OperationId.RequireValid(operationId);
+            if (!distinct.Add(operationId)) throw new ArgumentException("Required audited operation IDs must be unique.", nameof(requiredOperationIds));
+            if (!actual.ContainsKey(operationId) || !policy.Rules.Any(x => StringComparer.Ordinal.Equals(x.OperationId, operationId)))
+                throw new ArgumentException("A required audited operation is not registered with a matching audit rule: " + operationId, nameof(requiredOperationIds));
+        }
+        return new(policy, sinkFactory() ?? throw new ArgumentException("The trusted trail sink factory returned null."),
+            writeTimeout, timeProvider, registry);
+    }
+    /// <summary>
+    /// Check cancellation, live scope, exact validated registry and rule before the application mutates data.
+    /// This does not reserve storage, perform provider I/O or authorize a future commit.
+    /// </summary>
+    public TenantChangeAuditPreparation Prepare(TenantOperationContext context, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context); cancellationToken.ThrowIfCancellationRequested();
+        DemandContext(context);
+        if (!policy.Rules.Any(x => StringComparer.Ordinal.Equals(x.OperationId, context.OperationId) &&
+            StringComparer.Ordinal.Equals(x.Action, context.Action) && StringComparer.Ordinal.Equals(x.ResourceKind, context.Resource.Kind)))
+            throw new TenantAccessDeniedException();
+        cancellationToken.ThrowIfCancellationRequested();
+        return new(this, context);
+    }
+    private void DemandContext(TenantOperationContext context)
+    {
+        context.DemandAccess(context.Tenant, context.Resource.Kind, context.Resource.ResourceId, context.Action);
+        validatedRegistry?.DemandContextBinding(context);
     }
     public async ValueTask RecordAsync(TenantOperationContext context, TenantChangeReceipt receipt,
         Func<TenantChangeStates>? valuesFactory = null, CancellationToken cancellationToken = default)
@@ -374,14 +428,40 @@ public sealed class TenantChangeAuditRecorder
         }
         catch (Exception error) { throw new TenantChangeAuditWriteException(error); }
     }
-    private static void Demand(TenantOperationContext context, TenantChangeReceipt receipt)
+    private void Demand(TenantOperationContext context, TenantChangeReceipt receipt)
     {
+        DemandContext(context);
         context.DemandAccess(receipt.Tenant, receipt.ResourceKind, receipt.ResourceId, receipt.Action);
         if (!context.Identity.Principal.Equals(receipt.Principal) || !StringComparer.Ordinal.Equals(context.Identity.AuthenticationScheme, receipt.AuthenticationScheme) ||
             !StringComparer.Ordinal.Equals(context.OperationId, receipt.OperationId) || !StringComparer.Ordinal.Equals(context.Resource.Version, receipt.AuthorizationResourceVersion))
             throw new TenantAccessDeniedException();
     }
 }
+/// <summary>
+/// Opaque single-attempt recording preparation bound to its original recorder and checked context.
+/// It is not a database reservation, mutation authorization, proof of commit or backend exactly-once guarantee.
+/// </summary>
+public sealed class TenantChangeAuditPreparation
+{
+    private readonly TenantChangeAuditRecorder owner;
+    private readonly TenantOperationContext context;
+    private int consumed;
+    internal TenantChangeAuditPreparation(TenantChangeAuditRecorder owner, TenantOperationContext context)
+        => (this.owner, this.context) = (owner, context);
+    public async ValueTask CompleteAsync(TenantChangeReceipt receipt, Func<TenantChangeStates>? valuesFactory = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (Interlocked.CompareExchange(ref consumed, 1, 0) != 0)
+                throw new InvalidOperationException("The audit preparation has already been consumed.");
+            await owner.RecordAsync(context, receipt, valuesFactory, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TenantChangeAuditWriteException) { throw; }
+        catch (Exception failure) { throw new TenantChangeAuditWriteException(failure); }
+    }
+}
+
 public sealed class TenantChangeAuditPage
 {
     public TenantChangeAuditPage(IEnumerable<TenantChangeAuditRecord> entries, string? nextCursor = null)

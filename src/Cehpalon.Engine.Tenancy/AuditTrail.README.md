@@ -1,5 +1,27 @@
 # Optional audit history and change trails
 
+## Validate and prepare before mutation
+
+Freeze the actual tenant registry once and use that same instance for dispatch and validated trail activation. `DescribeOperations()` returns ordinal, immutable operation/action/resource-kind descriptions without invoking request freezers, selectors, business factories or providers. Descriptions are informational metadata, not authority.
+
+```csharp
+var recorder = TenantChangeAuditRecorder.ActivateValidated(
+    policy, tenantRegistry, ["document.update"], () => trustedStore);
+// Inside the checked tenant handler, before the application's data mutation:
+var preparation = recorder!.Prepare(context, cancellationToken);
+var receipt = await application.MutateAndReportAsync(cancellationToken);
+await preparation.CompleteAsync(receipt,
+    () => new TenantChangeStates(beforeState, afterState), cancellationToken);
+```
+
+Validated activation checks every configured rule against the actual registered action/resource kind and every explicitly required operation (at most128 distinct IDs) before calling the sink factory. It does not infer audited operations from CRUD labels or action names. Disabled skips catalog, required-ID enumeration and provider work. A validated recorder checks the exact registry instance even when two registries were built from the same builder. Existing `Activate` and `RecordAsync` remain available for explicit lower-level integration; direct recording on a validated recorder still enforces its registry binding.
+
+`Prepare` performs only cancellation, current checked-scope/registry and rule validation. Failure is ordinary denial/cancellation before the application should mutate; no payload or sink I/O occurs. The sealed preparation captures its original recorder and checked context. It is not a provider-health check, database reservation, mutation authorization or proof of commit. The context must still be active when completing.
+
+`CompleteAsync` consumes the preparation atomically before receipt validation, payload callbacks or append. Concurrent/repeated completion and any failed first attempt cannot invoke another callback or append through that instance. All completion failures, including cancellation, invalid/null receipt, replay and a sink failure, report `TenantChangeAuditWriteException.MayHaveCommitted`: the application may already have changed data or the first attempt may have persisted. This is at most one facade append attempt per preparation, not backend exactly-once or an automatic retry/rollback guarantee. No disposal/background worker or automatic abort is installed. Provider receipt IDs and transaction/outbox handling remain application responsibilities.
+
+Prepared metadata-only or empty-field capture retains the existing lazy payload behavior and redaction/history policy. Project configuration and registry validation complement the normal fresh tenant/identity/RBAC/ABAC boundary; they do not replace it.
+
 The engine supports project-selected Disabled, MetadataOnly, ChangedFields and BeforeAfterSnapshots modes. Automatic TenantAuditServices remains operation metadata. These new APIs record explicit domain/entity change receipts reported by trusted application/provider code, including before/after values only where configured. They do not infer a database commit or diff an arbitrary request/response.
 
 ```csharp

@@ -108,8 +108,9 @@ public sealed class TenantOperationContext
 {
     private readonly AuthorizationLease lease;
     private readonly object origin;
-    internal TenantOperationContext(TenantAccessRequest access,OperationContext correlation,AuthorizationLease lease,object origin)
-    { Access=access; Correlation=correlation; this.lease=lease; this.origin=origin; }
+    private readonly TenantOperationRegistry registry;
+    internal TenantOperationContext(TenantAccessRequest access,OperationContext correlation,AuthorizationLease lease,object origin,TenantOperationRegistry registry)
+    { Access=access; Correlation=correlation; this.lease=lease; this.origin=origin; this.registry=registry; }
     internal TenantAccessRequest Access { get; }
     public string OperationId=>Access.OperationId;
     public string Action=>Access.Action;
@@ -121,6 +122,11 @@ public sealed class TenantOperationContext
     public void DemandAccess(TenantId tenant,string kind,string resourceId,string action)
     {
         if(!Tenant.Equals(tenant) || !StringComparer.Ordinal.Equals(Resource.Kind,kind) || !StringComparer.Ordinal.Equals(Resource.ResourceId,resourceId) || !StringComparer.Ordinal.Equals(Action,action)) throw new TenantAccessDeniedException();
+        lease.DemandActive();
+    }
+    internal void DemandRegistryBinding(TenantOperationRegistry expectedRegistry)
+    {
+        if (!ReferenceEquals(registry, expectedRegistry)) throw new TenantAccessDeniedException();
         lease.DemandActive();
     }
     internal void DemandBinding(object expectedOrigin,string operationId)
