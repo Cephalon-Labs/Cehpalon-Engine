@@ -13,6 +13,238 @@ namespace PortableConsumers.Generated;
 
 public static class SelfTest
 {
+public static async Task<int> RunLiveMetrics(string output)
+{
+    output = Path.GetFullPath(output);
+    if (File.Exists(output)) throw new IOException("Use a new report path.");
+    var cases = new List<Dictionary<string, object?>>();
+    object? disabled = null;
+    var passed = true;
+    try
+    {
+        using var tls = new TlsFixture();
+        using var jwt = new JwtFixture();
+        string Config(string file) => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, file), Encoding.UTF8);
+        foreach (var tenantLimited in new[] { false, true })
+        {
+            var samples = new List<object>();
+            var result = new Dictionary<string, object?>
+            {
+                ["tenantLimited"] = tenantLimited, ["status"] = "started", ["collections"] = samples
+            };
+            cases.Add(result);
+            await using var host = new FixtureHost();
+            await host.Start(Config("appsettings.graphql.json"), tls, jwt, 8, tenantLimited ? 4 : null);
+            using var client = tls.Client(host.Address);
+            client.Timeout = Timeout.InfiniteTimeSpan;
+            var aliceToken = jwt.Token();
+            var bobToken = jwt.Token("bob");
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            using var samplerStop = new CancellationTokenSource();
+            var collectionGate = new object();
+            var values = new Dictionary<string, int>(5, StringComparer.Ordinal);
+            var lastClosed = 0;
+            var callbacks = 0;
+            var invalid = 0;
+            var midpoint = CatalogStore.NewSignal();
+            var midpointRelease = CatalogStore.NewSignal();
+            var midpointObserved = CatalogStore.NewSignal();
+            var halfDrivers = 0;
+            var store = host.Store;
+            var release = CatalogStore.NewSignal();
+            store.WriteRelease = release;
+            store.DelayWrites = true;
+            var meterName = tenantLimited ? "Cehpalon.SmallApi.TenantBudgetProof" : "Cehpalon.SmallApi.CoreBudgetProof";
+            using var listener = new System.Diagnostics.Metrics.MeterListener();
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            listener.InstrumentPublished = (instrument, observer) =>
+            {
+                if (instrument.Meter.Name != meterName) return;
+                if (!names.Add(instrument.Name)) throw new InvalidOperationException("Duplicate instrument.");
+                observer.EnableMeasurementEvents(instrument);
+            };
+            listener.SetMeasurementEventCallback<int>((instrument, value, tags, _) =>
+            {
+                var valid = instrument.Name switch
+                {
+                    "cehpalon.operation_budget.active" => value is >= 0 and <= 8,
+                    "cehpalon.operation_budget.capacity" => value == 8,
+                    "cehpalon.operation_budget.closed" => value is 0 or 1,
+                    "cehpalon.operation_budget.active_tenants" => tenantLimited && value is >= 0 and <= 2,
+                    "cehpalon.operation_budget.tenant_capacity" => tenantLimited && value == 4,
+                    _ => false
+                };
+                if (!valid || !tags.IsEmpty || !values.TryAdd(instrument.Name, value)) invalid++;
+                callbacks++;
+            });
+            listener.Start();
+            using var meter = host.CreateBudgetMetrics(meterName)
+                ?? throw new InvalidOperationException("Configured budget has no meter.");
+            var expectedCallbacks = tenantLimited ? 5 : 3;
+            if (names.Count != expectedCallbacks || callbacks != 0 || store.Work != 0)
+                throw new InvalidOperationException("Meter registration performed unexpected work.");
+
+            Dictionary<string, int> Collect(string phase)
+            {
+                lock (collectionGate)
+                {
+                    values.Clear();
+                    callbacks = 0;
+                    var allocated = GC.GetAllocatedBytesForCurrentThread();
+                    var started = Stopwatch.GetTimestamp();
+                    listener.RecordObservableInstruments();
+                    var elapsed = Stopwatch.GetTimestamp() - started;
+                    var bytes = GC.GetAllocatedBytesForCurrentThread() - allocated;
+                    var observed = new Dictionary<string, int>(values, StringComparer.Ordinal);
+                    var reads = Volatile.Read(ref store.Reads);
+                    samples.Add(new { index = samples.Count, phase, startedTicks = started, elapsedTicks = elapsed,
+                        allocatedBytes = bytes, callbacks, values = observed, businessReads = reads });
+                    if (invalid != 0 || callbacks != expectedCallbacks || observed["cehpalon.operation_budget.closed"] < lastClosed)
+                        throw new InvalidOperationException("Metric bounds, tags or closure ordering differed.");
+                    lastClosed = observed["cehpalon.operation_budget.closed"];
+                    if (phase == "periodic" && reads == 200) midpointObserved.TrySetResult();
+                    return observed;
+                }
+            }
+
+            void Controlled(string phase, int active, int closed)
+            {
+                var observed = Collect(phase);
+                if (observed["cehpalon.operation_budget.active"] != active
+                    || observed["cehpalon.operation_budget.closed"] != closed
+                    || tenantLimited && observed["cehpalon.operation_budget.active_tenants"] != active)
+                    throw new InvalidOperationException("Controlled metric state differed.");
+            }
+
+            async Task<(int Status, string? Code)> Post(string path, object input, string subject, bool graphQL)
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = JsonContent.Create(input) };
+                request.Headers.Authorization = new("Bearer", subject == "alice" ? aliceToken : bobToken);
+                request.Headers.Add("X-Tenant", subject == "alice" ? "tenant-b" : "tenant-a");
+                using var response = await client.SendAsync(request, deadline.Token);
+                using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(deadline.Token));
+                var root = body.RootElement;
+                string? code = graphQL
+                    ? root.TryGetProperty("errors", out var errors) ? errors[0].GetProperty("extensions").GetProperty("code").GetString() : null
+                    : root.TryGetProperty("code", out var errorCode) ? errorCode.GetString() : null;
+                if (response.StatusCode == HttpStatusCode.OK && code is null)
+                {
+                    var value = graphQL ? root.GetProperty("data").GetProperty("catalogItem") : root;
+                    if (value.GetProperty("id").GetInt32() != 1
+                        || value.GetProperty("tenant").GetString() != (subject == "alice" ? "tenant-a" : "tenant-b"))
+                        throw new InvalidOperationException("Successful response had the wrong tenant or item.");
+                }
+                return ((int)response.StatusCode, code);
+            }
+
+            Task<(int Status, string? Code)> Read(string subject, string tenant, bool graphQL)
+            {
+                var input = new GetItem(tenant, 1);
+                return graphQL
+                    ? Post("/graphql", new { query = "query($input:GetItemInput!){catalogItem(input:$input){id tenant}}", variables = new { input } }, subject, true)
+                    : Post("/api/catalog/get", input, subject, false);
+            }
+
+            Controlled("ready", 0, 0);
+            var held = Post("/api/catalog/set", new SetLabel("tenant-a", 1, 0, "metrics-shutdown"), "alice", false);
+            Task? sampler = null;
+            Task[] drivers = [];
+            try
+            {
+                await store.WriteEntered.Task.WaitAsync(deadline.Token);
+                Controlled("held", 1, 0);
+                sampler = Task.Run(async () =>
+                {
+                    try
+                    {
+                        while (true)
+                        {
+                            await Task.Delay(10, samplerStop.Token);
+                            Collect("periodic");
+                        }
+                    }
+                    catch (OperationCanceledException) when (samplerStop.IsCancellationRequested) { }
+                });
+                drivers = Enumerable.Range(0, 4).Select(async driver =>
+                {
+                    var subject = driver % 2 == 0 ? "alice" : "bob";
+                    var tenant = driver % 2 == 0 ? "tenant-a" : "tenant-b";
+                    for (var i = 0; i < 100; i++)
+                    {
+                        if (await Read(subject, tenant, graphQL: driver >= 2) != (200, null))
+                            throw new InvalidOperationException("An authorized traffic request failed.");
+                        if (i == 49)
+                        {
+                            if (Interlocked.Increment(ref halfDrivers) == 4) midpoint.TrySetResult();
+                            await midpointRelease.Task.WaitAsync(deadline.Token);
+                        }
+                    }
+                }).ToArray();
+                await midpoint.Task.WaitAsync(deadline.Token);
+                if (store.Reads != 200) throw new InvalidOperationException("Midpoint traffic count differs.");
+                Controlled("midpoint", 1, 0);
+                await midpointObserved.Task.WaitAsync(deadline.Token);
+                midpointRelease.SetResult();
+                await Task.WhenAll(drivers).WaitAsync(deadline.Token);
+                foreach (var graphQL in new[] { false, true })
+                {
+                    var denial = graphQL ? 200 : 403;
+                    if (await Read("alice", "tenant-b", graphQL) != (denial, "access.denied")
+                        || await Read("bob", "tenant-a", graphQL) != (denial, "access.denied"))
+                        throw new InvalidOperationException("Cross-tenant denial changed with metrics enabled.");
+                }
+                var stopping = host.DisposeAsync().AsTask();
+                Controlled("closing", 1, 1);
+                if (stopping.IsCompleted) throw new InvalidOperationException("Shutdown did not wait for the held operation.");
+                release.SetResult();
+                await stopping.WaitAsync(deadline.Token);
+                if (await held != (200, null)) throw new InvalidOperationException("Held write failed.");
+            }
+            finally
+            {
+                midpointRelease.TrySetResult();
+                release.TrySetResult();
+                samplerStop.Cancel();
+                if (sampler is not null) await sampler.WaitAsync(TimeSpan.FromSeconds(5));
+                await Task.WhenAll(drivers).WaitAsync(TimeSpan.FromSeconds(5));
+                await held.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            Controlled("stopped", 0, 1);
+            if (store.Factories != 401 || store.Disposals != 401 || store.Reads != 400 || store.Writes != 1
+                || host.Counters.HostDisposals != 1 || host.Counters.ForbiddenFactories != 0)
+                throw new InvalidOperationException("Business work or owned shutdown counts differed.");
+            meter.Dispose();
+            values.Clear();
+            callbacks = 0;
+            listener.RecordObservableInstruments();
+            if (callbacks != 0) throw new InvalidOperationException("Disposed meter emitted a measurement.");
+            result["status"] = "passed";
+            result["metricNames"] = names.Order().ToArray();
+            result["crossTenantDenials"] = 4;
+            result["postDisposalCallbacks"] = callbacks;
+            result["store"] = new { store.Factories, store.Disposals, store.Reads, store.Writes };
+            result["hostDisposals"] = host.Counters.HostDisposals;
+        }
+        await using var off = new FixtureHost();
+        await off.Start(Config("appsettings.off.json"), tls, jwt, 8, 4);
+        using var offMeter = off.CreateBudgetMetrics("Cehpalon.SmallApi.DisabledBudgetProof");
+        if (offMeter is not null || off.Counters.HostFactories != 0 || off.Application is not null)
+            throw new InvalidOperationException("Disabled profile created a meter or host.");
+        disabled = new { meterCreated = offMeter is not null, off.Counters.HostFactories, hasApplication = off.Application is not null };
+    }
+    catch (Exception)
+    {
+        passed = false;
+    }
+    Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+    await using var file = new FileStream(output, FileMode.CreateNew, FileAccess.Write);
+    await JsonSerializer.SerializeAsync(file, new { status = passed ? "passed" : "failed", cases, disabled,
+        framework = RuntimeInformation.FrameworkDescription, os = RuntimeInformation.OSDescription,
+        stopwatchFrequency = Stopwatch.Frequency, requestedDelayMilliseconds = 10,
+        scope = "Protected fixture HTTPS traffic with explicit collection and controlled midpoint/shutdown" });
+    return passed ? 0 : 1;
+}
+
 public static async Task<int> RunDrain(string output)
 {
     output = Path.GetFullPath(output);

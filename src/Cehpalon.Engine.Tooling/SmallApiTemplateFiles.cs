@@ -143,6 +143,10 @@ kinds of budget at shutdown and waits for admitted work within the shutdown
 timeout. Readiness and the post-cleanup stopped report include aggregate capacity
 snapshots when a budget is configured. Tenant snapshots contain counts only.
 Run --self-test-drain --output <new-report.json> for that lifecycle check.
+The generated host offers CreateBudgetMetrics with a host-selected meter name.
+Its caller owns collection and disposal. Run --self-test-live-metrics --output
+<new-report.json> for protected HTTP/GraphQL traffic with periodic collection and
+an admitted write held across shutdown.
 
 Type `stop` followed by Enter, or Ctrl+C, for awaited listener/handler cleanup and
 a stopped JSON report. Redirected stdin EOF alone keeps the host alive without

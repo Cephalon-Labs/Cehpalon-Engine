@@ -122,6 +122,10 @@ public sealed class FixtureHost : IAsyncDisposable
     public OperationConcurrencySnapshot? CapacitySnapshot =>
         tenantBudget is not null ? tenantBudget.GetSnapshot().Total : budget?.GetSnapshot();
     public TenantOperationConcurrencySnapshot? TenantCapacitySnapshot => tenantBudget?.GetSnapshot();
+
+    // The caller owns the meter and may observe final drain state before disposing it.
+    public System.Diagnostics.Metrics.Meter? CreateBudgetMetrics(string meterName) =>
+        tenantBudget?.CreateMetrics(meterName) ?? budget?.CreateMetrics(meterName);
     public CatalogStore Store => store ?? throw new InvalidOperationException("Catalog module has not activated.");
     public ActivationCounters Counters {get;}=new();
     public WebApplication? Application {get;private set;}
