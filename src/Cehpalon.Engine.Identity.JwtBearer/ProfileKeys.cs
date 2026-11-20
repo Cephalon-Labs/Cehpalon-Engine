@@ -108,8 +108,25 @@ internal static class ProfileKeys
             catch (ArgumentException) { return false; }
             catch (FormatException) { return false; }
         }
-        return profile.Family == "RSA" && key is RsaSecurityKey && key.KeySize >= 2048 ||
-            profile.Family == "EC" && key is ECDsaSecurityKey && key.KeySize == (profile.Algorithm == "ES512" ? 521 : profile.Algorithm == "ES384" ? 384 : 256);
+        try
+        {
+            if (profile.Family == "RSA" && key is RsaSecurityKey rsa)
+            {
+                var p = rsa.Rsa is null ? rsa.Parameters : rsa.Rsa.ExportParameters(false);
+                if (p.Modulus is null || p.Modulus.Length is < 1 or > 1024 || p.Modulus[0] == 0 ||
+                    p.Exponent is null || p.Exponent.Length is < 1 or > 4) return false;
+                var exponent = new BigInteger(p.Exponent, isUnsigned: true, isBigEndian: true);
+                return new BigInteger(p.Modulus, isUnsigned: true, isBigEndian: true).GetBitLength() >= 2048 && exponent >= 65537 && !exponent.IsEven;
+            }
+            if (profile.Family == "EC" && key is ECDsaSecurityKey ec)
+            {
+                var p = ec.ECDsa.ExportParameters(false);
+                var oid = profile.Algorithm switch { "ES256" => "1.2.840.10045.3.1.7", "ES384" => "1.3.132.0.34", "ES512" => "1.3.132.0.35", _ => "" };
+                return p.Curve.IsNamed && p.Curve.Oid.Value == oid && key.KeySize == (profile.Algorithm == "ES512" ? 521 : profile.Algorithm == "ES384" ? 384 : 256);
+            }
+        }
+        catch (CryptographicException) { return false; }
+        return false;
     }
 
     private static string Curve(string algorithm) => algorithm switch { "ES256" => "P-256", "ES384" => "P-384", "ES512" => "P-521", _ => "" };
