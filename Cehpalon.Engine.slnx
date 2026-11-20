@@ -13,6 +13,7 @@
     <Project Path="src/Cehpalon.Engine.Tooling/Cehpalon.Engine.Tooling.csproj" />
   </Folder>
   <Folder Name="/Tests/">
+    <Project Path="Tests/Jwe.ContractTests/Jwe.ContractTests.csproj" />
     <Project Path="Tests/AuthProfile.ContractTests/AuthProfile.ContractTests.csproj" />
     <Project Path="Tests/TenantReadSet.ContractTests/TenantReadSet.ContractTests.csproj" />
     <Project Path="Tests/Access.ContractTests/Access.ContractTests.csproj" />
