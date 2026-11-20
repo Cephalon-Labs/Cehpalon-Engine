@@ -41,6 +41,8 @@ public sealed class CatalogStore : IResourceScopeSource
     public bool WrongOwner, Revoked, MissingPolicy, DelayWrites;
     public TaskCompletionSource WriteEntered = NewSignal(), CancelObserved = NewSignal();
     public TaskCompletionSource? WriteRelease { get; set; }
+    public TaskCompletionSource? ReadRelease, ReadsEntered;
+    public int ReadWaits;
     public static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
     public CatalogStore()
     {
@@ -94,7 +96,20 @@ public sealed class CatalogStore : IResourceScopeSource
 
 public sealed class CatalogHandler(CatalogStore store) : ITenantOperationHandler<GetItem,Item>,ITenantOperationHandler<ListItems,ItemPage>,ITenantOperationHandler<SetLabel,Item>,IDisposable
 {
-    public ValueTask<OperationResult<Item>> HandleAsync(GetItem r,TenantOperationContext c,CancellationToken ct) { ct.ThrowIfCancellationRequested(); return ValueTask.FromResult(store.Get(r,c)); }
+    public ValueTask<OperationResult<Item>> HandleAsync(GetItem r,TenantOperationContext c,CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return store.ReadRelease is { } release ? WaitForRead(r, c, ct, release) : ValueTask.FromResult(store.Get(r,c));
+    }
+    private async ValueTask<OperationResult<Item>> WaitForRead(GetItem request, TenantOperationContext context,
+        CancellationToken token, TaskCompletionSource release)
+    {
+        context.DemandAccess(new(request.Tenant), "catalog", "catalog", "catalog.get");
+        if (Interlocked.Increment(ref store.ReadWaits) == 4) store.ReadsEntered?.TrySetResult();
+        await release.Task.WaitAsync(token);
+        token.ThrowIfCancellationRequested();
+        return store.Get(request, context);
+    }
     public ValueTask<OperationResult<ItemPage>> HandleAsync(ListItems r,TenantOperationContext c,CancellationToken ct) { ct.ThrowIfCancellationRequested(); return ValueTask.FromResult(store.List(r,c)); }
     public ValueTask<OperationResult<Item>> HandleAsync(SetLabel r,TenantOperationContext c,CancellationToken ct) => store.Set(r,c,ct);
     public void Dispose() => Interlocked.Increment(ref store.Disposals);

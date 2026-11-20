@@ -49,6 +49,7 @@ public static async Task<int> RunLiveMetrics(string output)
             var midpoint = CatalogStore.NewSignal();
             var midpointRelease = CatalogStore.NewSignal();
             var midpointObserved = CatalogStore.NewSignal();
+            var overlapObserved = CatalogStore.NewSignal();
             var halfDrivers = 0;
             var store = host.Store;
             var release = CatalogStore.NewSignal();
@@ -103,16 +104,18 @@ public static async Task<int> RunLiveMetrics(string output)
                         throw new InvalidOperationException("Metric bounds, tags or closure ordering differed.");
                     lastClosed = observed["cehpalon.operation_budget.closed"];
                     if (phase == "periodic" && reads == 200) midpointObserved.TrySetResult();
+                    if (phase == "periodic" && observed["cehpalon.operation_budget.active"] == 5)
+                        overlapObserved.TrySetResult();
                     return observed;
                 }
             }
 
-            void Controlled(string phase, int active, int closed)
+            void Controlled(string phase, int active, int closed, int activeTenants)
             {
                 var observed = Collect(phase);
                 if (observed["cehpalon.operation_budget.active"] != active
                     || observed["cehpalon.operation_budget.closed"] != closed
-                    || tenantLimited && observed["cehpalon.operation_budget.active_tenants"] != active)
+                    || tenantLimited && observed["cehpalon.operation_budget.active_tenants"] != activeTenants)
                     throw new InvalidOperationException("Controlled metric state differed.");
             }
 
@@ -145,14 +148,15 @@ public static async Task<int> RunLiveMetrics(string output)
                     : Post("/api/catalog/get", input, subject, false);
             }
 
-            Controlled("ready", 0, 0);
+            Controlled("ready", 0, 0, 0);
             var held = Post("/api/catalog/set", new SetLabel("tenant-a", 1, 0, "metrics-shutdown"), "alice", false);
             Task? sampler = null;
             Task[] drivers = [];
+            Task<(int Status, string? Code)>[] overlap = [];
             try
             {
                 await store.WriteEntered.Task.WaitAsync(deadline.Token);
-                Controlled("held", 1, 0);
+                Controlled("held", 1, 0, 1);
                 sampler = Task.Run(async () =>
                 {
                     try
@@ -182,7 +186,7 @@ public static async Task<int> RunLiveMetrics(string output)
                 }).ToArray();
                 await midpoint.Task.WaitAsync(deadline.Token);
                 if (store.Reads != 200) throw new InvalidOperationException("Midpoint traffic count differs.");
-                Controlled("midpoint", 1, 0);
+                Controlled("midpoint", 1, 0, 1);
                 await midpointObserved.Task.WaitAsync(deadline.Token);
                 midpointRelease.SetResult();
                 await Task.WhenAll(drivers).WaitAsync(deadline.Token);
@@ -193,9 +197,17 @@ public static async Task<int> RunLiveMetrics(string output)
                         || await Read("bob", "tenant-a", graphQL) != (denial, "access.denied"))
                         throw new InvalidOperationException("Cross-tenant denial changed with metrics enabled.");
                 }
+                store.ReadRelease = CatalogStore.NewSignal();
+                store.ReadsEntered = CatalogStore.NewSignal();
+                overlap = Enumerable.Range(0, 4).Select(driver => Read(
+                    driver % 2 == 0 ? "alice" : "bob", driver % 2 == 0 ? "tenant-a" : "tenant-b", driver >= 2)).ToArray();
+                await store.ReadsEntered.Task.WaitAsync(deadline.Token);
+                Controlled("overlap", 5, 0, 2);
+                await overlapObserved.Task.WaitAsync(deadline.Token);
                 var stopping = host.DisposeAsync().AsTask();
-                Controlled("closing", 1, 1);
-                if (stopping.IsCompleted) throw new InvalidOperationException("Shutdown did not wait for the held operation.");
+                Controlled("closing", 5, 1, 2);
+                if (stopping.IsCompleted) throw new InvalidOperationException("Shutdown did not wait for the held operations.");
+                store.ReadRelease.SetResult();
                 release.SetResult();
                 await stopping.WaitAsync(deadline.Token);
                 if (await held != (200, null)) throw new InvalidOperationException("Held write failed.");
@@ -203,14 +215,18 @@ public static async Task<int> RunLiveMetrics(string output)
             finally
             {
                 midpointRelease.TrySetResult();
+                store.ReadRelease?.TrySetResult();
                 release.TrySetResult();
                 samplerStop.Cancel();
                 if (sampler is not null) await sampler.WaitAsync(TimeSpan.FromSeconds(5));
                 await Task.WhenAll(drivers).WaitAsync(TimeSpan.FromSeconds(5));
+                await Task.WhenAll(overlap).WaitAsync(TimeSpan.FromSeconds(5));
                 await held.WaitAsync(TimeSpan.FromSeconds(5));
             }
-            Controlled("stopped", 0, 1);
-            if (store.Factories != 401 || store.Disposals != 401 || store.Reads != 400 || store.Writes != 1
+            Controlled("stopped", 0, 1, 0);
+            foreach (var reading in overlap)
+                if (await reading != (200, null)) throw new InvalidOperationException("Overlapping read failed.");
+            if (store.ReadWaits != 4 || store.Factories != 405 || store.Disposals != 405 || store.Reads != 404 || store.Writes != 1
                 || host.Counters.HostDisposals != 1 || host.Counters.ForbiddenFactories != 0)
                 throw new InvalidOperationException("Business work or owned shutdown counts differed.");
             meter.Dispose();
@@ -221,6 +237,8 @@ public static async Task<int> RunLiveMetrics(string output)
             result["status"] = "passed";
             result["metricNames"] = names.Order().ToArray();
             result["crossTenantDenials"] = 4;
+            result["trafficReads"] = 400;
+            result["overlapReads"] = 4;
             result["postDisposalCallbacks"] = callbacks;
             result["store"] = new { store.Factories, store.Disposals, store.Reads, store.Writes };
             result["hostDisposals"] = host.Counters.HostDisposals;
