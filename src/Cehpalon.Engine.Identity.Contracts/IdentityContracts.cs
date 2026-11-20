@@ -34,6 +34,9 @@ public sealed class IdentitySnapshot
 {
     public const int MaximumSchemeLength = 128;
     public const int MaximumSessionIdLength = 256;
+    private const int MaximumObservationConstraints = 16;
+    private static readonly ObservationConstraint[] NoObservations = [];
+    private readonly ObservationConstraint[] observations = NoObservations;
 
     public IdentitySnapshot(PrincipalId principal, string authenticationScheme,
         DateTimeOffset notBeforeUtc, DateTimeOffset expiresAtUtc)
@@ -57,6 +60,100 @@ public sealed class IdentitySnapshot
     public string AuthenticationScheme { get; }
     public DateTimeOffset NotBeforeUtc { get; }
     public DateTimeOffset ExpiresAtUtc { get; }
+
+    /// <summary>
+    /// Check only additional source observation constraints; true for plain representations.
+    /// This is not authentication, issuer/scheme validation, ordinary UTC validity or a fresh session query.
+    /// Clock faults invalidate the shared observation before propagating; later checks deny.
+    /// </summary>
+    public bool SatisfiesObservationConstraints()
+    {
+        foreach (var observation in observations)
+            if (!observation.IsCurrent()) return false;
+        return true;
+    }
+
+    /// <summary>Narrow UTC validity without changing bindings or restarting any original observation clock.</summary>
+    public IdentitySnapshot WithValidity(DateTimeOffset notBeforeUtc, DateTimeOffset expiresAtUtc)
+    {
+        if (notBeforeUtc < NotBeforeUtc || expiresAtUtc > ExpiresAtUtc || expiresAtUtc <= notBeforeUtc)
+            throw new ArgumentException("The validity interval must be a non-empty subset of the original interval.");
+        return new(this, notBeforeUtc, expiresAtUtc, observations);
+    }
+
+    /// <summary>
+    /// Intersect exact identity bindings, UTC validity and all original observations.
+    /// Null means different bindings, disjoint validity or more than sixteen distinct constraints; none are truncated.
+    /// </summary>
+    public IdentitySnapshot? IntersectValidity(IdentitySnapshot other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        if (!Principal.Equals(other.Principal) || !StringComparer.Ordinal.Equals(AuthenticationScheme, other.AuthenticationScheme) ||
+            !StringComparer.Ordinal.Equals(SessionId, other.SessionId)) return null;
+        var before = NotBeforeUtc > other.NotBeforeUtc ? NotBeforeUtc : other.NotBeforeUtc;
+        var expires = ExpiresAtUtc < other.ExpiresAtUtc ? ExpiresAtUtc : other.ExpiresAtUtc;
+        if (expires <= before) return null;
+        if (observations.Length == 0) return new(this, before, expires, other.observations);
+        if (other.observations.Length == 0) return new(this, before, expires, observations);
+        var combined = new List<ObservationConstraint>(observations);
+        foreach (var candidate in other.observations)
+        {
+            // Private sealed constraints use reference equality and never expose their mutable clock state.
+            if (combined.Contains(candidate)) continue;
+            if (combined.Count == MaximumObservationConstraints) return null;
+            combined.Add(candidate);
+        }
+        return new(this, before, expires, combined.ToArray());
+    }
+
+    private IdentitySnapshot(IdentitySnapshot original, DateTimeOffset before, DateTimeOffset expires, ObservationConstraint[] constraints)
+        : this(original.Principal, original.AuthenticationScheme, before, expires, original.SessionId) => observations = constraints;
+
+    internal IdentitySnapshot? AttachObservation(TimeProvider clock, long started, long completedTimestamp, long frequency,
+        TimeSpan elapsedAtCompletion, TimeSpan maximumLifetime, DateTimeOffset completedUtc)
+    {
+        if (observations.Length == MaximumObservationConstraints) return null;
+        var remaining = maximumLifetime - elapsedAtCompletion;
+        var utcRemaining = ExpiresAtUtc - completedUtc;
+        if (utcRemaining < remaining) remaining = utcRemaining;
+        if (remaining <= TimeSpan.Zero) return null;
+        var constraints = new ObservationConstraint[observations.Length + 1];
+        observations.CopyTo(constraints, 0);
+        constraints[^1] = new(clock, started, completedTimestamp, frequency, elapsedAtCompletion,
+            elapsedAtCompletion + remaining, completedUtc, ExpiresAtUtc);
+        var identity = new IdentitySnapshot(this, NotBeforeUtc, ExpiresAtUtc, constraints);
+        return identity.SatisfiesObservationConstraints() ? identity : null;
+    }
+
+    private sealed class ObservationConstraint(TimeProvider clock, long started, long completedTimestamp, long frequency,
+        TimeSpan completedElapsed, TimeSpan nativeCeiling, DateTimeOffset completedUtc, DateTimeOffset expiresUtc)
+    {
+        private readonly object gate = new();
+        private bool active = true;
+        private readonly DateTimeOffset lowerUtc = completedUtc;
+        private DateTimeOffset lastUtc = completedUtc;
+        private long lastTimestamp = completedTimestamp;
+        private TimeSpan lastElapsed = completedElapsed;
+        internal bool IsCurrent()
+        {
+            lock (gate)
+            {
+                if (!active) return false;
+                try
+                {
+                    var now = clock.GetUtcNow(); var timestamp = clock.GetTimestamp();
+                    if (clock.TimestampFrequency != frequency || frequency <= 0 || now < lastUtc || now < lowerUtc ||
+                        now >= expiresUtc || timestamp < lastTimestamp) return active = false;
+                    var elapsed = clock.GetElapsedTime(started, timestamp);
+                    if (clock.TimestampFrequency != frequency || elapsed < lastElapsed || elapsed < TimeSpan.Zero || elapsed >= nativeCeiling)
+                        return active = false;
+                    lastUtc = now; lastTimestamp = timestamp; lastElapsed = elapsed;
+                    return true;
+                }
+                catch { active = false; throw; }
+            }
+        }
+    }
 }
 
 /// <summary>
@@ -117,19 +214,19 @@ public sealed class SessionValidatingIdentitySource : IIdentitySource
     public async ValueTask<IdentitySnapshot?> ResolveAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var before = clock.GetUtcNow(); var started = clock.GetTimestamp();
+        var before = clock.GetUtcNow(); var frequency = clock.TimestampFrequency; var started = clock.GetTimestamp();
         var identity = await inner.ResolveAsync(cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
-        if (identity is null || identity.SessionId is null) return null;
+        if (identity is null || identity.SessionId is null || !identity.SatisfiesObservationConstraints()) return null;
         var authenticatedAt = clock.GetUtcNow(); var authenticatedTimestamp = clock.GetTimestamp();
         var authenticationElapsed = clock.GetElapsedTime(started, authenticatedTimestamp);
-        if (authenticatedAt < before || authenticatedTimestamp < started || authenticationElapsed < TimeSpan.Zero ||
+        if (frequency <= 0 || clock.TimestampFrequency != frequency || authenticatedAt < before || authenticatedTimestamp < started || authenticationElapsed < TimeSpan.Zero ||
             authenticationElapsed >= maximumLifetime || identity.NotBeforeUtc > authenticatedAt || authenticatedAt >= identity.ExpiresAtUtc) return null;
         var status = await sessions.ResolveAsync(identity, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         var after = clock.GetUtcNow(); var ended = clock.GetTimestamp();
         var elapsed = clock.GetElapsedTime(started, ended);
-        if (after < authenticatedAt || ended < authenticatedTimestamp || elapsed < authenticationElapsed || elapsed >= maximumLifetime ||
+        if (clock.TimestampFrequency != frequency || !identity.SatisfiesObservationConstraints() || after < authenticatedAt || ended < authenticatedTimestamp || elapsed < authenticationElapsed || elapsed >= maximumLifetime ||
             identity.NotBeforeUtc > after || after >= identity.ExpiresAtUtc || status is null || !status.IsActive ||
             !status.Principal.Equals(identity.Principal) || !StringComparer.Ordinal.Equals(status.AuthenticationScheme, identity.AuthenticationScheme) ||
             !StringComparer.Ordinal.Equals(status.SessionId, identity.SessionId) || status.NotBeforeUtc > after || after >= status.ExpiresAtUtc) return null;
@@ -140,7 +237,7 @@ public sealed class SessionValidatingIdentitySource : IIdentitySource
         if (utcCap < expires) expires = utcCap;
         if (remainingCap < expires) expires = remainingCap;
         return expires > after && expires > notBefore
-            ? new(identity.Principal, identity.AuthenticationScheme, notBefore, expires, identity.SessionId) : null;
+            ? identity.WithValidity(notBefore, expires).AttachObservation(clock, started, ended, frequency, elapsed, maximumLifetime, after) : null;
     }
     private static DateTimeOffset AddBounded(DateTimeOffset value, TimeSpan duration)
         => duration.Ticks > DateTimeOffset.MaxValue.UtcTicks - value.UtcTicks ? DateTimeOffset.MaxValue : value.Add(duration);
@@ -170,7 +267,8 @@ public sealed class IdentityTrustPolicy
         && issuers.Contains(identity.Principal.Issuer)
         && schemes.Contains(identity.AuthenticationScheme)
         && identity.NotBeforeUtc <= now
-        && now < identity.ExpiresAtUtc;
+        && now < identity.ExpiresAtUtc
+        && identity.SatisfiesObservationConstraints();
 
     private static FrozenSet<string> Snapshot(IEnumerable<string> values, int maximumLength, string parameter)
     {

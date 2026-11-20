@@ -130,7 +130,7 @@ public sealed class TenantOperationContext
     }
 }
 
-internal sealed class AuthorizationLease(TimeProvider timeProvider,DateTimeOffset notBeforeUtc,DateTimeOffset expiresAtUtc) : IDisposable
+internal sealed class AuthorizationLease(TimeProvider timeProvider,DateTimeOffset notBeforeUtc,DateTimeOffset expiresAtUtc,IdentitySnapshot? identity = null) : IDisposable
 {
     private int active=1;
     private readonly long started=timeProvider.GetTimestamp();
@@ -142,7 +142,8 @@ internal sealed class AuthorizationLease(TimeProvider timeProvider,DateTimeOffse
         {
             var now=timeProvider.GetUtcNow();
             var elapsed=timeProvider.GetElapsedTime(started,timeProvider.GetTimestamp());
-            if(now<notBeforeUtc || now>=expiresAtUtc || elapsed<TimeSpan.Zero || elapsed>=maximumElapsed)
+            if(now<notBeforeUtc || now>=expiresAtUtc || elapsed<TimeSpan.Zero || elapsed>=maximumElapsed ||
+                identity is not null && !identity.SatisfiesObservationConstraints())
             { Interlocked.Exchange(ref active,0); throw new TenantAccessDeniedException(); }
         }
         catch { Interlocked.Exchange(ref active,0); throw; }

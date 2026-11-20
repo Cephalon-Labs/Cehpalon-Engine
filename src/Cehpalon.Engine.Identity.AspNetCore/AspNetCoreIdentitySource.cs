@@ -84,6 +84,7 @@ public sealed class SessionBoundTicketIdentityMapper : IAuthenticatedTicketIdent
         var sessions = claims.Where(c => StringComparer.Ordinal.Equals(c.Type, claimType)).Take(2).ToArray();
         if (sessions.Length != 1 || (identity.SessionId is not null &&
             !StringComparer.Ordinal.Equals(identity.SessionId, sessions[0].Value))) return null;
+        if (identity.SessionId is not null) return identity;
         try { return new(identity.Principal, identity.AuthenticationScheme, identity.NotBeforeUtc, identity.ExpiresAtUtc, sessions[0].Value); }
         catch (ArgumentException) { return null; }
     }

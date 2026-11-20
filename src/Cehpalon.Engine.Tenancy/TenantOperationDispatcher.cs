@@ -165,7 +165,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
             if(allowed) { policyExpires=decision!.ExpiresAtUtc; policyNotBefore=decision.NotBeforeUtc>policyTime?decision.NotBeforeUtc:policyTime; }
         }
         else allowed=await services.Policy.IsAllowedAsync(access,token).ConfigureAwait(false);
-        if(!allowed) { token.ThrowIfCancellationRequested(); return Denied(); }
+        if(!allowed || !identity!.SatisfiesObservationConstraints()) { token.ThrowIfCancellationRequested(); return Denied(); }
         token.ThrowIfCancellationRequested();
         if(authorized is not null) await authorized(access).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
@@ -175,19 +175,19 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         var expires=identity!.ExpiresAtUtc<membership!.ExpiresAtUtc?identity.ExpiresAtUtc:membership.ExpiresAtUtc;
         if(maximum<expires) expires=maximum;
         if(policyExpires<expires) expires=policyExpires;
-        using var lease=new AuthorizationLease(services.TimeProvider,now,expires);
+        using var lease=new AuthorizationLease(services.TimeProvider,now,expires,identity);
         var context=new TenantOperationContext(access,correlation,lease,origin);
         try
         {
             var invocation = new AuthorizedInvocation(frozen, context);
-            if (tenantBudget is not null)
-                return await tenantBudget.DispatchAsync<AuthorizedInvocation, TResponse>(
-                    resource.Tenant, core, operationId, invocation, correlation, token).ConfigureAwait(false);
-
-            var work = budget is null
-                ? core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId, invocation, correlation, token)
-                : budget.DispatchAsync<AuthorizedInvocation,TResponse>(core, operationId, invocation, correlation, token);
-            return await work.ConfigureAwait(false);
+            var work = tenantBudget is not null
+                ? tenantBudget.DispatchAsync<AuthorizedInvocation, TResponse>(resource.Tenant, core, operationId, invocation, correlation, token)
+                : budget is null
+                    ? core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId, invocation, correlation, token)
+                    : budget.DispatchAsync<AuthorizedInvocation,TResponse>(core, operationId, invocation, correlation, token);
+            // Core returns after owned cleanup. Never replace an explicit business failure or cleanup fault.
+            var result = await work.ConfigureAwait(false);
+            return result.IsSuccess && !identity.SatisfiesObservationConstraints() ? Denied() : result;
         }
         catch(TenantAccessDeniedException) { return Denied(); }
     }

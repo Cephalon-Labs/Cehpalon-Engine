@@ -186,7 +186,7 @@ public sealed class TenantReadSetDispatcher
             ? DateTimeOffset.MaxValue : now.Add(services.MaximumLeaseLifetime);
         var expires = identity!.ExpiresAtUtc < grant.ExpiresAtUtc ? identity.ExpiresAtUtc : grant.ExpiresAtUtc;
         if (maximum < expires) expires = maximum;
-        run.Start = now; run.Expires = expires; run.Lease = new(services.TimeProvider, now, expires);
+        run.Start = now; run.Expires = expires; run.Lease = new(services.TimeProvider, now, expires, identity);
         if (services.Audit is not null)
         {
             try { await services.Audit.AppendAsync(run.Entry(operation.OperationId, TenantAuditStage.Authorization, TenantAuditOutcome.Authorized), false).ConfigureAwait(false); }
@@ -238,7 +238,7 @@ public sealed class TenantReadSetDispatcher
                 || !StringComparer.Ordinal.Equals(fresh.SessionId, run.Identity.SessionId)) return null;
             var before = fresh.NotBeforeUtc > run.Start ? fresh.NotBeforeUtc : run.Start;
             var after = fresh.ExpiresAtUtc < run.Expires ? fresh.ExpiresAtUtc : run.Expires;
-            return after > before ? new(fresh.Principal, fresh.AuthenticationScheme, before, after, fresh.SessionId) : null;
+            return after > before ? fresh.WithValidity(before, after).IntersectValidity(run.Identity) : null;
         }
     }
 }
