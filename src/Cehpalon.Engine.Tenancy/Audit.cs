@@ -316,6 +316,260 @@ public interface ITenantChangeAuditSink
 {
     ValueTask AppendAsync(TenantChangeAuditRecord record, CancellationToken cancellationToken);
 }
+/// <summary>One trusted provider transaction must contain every Session effect and staged record.</summary>
+public interface ITenantChangeAuditTransaction<TSession> : IAsyncDisposable
+{
+    TSession Session { get; }
+    ValueTask StageAsync(TenantChangeAuditRecord record, CancellationToken cancellationToken);
+    ValueTask CommitAsync(CancellationToken cancellationToken);
+    ValueTask RollbackAsync(CancellationToken cancellationToken);
+}
+public interface ITenantChangeAuditTransactionProvider<TSession>
+{
+    /// <summary>Returns an uncommitted tenant-bound transaction; a failing Begin must clean up its own resources.</summary>
+    ValueTask<ITenantChangeAuditTransaction<TSession>> BeginAsync(TenantId tenant, CancellationToken cancellationToken);
+}
+public enum TenantChangeAuditTransactionOutcome { NotStarted, RolledBack, RollbackUnknown, CommitUnknown, Committed }
+/// <summary>Outcomes describe the trusted transaction only, never arbitrary effects outside its Session.</summary>
+public sealed class TenantChangeAuditTransactionException : Exception
+{
+    internal TenantChangeAuditTransactionException(TenantChangeAuditTransactionOutcome outcome,
+        Exception? primary, Exception? rollback, Exception? disposal)
+        : base("Transactional audit completion failed; inspect the transaction outcome before reconciling or retrying.",
+            Combine(primary, rollback, disposal))
+    { Outcome = outcome; PrimaryFailure = primary; RollbackFailure = rollback; DisposalFailure = disposal; }
+    private static Exception Combine(params Exception?[] failures)
+    { var present = failures.OfType<Exception>().ToArray(); return present.Length == 1 ? present[0] : new AggregateException(present); }
+    public TenantChangeAuditTransactionOutcome Outcome { get; }
+    public Exception? PrimaryFailure { get; }
+    public Exception? RollbackFailure { get; }
+    public Exception? DisposalFailure { get; }
+    public bool MayHaveCommitted => Outcome is not (TenantChangeAuditTransactionOutcome.NotStarted or TenantChangeAuditTransactionOutcome.RolledBack);
+}
+/// <summary>Opt-in orchestration of a provider-owned business transaction and redacted audit outbox row.</summary>
+public sealed class TenantChangeAuditOutboxExecutor<TSession>
+{
+    private readonly TenantChangeAuditPolicy policy;
+    private readonly TenantOperationRegistry registry;
+    private readonly ITenantChangeAuditTransactionProvider<TSession> provider;
+    private readonly TimeSpan timeout;
+    private readonly TimeProvider clock;
+    private TenantChangeAuditOutboxExecutor(TenantChangeAuditPolicy policy, TenantOperationRegistry registry,
+        ITenantChangeAuditTransactionProvider<TSession> provider, TimeSpan timeout, TimeProvider clock)
+    { this.policy = policy; this.registry = registry; this.provider = provider; this.timeout = timeout; this.clock = clock; }
+    public static TenantChangeAuditOutboxExecutor<TSession>? ActivateValidated(TenantChangeAuditPolicy policy,
+        TenantOperationRegistry? registry, IEnumerable<string>? requiredOperationIds,
+        Func<ITenantChangeAuditTransactionProvider<TSession>>? providerFactory = null,
+        TimeSpan? transactionTimeout = null, TimeProvider? timeProvider = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        ArgumentNullException.ThrowIfNull(registry); ArgumentNullException.ThrowIfNull(requiredOperationIds);
+        ArgumentNullException.ThrowIfNull(providerFactory);
+        var timeout = RequireBound(transactionTimeout ?? TimeSpan.FromSeconds(5), nameof(transactionTimeout));
+        TenantChangeAuditRecorder.ValidateCatalog(policy, registry, requiredOperationIds);
+        return new(policy, registry, providerFactory() ?? throw new ArgumentException("The transaction provider factory returned null."),
+            timeout, timeProvider ?? TimeProvider.System);
+    }
+    internal static TimeSpan RequireBound(TimeSpan value, string name)
+    { if (value <= TimeSpan.Zero || value > TimeSpan.FromMinutes(1)) throw new ArgumentOutOfRangeException(name); return value; }
+    public async ValueTask<TResult> ExecuteAsync<TResult>(TenantOperationContext context,
+        Func<TSession, CancellationToken, ValueTask<TenantChangeAuditMutation<TResult>>> mutation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        TenantChangeAuditRecorder.DemandPreparation(policy, registry, context, cancellationToken);
+        ITenantChangeAuditTransaction<TSession>? transaction = null;
+        Exception? primary = null, rollback = null, disposal = null;
+        var outcome = TenantChangeAuditTransactionOutcome.NotStarted;
+        TenantChangeReceipt? committedReceipt = null;
+        TResult result = default!;
+        try
+        {
+            transaction = await provider.BeginAsync(context.Tenant, cancellationToken).ConfigureAwait(false)
+                ?? throw new ArgumentException("The transaction provider returned no transaction.");
+            outcome = TenantChangeAuditTransactionOutcome.RollbackUnknown;
+            TenantChangeAuditRecorder.DemandPreparation(policy, registry, context, cancellationToken);
+            var session = transaction.Session;
+            if (session is null) throw new ArgumentException("The transaction provider returned no business session.");
+            TenantChangeAuditRecorder.DemandPreparation(policy, registry, context, cancellationToken);
+            var change = await mutation(session, cancellationToken).ConfigureAwait(false)
+                ?? throw new ArgumentException("The trusted mutation returned no change receipt.", nameof(mutation));
+            committedReceipt = change.Receipt;
+            var record = TenantChangeAuditRecorder.BuildCheckedRecord(policy, registry, clock, context, change.Receipt,
+                change.ValuesFactory, cancellationToken);
+            await transaction.StageAsync(record, cancellationToken).ConfigureAwait(false);
+            TenantChangeAuditRecorder.DemandReceipt(context, change.Receipt, registry);
+            cancellationToken.ThrowIfCancellationRequested();
+            // No rollback can establish non-commit after CommitAsync has been invoked.
+            outcome = TenantChangeAuditTransactionOutcome.CommitUnknown;
+            using (var commitDeadline = new CancellationTokenSource(timeout))
+            {
+                await transaction.CommitAsync(commitDeadline.Token).ConfigureAwait(false);
+                outcome = TenantChangeAuditTransactionOutcome.Committed;
+                commitDeadline.Token.ThrowIfCancellationRequested();
+            }
+            TenantChangeAuditRecorder.DemandReceipt(context, change.Receipt, registry);
+            cancellationToken.ThrowIfCancellationRequested();
+            result = change.Result;
+        }
+        catch (Exception failure)
+        {
+            primary = failure;
+            if (transaction is not null && outcome is not (TenantChangeAuditTransactionOutcome.CommitUnknown or TenantChangeAuditTransactionOutcome.Committed))
+            {
+                try
+                {
+                    using var rollbackDeadline = new CancellationTokenSource(timeout);
+                    await transaction.RollbackAsync(rollbackDeadline.Token).ConfigureAwait(false);
+                    rollbackDeadline.Token.ThrowIfCancellationRequested();
+                    outcome = TenantChangeAuditTransactionOutcome.RolledBack;
+                }
+                catch (Exception rollbackFailure) { rollback = rollbackFailure; outcome = TenantChangeAuditTransactionOutcome.RollbackUnknown; }
+            }
+        }
+        finally
+        {
+            if (transaction is not null)
+                try { await transaction.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception disposalFailure) { disposal = disposalFailure; }
+        }
+        if (primary is null && disposal is null)
+        {
+            try
+            {
+                TenantChangeAuditRecorder.DemandReceipt(context, committedReceipt!, registry);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            catch (Exception completionFailure) { primary = completionFailure; }
+        }
+        if (primary is not null || disposal is not null)
+            throw new TenantChangeAuditTransactionException(outcome, primary, rollback, disposal);
+        return result;
+    }
+}
+/// <summary>Provider-reported claim data, not authority. The provider must fence tenant/lease/receipt/expiry on acknowledgement.</summary>
+public sealed class TenantChangeAuditOutboxLease
+{
+    public TenantChangeAuditOutboxLease(TenantId tenant, Guid leaseId, DateTimeOffset expiresAtUtc,
+        IEnumerable<TenantChangeAuditRecord> records)
+    {
+        Tenant = tenant ?? throw new ArgumentNullException(nameof(tenant));
+        if (leaseId == Guid.Empty) throw new ArgumentException("Lease ID cannot be empty.", nameof(leaseId));
+        ArgumentNullException.ThrowIfNull(records);
+        var copy = records.Take(129).ToArray();
+        if (copy.Length > 128 || copy.Any(x => x is null || !x.Receipt.Tenant.Equals(tenant)) ||
+            copy.Select(x => x.Receipt.ReceiptId).Distinct().Count() != copy.Length)
+            throw new ArgumentException("A claim contains at most128 unique records belonging to one tenant.", nameof(records));
+        LeaseId = leaseId; ExpiresAtUtc = expiresAtUtc.ToUniversalTime(); Records = Array.AsReadOnly(copy);
+    }
+    public TenantId Tenant { get; }
+    public Guid LeaseId { get; }
+    public DateTimeOffset ExpiresAtUtc { get; }
+    public IReadOnlyList<TenantChangeAuditRecord> Records { get; }
+}
+public interface ITenantChangeAuditOutboxSource
+{
+    ValueTask<TenantChangeAuditOutboxLease?> ClaimAsync(TenantId tenant, int maximum, TimeSpan leaseDuration, CancellationToken cancellationToken);
+    ValueTask<bool> AcknowledgeAsync(TenantChangeAuditOutboxLease lease, Guid receiptId, CancellationToken cancellationToken);
+    ValueTask ReleaseAsync(TenantChangeAuditOutboxLease lease, CancellationToken cancellationToken);
+}
+public interface ITenantChangeAuditIdempotentSink
+{
+    /// <summary>Same tenant/receipt ID and same payload must succeed idempotently; conflicting payload must fail.</summary>
+    ValueTask AppendOnceAsync(TenantChangeAuditRecord record, CancellationToken cancellationToken);
+}
+public sealed class TenantChangeAuditOutboxRelayException : Exception
+{
+    internal TenantChangeAuditOutboxRelayException(int acknowledged, bool attempted, Exception? primary, Exception? release)
+        : base("Outbox delivery or fenced claim cleanup failed; delivery may be repeated.",
+            primary is not null && release is not null ? new AggregateException(primary, release) : primary ?? release)
+    { AcknowledgedCount = acknowledged; MayHaveDelivered = attempted; PrimaryFailure = primary; ReleaseFailure = release; }
+    public int AcknowledgedCount { get; }
+    public bool MayHaveDelivered { get; }
+    public Exception? PrimaryFailure { get; }
+    public Exception? ReleaseFailure { get; }
+}
+/// <summary>Explicit bounded at-least-once relay. It installs no timer, background worker or tenant authority.</summary>
+public sealed class TenantChangeAuditOutboxRelay
+{
+    private readonly ITenantChangeAuditOutboxSource source;
+    private readonly ITenantChangeAuditIdempotentSink sink;
+    private readonly TimeSpan leaseDuration;
+    private readonly TimeProvider clock;
+    private TenantChangeAuditOutboxRelay(ITenantChangeAuditOutboxSource source, ITenantChangeAuditIdempotentSink sink,
+        TimeSpan leaseDuration, TimeProvider clock)
+    { this.source = source; this.sink = sink; this.leaseDuration = leaseDuration; this.clock = clock; }
+    public static TenantChangeAuditOutboxRelay? Activate(bool enabled,
+        Func<ITenantChangeAuditOutboxSource>? sourceFactory = null, Func<ITenantChangeAuditIdempotentSink>? sinkFactory = null,
+        TimeSpan? leaseDuration = null, TimeProvider? timeProvider = null)
+    {
+        if (!enabled) return null;
+        ArgumentNullException.ThrowIfNull(sourceFactory); ArgumentNullException.ThrowIfNull(sinkFactory);
+        var bound = TenantChangeAuditOutboxExecutor<object>.RequireBound(leaseDuration ?? TimeSpan.FromSeconds(15), nameof(leaseDuration));
+        return new(sourceFactory() ?? throw new ArgumentException("The outbox source factory returned null."),
+            sinkFactory() ?? throw new ArgumentException("The idempotent sink factory returned null."), bound, timeProvider ?? TimeProvider.System);
+    }
+    private static void Demand(TenantOperationContext context)
+        => context.DemandAccess(context.Tenant, "audit-outbox", "tenant", "relay");
+    public async ValueTask<int> RelayAsync(TenantOperationContext context, int maximum = 128, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (maximum < 1 || maximum > 128) throw new ArgumentOutOfRangeException(nameof(maximum));
+        cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+        var startedUtc = clock.GetUtcNow(); var started = clock.GetTimestamp();
+        var lease = await source.ClaimAsync(context.Tenant, maximum, leaseDuration, cancellationToken).ConfigureAwait(false);
+        if (lease is null) { cancellationToken.ThrowIfCancellationRequested(); Demand(context); return 0; }
+        var acknowledged = 0; var attempted = false; var invalid = false;
+        Exception? primary = null, release = null;
+        void DemandLease()
+        {
+            if (invalid) throw new TenantAccessDeniedException();
+            try
+            {
+                var now = clock.GetUtcNow(); var elapsed = clock.GetElapsedTime(started, clock.GetTimestamp());
+                if (!lease.Tenant.Equals(context.Tenant) || lease.Records.Count > maximum || now < startedUtc ||
+                    now >= lease.ExpiresAtUtc || elapsed < TimeSpan.Zero || elapsed >= leaseDuration)
+                    throw new TenantAccessDeniedException();
+            }
+            catch { invalid = true; throw; }
+        }
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+            foreach (var record in lease.Records)
+            {
+                cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+                attempted = true;
+                await sink.AppendOnceAsync(record, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+                if (!await source.AcknowledgeAsync(lease, record.Receipt.ReceiptId, cancellationToken).ConfigureAwait(false))
+                    throw new InvalidOperationException("The provider rejected the fenced outbox acknowledgement.");
+                acknowledged++;
+                cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+            }
+        }
+        catch (Exception failure) { primary = failure; }
+        finally
+        {
+            try
+            {
+                using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await source.ReleaseAsync(lease, cleanup.Token).ConfigureAwait(false);
+                cleanup.Token.ThrowIfCancellationRequested();
+            }
+            catch (Exception releaseFailure) { release = releaseFailure; }
+        }
+        if (primary is null && release is null)
+        {
+            try { cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease(); }
+            catch (Exception completionFailure) { primary = completionFailure; }
+        }
+        if (primary is not null || release is not null)
+            throw new TenantChangeAuditOutboxRelayException(acknowledged, attempted, primary, release);
+        return acknowledged;
+    }
+}
 public sealed class TenantChangeAuditWriteException : Exception
 {
     internal TenantChangeAuditWriteException(Exception inner) : base("Required change-trail persistence or checked-scope completion failed; the reported change may already be committed.", inner) { }
@@ -359,6 +613,12 @@ public sealed class TenantChangeAuditRecorder
         ArgumentNullException.ThrowIfNull(sinkFactory);
         if (writeTimeout is { } bound && (bound <= TimeSpan.Zero || bound > TimeSpan.FromMinutes(1)))
             throw new ArgumentOutOfRangeException(nameof(writeTimeout));
+        ValidateCatalog(policy, registry, requiredOperationIds);
+        return new(policy, sinkFactory() ?? throw new ArgumentException("The trusted trail sink factory returned null."),
+            writeTimeout, timeProvider, registry);
+    }
+    internal static void ValidateCatalog(TenantChangeAuditPolicy policy, TenantOperationRegistry registry, IEnumerable<string> requiredOperationIds)
+    {
         var actual = registry.DescribeOperations().ToDictionary(x => x.OperationId, StringComparer.Ordinal);
         foreach (var rule in policy.Rules)
             if (!actual.TryGetValue(rule.OperationId, out var registered) ||
@@ -375,8 +635,6 @@ public sealed class TenantChangeAuditRecorder
             if (!actual.ContainsKey(operationId) || !policy.Rules.Any(x => StringComparer.Ordinal.Equals(x.OperationId, operationId)))
                 throw new ArgumentException("A required audited operation is not registered with a matching audit rule: " + operationId, nameof(requiredOperationIds));
         }
-        return new(policy, sinkFactory() ?? throw new ArgumentException("The trusted trail sink factory returned null."),
-            writeTimeout, timeProvider, registry);
     }
     /// <summary>
     /// Check cancellation, live scope, exact validated registry and rule before the application mutates data.
@@ -384,18 +642,23 @@ public sealed class TenantChangeAuditRecorder
     /// </summary>
     public TenantChangeAuditPreparation Prepare(TenantOperationContext context, CancellationToken cancellationToken = default)
     {
+        DemandPreparation(policy, validatedRegistry, context, cancellationToken);
+        return new(this, context);
+    }
+    internal static void DemandPreparation(TenantChangeAuditPolicy policy, TenantOperationRegistry? registry,
+        TenantOperationContext context, CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(context); cancellationToken.ThrowIfCancellationRequested();
-        DemandContext(context);
+        DemandCheckedContext(context, registry);
         if (!policy.Rules.Any(x => StringComparer.Ordinal.Equals(x.OperationId, context.OperationId) &&
             StringComparer.Ordinal.Equals(x.Action, context.Action) && StringComparer.Ordinal.Equals(x.ResourceKind, context.Resource.Kind)))
             throw new TenantAccessDeniedException();
         cancellationToken.ThrowIfCancellationRequested();
-        return new(this, context);
     }
-    private void DemandContext(TenantOperationContext context)
+    internal static void DemandCheckedContext(TenantOperationContext context, TenantOperationRegistry? registry)
     {
         context.DemandAccess(context.Tenant, context.Resource.Kind, context.Resource.ResourceId, context.Action);
-        validatedRegistry?.DemandContextBinding(context);
+        registry?.DemandContextBinding(context);
     }
     /// <summary>
     /// Prepare before invoking one trusted mutation, then await its required trail before returning its result.
@@ -428,34 +691,43 @@ public sealed class TenantChangeAuditRecorder
         ArgumentNullException.ThrowIfNull(context); ArgumentNullException.ThrowIfNull(receipt);
         try
         {
-            Demand(context, receipt); cancellationToken.ThrowIfCancellationRequested();
-            var rule = policy.Find(receipt) ?? throw new TenantAccessDeniedException();
-            var fields = new List<TenantChangeField>();
-            if (policy.Mode != TenantChangeAuditMode.MetadataOnly && rule.Fields.Count != 0)
-            {
-                var states = valuesFactory?.Invoke() ?? throw new ArgumentException("This capture mode requires a trusted state factory.", nameof(valuesFactory));
-                if (receipt.Kind == TenantChangeKind.Create && states.Before.Fields.Count != 0 || receipt.Kind == TenantChangeKind.Delete && states.After.Fields.Count != 0)
-                    throw new ArgumentException("Create/delete state shape does not match the reported change.");
-                foreach (var field in rule.Fields)
-                {
-                    var before = states.Before.Fields.TryGetValue(field.Name, out var b) ? b : TenantChangeValue.Missing;
-                    var after = states.After.Fields.TryGetValue(field.Name, out var a) ? a : TenantChangeValue.Missing;
-                    var changed = !before.Equals(after);
-                    if (policy.Mode == TenantChangeAuditMode.ChangedFields && !changed) continue;
-                    fields.Add(field.Redact ? new(field.Name, TenantChangeValue.Redacted, TenantChangeValue.Redacted, changed) : new(field.Name, before, after, changed));
-                }
-            }
-            var record = new TenantChangeAuditRecord(receipt, clock.GetUtcNow(), policy.Mode, fields);
-            Demand(context, receipt); cancellationToken.ThrowIfCancellationRequested();
+            var record = BuildCheckedRecord(policy, validatedRegistry, clock, context, receipt, valuesFactory, cancellationToken);
             using var deadline = new CancellationTokenSource(timeout);
             await sink.AppendAsync(record, deadline.Token).ConfigureAwait(false);
             deadline.Token.ThrowIfCancellationRequested(); cancellationToken.ThrowIfCancellationRequested(); Demand(context, receipt);
         }
         catch (Exception error) { throw new TenantChangeAuditWriteException(error); }
     }
-    private void Demand(TenantOperationContext context, TenantChangeReceipt receipt)
+    internal static TenantChangeAuditRecord BuildCheckedRecord(TenantChangeAuditPolicy policy, TenantOperationRegistry? registry,
+        TimeProvider clock, TenantOperationContext context, TenantChangeReceipt receipt,
+        Func<TenantChangeStates>? valuesFactory, CancellationToken cancellationToken)
     {
-        DemandContext(context);
+        DemandReceipt(context, receipt, registry); cancellationToken.ThrowIfCancellationRequested();
+        var rule = policy.Find(receipt) ?? throw new TenantAccessDeniedException();
+        var fields = new List<TenantChangeField>();
+        if (policy.Mode != TenantChangeAuditMode.MetadataOnly && rule.Fields.Count != 0)
+        {
+            var states = valuesFactory?.Invoke() ?? throw new ArgumentException("This capture mode requires a trusted state factory.", nameof(valuesFactory));
+            if (receipt.Kind == TenantChangeKind.Create && states.Before.Fields.Count != 0 || receipt.Kind == TenantChangeKind.Delete && states.After.Fields.Count != 0)
+                throw new ArgumentException("Create/delete state shape does not match the reported change.");
+            foreach (var field in rule.Fields)
+            {
+                var before = states.Before.Fields.TryGetValue(field.Name, out var b) ? b : TenantChangeValue.Missing;
+                var after = states.After.Fields.TryGetValue(field.Name, out var a) ? a : TenantChangeValue.Missing;
+                var changed = !before.Equals(after);
+                if (policy.Mode == TenantChangeAuditMode.ChangedFields && !changed) continue;
+                fields.Add(field.Redact ? new(field.Name, TenantChangeValue.Redacted, TenantChangeValue.Redacted, changed) : new(field.Name, before, after, changed));
+            }
+        }
+        var record = new TenantChangeAuditRecord(receipt, clock.GetUtcNow(), policy.Mode, fields);
+        DemandReceipt(context, receipt, registry); cancellationToken.ThrowIfCancellationRequested();
+        return record;
+    }
+    private void Demand(TenantOperationContext context, TenantChangeReceipt receipt)
+        => DemandReceipt(context, receipt, validatedRegistry);
+    internal static void DemandReceipt(TenantOperationContext context, TenantChangeReceipt receipt, TenantOperationRegistry? registry)
+    {
+        DemandCheckedContext(context, registry);
         context.DemandAccess(receipt.Tenant, receipt.ResourceKind, receipt.ResourceId, receipt.Action);
         if (!context.Identity.Principal.Equals(receipt.Principal) || !StringComparer.Ordinal.Equals(context.Identity.AuthenticationScheme, receipt.AuthenticationScheme) ||
             !StringComparer.Ordinal.Equals(context.OperationId, receipt.OperationId) || !StringComparer.Ordinal.Equals(context.Resource.Version, receipt.AuthorizationResourceVersion))
