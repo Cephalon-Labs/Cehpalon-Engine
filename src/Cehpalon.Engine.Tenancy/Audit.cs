@@ -11,21 +11,25 @@ public sealed class TenantAuditEvent
 {
     public TenantAuditEvent(Guid invocationId, TenantAuditStage stage, TenantAuditOutcome outcome,
         DateTimeOffset observedAtUtc, string operationId, string action, string resourceKind,
-        PrincipalId? principal = null, TenantId? authorizedTenant = null, string? resourceId = null)
+        PrincipalId? principal = null, TenantId? authorizedTenant = null, string? resourceId = null, Guid? parentInvocationId = null)
     {
         if (invocationId == Guid.Empty) throw new ArgumentException("Invocation ID cannot be empty.", nameof(invocationId));
+        if (parentInvocationId == Guid.Empty || parentInvocationId == invocationId)
+            throw new ArgumentException("Parent invocation must be a different non-empty ID.", nameof(parentInvocationId));
         if (!Enum.IsDefined(stage) || !Enum.IsDefined(outcome) ||
             (stage == TenantAuditStage.Authorization) != (outcome == TenantAuditOutcome.Authorized))
             throw new ArgumentException("Invalid audit stage/outcome combination.");
         if (authorizedTenant is not null && (principal is null || resourceId is null))
             throw new ArgumentException("Authorized tenant records require a principal and resource.");
         InvocationId = invocationId; Stage = stage; Outcome = outcome; ObservedAtUtc = observedAtUtc.ToUniversalTime();
+        ParentInvocationId = parentInvocationId;
         OperationId = Cehpalon.Engine.Core.OperationId.RequireValid(operationId);
         Action = Cehpalon.Engine.Core.OperationId.RequireValid(action); ResourceKind = Cehpalon.Engine.Core.OperationId.RequireValid(resourceKind);
         Principal = principal; AuthorizedTenant = authorizedTenant;
         ResourceId = resourceId is null ? null : Values.Opaque(resourceId, 512, nameof(resourceId));
     }
     public Guid InvocationId { get; }
+    public Guid? ParentInvocationId { get; }
     public TenantAuditStage Stage { get; }
     public TenantAuditOutcome Outcome { get; }
     public DateTimeOffset ObservedAtUtc { get; }
@@ -64,6 +68,8 @@ public sealed class TenantAuditServices
     }
     public ITenantAuditSink Sink { get; }
     public TimeSpan WriteTimeout { get; }
+    internal Guid? ParentInvocationId { get; private init; }
+    internal TenantAuditServices ForParent(Guid invocationId) => new(Sink, WriteTimeout) { ParentInvocationId = invocationId };
     internal async ValueTask AppendAsync(TenantAuditEvent entry, bool mayHaveExecuted)
     {
         using var timeout = new CancellationTokenSource(WriteTimeout);

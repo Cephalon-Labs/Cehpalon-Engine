@@ -112,7 +112,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         var id=Guid.NewGuid(); TenantAccessRequest? authority=null; var mayHaveExecuted=false;
         TenantAuditWriteException? authorizationAuditFailure=null;
         TenantAuditEvent Entry(TenantAuditStage stage,TenantAuditOutcome outcome)=>new(id,stage,outcome,
-            services.TimeProvider.GetUtcNow(),operationId,action,kind,authority?.Identity.Principal,authority?.Tenant,authority?.Resource.ResourceId);
+            services.TimeProvider.GetUtcNow(),operationId,action,kind,authority?.Identity.Principal,authority?.Tenant,authority?.Resource.ResourceId,services.Audit?.ParentInvocationId);
         async ValueTask Authorized(TenantAccessRequest access)
         {
             authority=access;

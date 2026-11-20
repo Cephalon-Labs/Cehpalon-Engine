@@ -68,3 +68,24 @@ Pass `audit: new TenantAuditServices(yourSink)` to `TenantSecurityServices` to e
 Events contain invocation ID, stage, timestamp, fixed outcome, operation/action/kind and verified principal/tenant/resource identifiers. No token, raw claim bag, body, response or exception text is recorded. Identifiers may still be personal/sensitive data; consumers own access control, minimization, retention, encryption, archival and deletion. This is operation/security history, not automatic before/after field-value versioning or tamper-proof storage.
 
 Use `TenantAuditHistoryReader` over your `ITenantAuditHistorySource` inside a tenant handler authorized for `audit-history` kind, `tenant` resource and `read` action. It demands the active scope before and after the asynchronous call, caps pages at 200 and rejects foreign/unverified tenant records. Your source must scope queries and pagination to the provided checked tenant. Do not expose the raw sink/history source as a public endpoint. The source/sink lifetime remains consumer-owned.
+
+## Tenant selection and read sets
+
+`builder.RegisterTenantSelection()` adds `tenant.select` with action `select`, kind `tenant` and destination-tenant ID as resource ID. Use normal `TenantSecurityServices` and destination membership/resource/policy. A successful `TenantSelectionRequest` only returns the selected ID; it does not mutate a global current tenant, change login identity, issue an authority token or bypass the next data request's checks. Keep a selected tenant in client/tab/request state and send it as an untrusted selector. Parallel requests retain their own checked context; A work cannot acquire B authority because another tab switched.
+
+For explicit cross-tenant reads, register a separate `TenantReadSetOperation<TQuery,TResponse>` and supply an `ITenantReadSetSource` to `TenantReadSetDispatcher`. The source must freshly grant an exact principal/operation/resource-bound tenant set. `requestedTenants: null` means the tenants in that grant; a nonempty caller subset must be contained in it. Grants and subsets are bounded to 64 exact unique IDs. Empty, duplicate, over-limit, wildcard or ungranted selection cannot promote access. Large global reporting/catalog pagination needs a separately designed provider capability; this implementation rejects over-limit input instead of silently truncating it.
+
+```csharp
+var operation = new TenantReadSetOperation<ReportQuery, ReportRows>(
+    "report.read", "report", query => query.Copy(), query => query.ReportId,
+    () => new ScopedReadHandler(dataPort));
+var dispatcher = new TenantReadSetDispatcher(securityServices, trustedReadGrantSource);
+var result = await dispatcher.DispatchAsync(operation, query, correlation,
+    requestedTenants: null, cancellationToken: token);
+```
+
+Read-set handlers are registered by trusted application code and always receive action `read` with a normal checked tenant context. The framework cannot prove arbitrary C# handlers have no writes. Data/query/cache ports must demand and apply the checked tenant, not caller payload tenant fields. The query snapshot callback must deep-copy mutable graphs; the dispatcher freezes the query and caller subset before authority awaits, then supplies a separate frozen query per child. Response values and application code remain trusted; the framework cannot inspect arbitrary row types for semantic tenant ownership.
+
+The dispatcher pins principal **and authentication scheme**, but resolves the original source afresh for every tenant. Each child runs fresh membership/resource/policy checks and can share a supplied tenant concurrency budget. The batch lease is bounded by its grant, initial identity and configured maximum; child identity validity is capped by that same lease. It checks the batch after each child and after the final required audit write before returning results. No partial result is returned on denial, cancellation or fault. Earlier authorized reads may already have run before a later failure; this is not an atomic cross-provider snapshot, rollback, instantaneous distributed revocation, a universal administrator grant or a write fanout API.
+
+When audit is selected, a required control-plane authorization event precedes child handlers, each normal tenant event carries `ParentInvocationId`, and a control-plane terminal event follows processing. Control-plane records have `AuthorizedTenant=null` and are excluded from tenant history. `ResourceId` on the root is the grant version, not a caller-supplied tenant assertion or a token. A terminal record describes processing at its observation point: audit persistence and transport delivery cannot be atomic. If the grant expires or caller cancels during the final write, the terminal processing event can be `Succeeded` while the final lease/cancellation gate still withholds all response rows. Applications must distinguish processing history from delivered responses.
