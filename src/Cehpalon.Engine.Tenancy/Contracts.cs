@@ -70,6 +70,17 @@ public interface ITenantAccessPolicy
     ValueTask<bool> IsAllowedAsync(TenantAccessRequest request,CancellationToken cancellationToken);
 }
 
+/// <summary>A trusted policy may bound the operation lease by the validity of its authority facts.</summary>
+public interface ILeasedTenantAccessPolicy : ITenantAccessPolicy
+{
+    ValueTask<TenantPolicyDecision> EvaluateAsync(TenantAccessRequest request,CancellationToken cancellationToken);
+}
+
+public sealed record TenantPolicyDecision(bool IsAllowed,DateTimeOffset NotBeforeUtc,DateTimeOffset ExpiresAtUtc)
+{
+    public static TenantPolicyDecision Denied { get; }=new(false,DateTimeOffset.MinValue,DateTimeOffset.MinValue);
+}
+
 public sealed class TenantAccessRequest
 {
     internal TenantAccessRequest(string operationId,string action,IdentitySnapshot identity,TenantMembershipSnapshot membership,ResourceScopeSnapshot resource)

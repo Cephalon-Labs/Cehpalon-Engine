@@ -6,12 +6,13 @@ namespace Cehpalon.Engine.Tenancy;
 
 public sealed class TenantSecurityServices
 {
-    public TenantSecurityServices(IIdentitySource identitySource,IdentityTrustPolicy identityTrust,ITenantMembershipSource memberships,IResourceScopeSource resources,TimeSpan maximumLeaseLifetime,ITenantAccessPolicy? policy=null,TimeProvider? timeProvider=null)
+    public TenantSecurityServices(IIdentitySource identitySource,IdentityTrustPolicy identityTrust,ITenantMembershipSource memberships,IResourceScopeSource resources,TimeSpan maximumLeaseLifetime,ITenantAccessPolicy? policy=null,TimeProvider? timeProvider=null,TenantAuditServices? audit=null)
     {
         IdentitySource=identitySource??throw new ArgumentNullException(nameof(identitySource)); IdentityTrust=identityTrust??throw new ArgumentNullException(nameof(identityTrust));
         Memberships=memberships??throw new ArgumentNullException(nameof(memberships)); Resources=resources??throw new ArgumentNullException(nameof(resources));
         if(maximumLeaseLifetime<=TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(maximumLeaseLifetime));
         MaximumLeaseLifetime=maximumLeaseLifetime; Policy=policy??DenyPolicy.Instance; TimeProvider=timeProvider??TimeProvider.System;
+        Audit=audit;
     }
     public IIdentitySource IdentitySource { get; }
     public IdentityTrustPolicy IdentityTrust { get; }
@@ -20,6 +21,7 @@ public sealed class TenantSecurityServices
     public TimeSpan MaximumLeaseLifetime { get; }
     public ITenantAccessPolicy Policy { get; }
     public TimeProvider TimeProvider { get; }
+    public TenantAuditServices? Audit { get; }
     private sealed class DenyPolicy:ITenantAccessPolicy
     {
         internal static readonly DenyPolicy Instance=new();
@@ -98,8 +100,44 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         this.operationId=operationId; this.action=action; this.kind=kind; this.freeze=freeze; this.select=select;
         core=new(new OperationRegistryBuilder().Register<AuthorizedInvocation,TResponse>(operationId,()=>new HandlerBridge(factory,origin,operationId)).Build());
     }
-    internal async ValueTask<OperationResult<TResponse>> DispatchAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
+    internal ValueTask<OperationResult<TResponse>> DispatchAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
         OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token)
+        => services.Audit is null
+            ? DispatchCoreAsync(request,correlation,services,budget,tenantBudget,token,null)
+            : DispatchAuditedAsync(request,correlation,services,budget,tenantBudget,token);
+
+    private async ValueTask<OperationResult<TResponse>> DispatchAuditedAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
+        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token)
+    {
+        var id=Guid.NewGuid(); TenantAccessRequest? authority=null; var mayHaveExecuted=false;
+        TenantAuditWriteException? authorizationAuditFailure=null;
+        TenantAuditEvent Entry(TenantAuditStage stage,TenantAuditOutcome outcome)=>new(id,stage,outcome,
+            services.TimeProvider.GetUtcNow(),operationId,action,kind,authority?.Identity.Principal,authority?.Tenant,authority?.Resource.ResourceId);
+        async ValueTask Authorized(TenantAccessRequest access)
+        {
+            authority=access;
+            try { await services.Audit!.AppendAsync(Entry(TenantAuditStage.Authorization,TenantAuditOutcome.Authorized),false).ConfigureAwait(false); }
+            catch(TenantAuditWriteException failure) { authorizationAuditFailure=failure; throw; }
+            mayHaveExecuted=true;
+        }
+        OperationResult<TResponse>? result=null; Exception? executionFailure=null;
+        try { result=await DispatchCoreAsync(request,correlation,services,budget,tenantBudget,token,Authorized).ConfigureAwait(false); }
+        catch(TenantAuditWriteException failure) when(ReferenceEquals(failure,authorizationAuditFailure)) { throw; }
+        catch(Exception failure) { executionFailure=failure; }
+        var outcome=executionFailure is OperationCanceledException?TenantAuditOutcome.Cancelled:
+            executionFailure is not null?TenantAuditOutcome.Faulted:
+            result!.IsSuccess?TenantAuditOutcome.Succeeded:
+            result.Error!.Code=="access.denied"?TenantAuditOutcome.Denied:TenantAuditOutcome.Rejected;
+        try { await services.Audit!.AppendAsync(Entry(TenantAuditStage.Terminal,outcome),mayHaveExecuted).ConfigureAwait(false); }
+        catch(TenantAuditWriteException auditFailure) when(executionFailure is not null)
+        { throw new AggregateException("Operation and required audit persistence failed.",executionFailure,auditFailure); }
+        if(executionFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(executionFailure).Throw();
+        return result!;
+    }
+
+    private async ValueTask<OperationResult<TResponse>> DispatchCoreAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
+        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token,
+        Func<TenantAccessRequest,ValueTask>? authorized)
     {
         token.ThrowIfCancellationRequested();
         var frozen=freeze(request);
@@ -117,13 +155,26 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         var policyTime=services.TimeProvider.GetUtcNow();
         if(!services.IdentityTrust.IsAccepted(identity,policyTime) || !ValidMembership(identity!,target.Tenant,membership,policyTime)) return Denied();
         var access=new TenantAccessRequest(operationId,action,identity!,membership!,resource);
-        if(!await services.Policy.IsAllowedAsync(access,token).ConfigureAwait(false)) { token.ThrowIfCancellationRequested(); return Denied(); }
+        var policyExpires=DateTimeOffset.MaxValue;
+        var policyNotBefore=policyTime;
+        bool allowed;
+        if(services.Policy is ILeasedTenantAccessPolicy leasedPolicy)
+        {
+            var decision=await leasedPolicy.EvaluateAsync(access,token).ConfigureAwait(false);
+            allowed=decision is not null && decision.IsAllowed;
+            if(allowed) { policyExpires=decision!.ExpiresAtUtc; policyNotBefore=decision.NotBeforeUtc>policyTime?decision.NotBeforeUtc:policyTime; }
+        }
+        else allowed=await services.Policy.IsAllowedAsync(access,token).ConfigureAwait(false);
+        if(!allowed) { token.ThrowIfCancellationRequested(); return Denied(); }
+        token.ThrowIfCancellationRequested();
+        if(authorized is not null) await authorized(access).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
         var now=services.TimeProvider.GetUtcNow();
-        if(!services.IdentityTrust.IsAccepted(identity,now) || !ValidMembership(identity!,target.Tenant,membership,now)) return Denied();
+        if(!services.IdentityTrust.IsAccepted(identity,now) || !ValidMembership(identity!,target.Tenant,membership,now) || now<policyNotBefore || now>=policyExpires) return Denied();
         var maximum=services.MaximumLeaseLifetime.Ticks>DateTimeOffset.MaxValue.Ticks-now.UtcTicks?DateTimeOffset.MaxValue:now.Add(services.MaximumLeaseLifetime);
         var expires=identity!.ExpiresAtUtc<membership!.ExpiresAtUtc?identity.ExpiresAtUtc:membership.ExpiresAtUtc;
         if(maximum<expires) expires=maximum;
+        if(policyExpires<expires) expires=policyExpires;
         using var lease=new AuthorizationLease(services.TimeProvider,now,expires);
         var context=new TenantOperationContext(access,correlation,lease,origin);
         try

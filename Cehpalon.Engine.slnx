@@ -1,5 +1,7 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Cehpalon.Engine.Authorization/Cehpalon.Engine.Authorization.csproj" />
+    <Project Path="src/Cehpalon.Engine.Identity.AspNetCore/Cehpalon.Engine.Identity.AspNetCore.csproj" />
     <Project Path="src/Cehpalon.Engine.Core/Cehpalon.Engine.Core.csproj" />
     <Project Path="src/Cehpalon.Engine.Composition/Cehpalon.Engine.Composition.csproj" />
     <Project Path="src/Cehpalon.Engine.CodeGeneration/Cehpalon.Engine.CodeGeneration.csproj" />
@@ -10,6 +12,7 @@
     <Project Path="src/Cehpalon.Engine.Tooling/Cehpalon.Engine.Tooling.csproj" />
   </Folder>
   <Folder Name="/Tests/">
+    <Project Path="Tests/Access.ContractTests/Access.ContractTests.csproj" />
     <Project Path="Tests/Core.ContractTests/Core.ContractTests.csproj" />
     <Project Path="Tests/Composition.ContractTests/Composition.ContractTests.csproj" />
     <Project Path="Tests/CodeGeneration.ContractTests/CodeGeneration.ContractTests.csproj" />

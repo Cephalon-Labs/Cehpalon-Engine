@@ -27,7 +27,7 @@ def main():
     revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     dirty=subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip()
     report={'observed_at_utc':datetime.now(timezone.utc).isoformat(),'engine_revision':revision,'source_state':'uncommitted integration' if dirty else 'exact clean committed source','scope':'Local experimental component and localhost adapter contracts; not supported-Windows, hosted CI, real IdP/provider, full workload/benchmark/production qualification','source_sha256':{},'tests':[],'status':'started'}
-    for folder in ['src/Cehpalon.Engine.Core','src/Cehpalon.Engine.Composition','src/Cehpalon.Engine.CodeGeneration','src/Cehpalon.Engine.Identity.Contracts','src/Cehpalon.Engine.Tenancy','src/Cehpalon.Engine.Transports.Http','src/Cehpalon.Engine.Transports.GraphQL','src/Cehpalon.Engine.Tooling','Tests/Tooling.ContractTests','Tests/Http.ContractTests','Tests/GraphQL.ContractTests','Tests/Core.ContractTests','Tests/Composition.ContractTests','Tests/CodeGeneration.ContractTests','Tests/Identity.ContractTests','Tests/Tenancy.ContractTests','Benchmarks/W1.Components','Benchmarks/Tenancy.Components','Benchmarks/Tooling.Components']:
+    for folder in ['src/Cehpalon.Engine.Core','src/Cehpalon.Engine.Composition','src/Cehpalon.Engine.CodeGeneration','src/Cehpalon.Engine.Identity.Contracts','src/Cehpalon.Engine.Authorization','src/Cehpalon.Engine.Identity.AspNetCore','src/Cehpalon.Engine.Tenancy','src/Cehpalon.Engine.Transports.Http','src/Cehpalon.Engine.Transports.GraphQL','src/Cehpalon.Engine.Tooling','Tests/Tooling.ContractTests','Tests/Http.ContractTests','Tests/GraphQL.ContractTests','Tests/Core.ContractTests','Tests/Composition.ContractTests','Tests/CodeGeneration.ContractTests','Tests/Identity.ContractTests','Tests/Access.ContractTests','Tests/Tenancy.ContractTests','Benchmarks/W1.Components','Benchmarks/Tenancy.Components','Benchmarks/Tooling.Components']:
         for path in sorted((ROOT/folder).rglob('*')):
             if not path.is_file() or {'bin','obj','evidence'}.intersection(path.relative_to(ROOT/folder).parts): continue
             if path.suffix in ('.cs','.csproj','.json','.py') or 'Templates' in path.relative_to(ROOT/folder).parts: report['source_sha256'][path.relative_to(ROOT).as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
@@ -41,7 +41,7 @@ def main():
         run([args.dotnet,'--info'],'sdk-info.txt')
         run([args.dotnet,'restore','Cehpalon.Engine.slnx','--locked-mode','--configfile',ROOT/'NuGet.Config','--artifacts-path',artifacts],'restore.txt')
         run([args.dotnet,'build','Cehpalon.Engine.slnx','-c','Release','--no-restore','--artifacts-path',artifacts,'-p:UseSharedCompilation=false','-warnaserror'],'build.txt')
-        for project in ['Core.ContractTests','Composition.ContractTests','CodeGeneration.ContractTests','Identity.ContractTests','Tenancy.ContractTests','Http.ContractTests','GraphQL.ContractTests','Tooling.ContractTests']:
+        for project in ['Core.ContractTests','Composition.ContractTests','CodeGeneration.ContractTests','Identity.ContractTests','Access.ContractTests','Tenancy.ContractTests','Http.ContractTests','GraphQL.ContractTests','Tooling.ContractTests']:
             result_path=output/(project+'.json')
             run([args.dotnet,artifacts/'bin'/project/'release'/(project+'.dll'),'--output='+str(result_path)],project+'.txt')
             test=json.loads(result_path.read_text())
