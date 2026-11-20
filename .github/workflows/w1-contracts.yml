@@ -8,6 +8,7 @@ on:
       - Tests/Core.ContractTests/**
       - Tests/Composition.ContractTests/**
       - Tests/CodeGeneration.ContractTests/**
+      - Tests/KeyRing.ContractTests/**
       - Tests/Jwe.ContractTests/**
       - Tests/AuthProfile.ContractTests/**
       - Tests/TenantReadSet.ContractTests/**
