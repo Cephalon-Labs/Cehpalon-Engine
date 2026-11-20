@@ -8,7 +8,7 @@ using Microsoft.IdentityModel.JsonWebTokens;
 
 namespace Cehpalon.Engine.Identity.JwtBearer;
 
-public enum JwtKeySource { PublicJwks, ProvidedKeys, AuthorityMetadata }
+public enum JwtKeySource { PublicJwks, ProvidedKeys, AuthorityMetadata, RotatingKeyRing }
 public enum JwtTokenProtection { Signed, EncryptedSigned }
 
 /// <summary>Mutable configuration binding DTO. Freeze through JwtAuthenticationProfile before activation.</summary>
@@ -111,6 +111,8 @@ public static class JwtAuthenticationRegistration
         Func<IEnumerable<SecurityKey>>? decryptionKeys = null)
     {
         ArgumentNullException.ThrowIfNull(builder); ArgumentNullException.ThrowIfNull(profile);
+        if (profile.KeySource == JwtKeySource.RotatingKeyRing)
+            throw new ArgumentException("Rotating key rings require their distinct registration method.");
         if (profile.KeySource == JwtKeySource.PublicJwks && (publicJwks is null || providedKeys is not null) ||
             profile.KeySource == JwtKeySource.ProvidedKeys && (providedKeys is null || publicJwks is not null) ||
             profile.KeySource == JwtKeySource.AuthorityMetadata && (publicJwks is not null || providedKeys is not null))
@@ -123,11 +125,9 @@ public static class JwtAuthenticationRegistration
             JwtKeySource.ProvidedKeys => ProfileKeys.CopyProvided(providedKeys!(), profile),
             _ => []
         };
-        var byId = keys.ToDictionary(k => k.KeyId, StringComparer.Ordinal);
         var decrypt = decryptionKeys is null ? [] : JweKeys.Copy(decryptionKeys(), profile);
         foreach (var signingKey in keys)
             if (!JweKeys.IsSeparate(signingKey, decrypt)) throw new ArgumentException("Signing and decryption keys must use separate IDs and material.");
-        var decryptById = decrypt.ToDictionary(k => k.KeyId, StringComparer.Ordinal);
         return builder.AddJwtBearer(profile.Scheme, options =>
         {
             options.MapInboundClaims = false; options.IncludeErrorDetails = false; options.SaveToken = false;
@@ -140,29 +140,35 @@ public static class JwtAuthenticationRegistration
                 options.Authority = profile.Authority;
                 if (profile.MetadataAddress is { } address) options.MetadataAddress = address;
             }
-            var validation = new TokenValidationParameters
-            {
-                ValidateIssuerSigningKey = true, ValidateIssuer = true, ValidIssuer = profile.Issuer,
-                IssuerValidatorUsingConfiguration = (issuer, _, _, _) => StringComparer.Ordinal.Equals(issuer, profile.Issuer)
-                    ? issuer : throw new SecurityTokenInvalidIssuerException("The token issuer is not trusted by this profile."),
-                ValidateAudience = true, ValidAudience = profile.Audience, IgnoreTrailingSlashWhenValidatingAudience = false,
-                ValidateLifetime = true, RequireExpirationTime = true, RequireSignedTokens = true,
-                ClockSkew = TimeSpan.Zero, ValidAlgorithms = [profile.Algorithm], ValidTypes = [profile.TokenType],
-                TryAllIssuerSigningKeys = false,
-                AlgorithmValidator = (algorithm, key, token, _) => token is JsonWebToken { IsEncrypted: true } outer
-                    ? profile.TokenProtection == JwtTokenProtection.EncryptedSigned && algorithm == profile.ContentEncryptionAlgorithm &&
-                        outer.Alg == profile.KeyManagementAlgorithm && outer.Enc == profile.ContentEncryptionAlgorithm && key is SymmetricSecurityKey && key.KeySize == 512
-                    : StringComparer.Ordinal.Equals(algorithm, profile.Algorithm) && ProfileKeys.IsCompatible(key, profile) && JweKeys.IsSeparate(key, decrypt)
-            };
-            if (profile.TokenProtection == JwtTokenProtection.EncryptedSigned)
-            {
-                validation.TokenDecryptionKeyResolver = (_, _, kid, _) => kid is not null && decryptById.TryGetValue(kid, out var key) ? [key] : [];
-                validation.TryAllDecryptionKeys = false;
-                validation.TokenReader = (text, _) => ProfileTokenHandler.Read(text, profile, false);
-            }
-            if (profile.KeySource != JwtKeySource.AuthorityMetadata)
-                validation.IssuerSigningKeyResolver = (_, _, kid, _) => kid is not null && byId.TryGetValue(kid, out var key) ? [key] : [];
-            options.TokenValidationParameters = validation;
+            options.TokenValidationParameters = CreateValidationParameters(profile, keys, decrypt);
         });
+    }
+    internal static TokenValidationParameters CreateValidationParameters(JwtAuthenticationProfile profile, SecurityKey[] keys, SecurityKey[] decrypt)
+    {
+        var byId = keys.ToDictionary(k => k.KeyId, StringComparer.Ordinal);
+        var decryptById = decrypt.ToDictionary(k => k.KeyId, StringComparer.Ordinal);
+        var validation = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true, ValidateIssuer = true, ValidIssuer = profile.Issuer,
+            IssuerValidatorUsingConfiguration = (issuer, _, _, _) => StringComparer.Ordinal.Equals(issuer, profile.Issuer)
+                ? issuer : throw new SecurityTokenInvalidIssuerException("The token issuer is not trusted by this profile."),
+            ValidateAudience = true, ValidAudience = profile.Audience, IgnoreTrailingSlashWhenValidatingAudience = false,
+            ValidateLifetime = true, RequireExpirationTime = true, RequireSignedTokens = true,
+            ClockSkew = TimeSpan.Zero, ValidAlgorithms = [profile.Algorithm], ValidTypes = [profile.TokenType],
+            TryAllIssuerSigningKeys = false,
+            AlgorithmValidator = (algorithm, key, token, _) => token is JsonWebToken { IsEncrypted: true } outer
+                ? profile.TokenProtection == JwtTokenProtection.EncryptedSigned && algorithm == profile.ContentEncryptionAlgorithm &&
+                    outer.Alg == profile.KeyManagementAlgorithm && outer.Enc == profile.ContentEncryptionAlgorithm && key is SymmetricSecurityKey && key.KeySize == 512
+                : StringComparer.Ordinal.Equals(algorithm, profile.Algorithm) && ProfileKeys.IsCompatible(key, profile) && JweKeys.IsSeparate(key, decrypt)
+        };
+        if (profile.TokenProtection == JwtTokenProtection.EncryptedSigned)
+        {
+            validation.TokenDecryptionKeyResolver = (_, _, kid, _) => kid is not null && decryptById.TryGetValue(kid, out var key) ? [key] : [];
+            validation.TryAllDecryptionKeys = false;
+            validation.TokenReader = (text, _) => ProfileTokenHandler.Read(text, profile, false);
+        }
+        if (profile.KeySource != JwtKeySource.AuthorityMetadata)
+            validation.IssuerSigningKeyResolver = (_, _, kid, _) => kid is not null && byId.TryGetValue(kid, out var key) ? [key] : [];
+        return validation;
     }
 }

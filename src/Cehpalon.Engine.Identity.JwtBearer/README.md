@@ -70,3 +70,30 @@ Outer typ must match TokenType, cty must be JWT, and alg/enc/kid are explicit. O
 Signing and decryption keys must have distinct IDs **and actual material**; unsigned RSA modulus/exponent comparison normalizes representation rather than comparing padded encodings. Symmetric bytes are compared directly. Local reuse rejects at registration; metadata-sourced signing reuse rejects during signature validation. Cross-profile/application separation and key entropy still belong to the host. Decryption secrets never come from public JWKS or token-provided URLs and are never included in audit records.
 
 Algorithm validation distinguishes outer content-encryption/derived symmetric CEK from inner signing keys. A global union of allowed algorithm names would lose those roles; do not replace the supplied handler/validators with permissive delegates. Failures remain generic with no token/plaintext/key interpolation. Successful JWE authentication still enters the same fresh tenant membership/resource/RBAC/ABAC, switching/read-set and audit boundaries. Encryption does not grant tenant access or replace TLS.
+
+## Optional local rotating key ring
+
+Select `KeySource = JwtKeySource.RotatingKeyRing` and use the distinct registration below inside the selected security factory. It cannot mix static key callbacks or metadata endpoints. The consumer owns the ring lifetime and supplies keys through a trusted local management path; token content cannot trigger retrieval, publication or refresh.
+
+```csharp
+var ring = new JwtKeyRing(profile); // profile selects RotatingKeyRing
+var now = DateTimeOffset.UtcNow;
+ring.Publish(expectedVersion: 0, signingKeys: initialSigningKeys,
+    decryptionKeys: initialDecryptionKeys, // null for Signed profiles
+    notBeforeUtc: now, expiresAtUtc: now.AddMinutes(4));
+builder.Services.AddAuthentication(profile.Scheme)
+    .AddCehpalonJwtBearerKeyRing(() => ring);
+
+// Publish both roles together: overlap first, then explicitly retire old keys.
+var version = ring.Publish(ring.Version, overlappingSigningKeys,
+    overlappingDecryptionKeys, now, now.AddMinutes(4));
+ring.Withdraw(version); // denies fresh validation until an explicit new publication
+```
+
+The factory runs once at registration. An empty ring denies authentication. `Publish` copies and validates a complete coherent signing/decryption candidate using the same exact algorithm, family, strength, key-ID and material-separation rules above, with at most16 keys per role. It then atomically replaces only `expectedVersion`; stale publishers fail. Invalid candidates leave the live version unchanged. A racing stale publisher may already have copied its candidate before the final version check. The caller must not mutate its key objects concurrently with publication.
+
+Only currently valid publications are accepted: a future `notBeforeUtc` or expired candidate rejects. Maximum remaining snapshot lifetime defaults to5minutes and can be configured to a positive duration of at most1hour. Validation checks UTC validity and elapsed monotonic age; observed UTC/timestamp rollback, expiry or clock faults permanently invalidate that publication. Correcting the clock alone cannot revive it: trusted management must explicitly publish a new version. No last-good key fallback exists. `Dispose` permanently closes the ring and clears its current publication; it cannot undo authentication already completed.
+
+Each validation pins one publication for both roles, creates private request copies of its keys, and uses an isolated standard IdentityModel crypto factory with signature-provider caching disabled. This prevents public validated-token key objects or cached crypto providers from retaining mutable references into later validations. This optional mode's copying and cache-isolation costs have not been benchmarked; static and metadata modes retain their existing behavior. `SignatureValidator` and `SignatureValidatorUsingConfiguration` overrides fail closed in ring mode because those hooks bypass the standard ring key and algorithm checks. Trusted host code and other callbacks remain outside a C# sandbox.
+
+A final version/validity check rejects validation completing after withdrawal, replacement or expiry observed at that check. That check is the completion boundary of token validation: it is not atomic with later host `TokenValidated` events, authentication-ticket caching, business execution or response delivery. An already completed/cached ticket is not revoked, and already admitted business work is not reversed. Continue to use fresh tenant membership/resource/RBAC/ABAC checks at protected operations. This local ring is not a real IdP/KMS/HSM adapter, distributed revocation protocol, private-memory zeroization guarantee or production key lifecycle proof.
