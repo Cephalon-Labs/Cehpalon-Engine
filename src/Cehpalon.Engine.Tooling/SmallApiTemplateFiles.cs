@@ -39,7 +39,7 @@ internal static class SmallApiTemplateFiles
             var versions = document.Descendants("PackageVersion").Where(x => (string?)x.Attribute("Include") == name).ToArray();
             return versions.Length == 1 && (string?)versions[0].Attribute("Version") == expected;
         }
-        return Pinned("Microsoft.AspNetCore.Authentication.JwtBearer", "[11.0.0-rc.3.26522.148]")
+        return Pinned("Microsoft.AspNetCore.Authentication.JwtBearer", "[11.0.0]")
             && Pinned("HotChocolate.AspNetCore", "[16.7.1]");
     }
 
@@ -77,7 +77,7 @@ internal static class SmallApiTemplateFiles
   <ItemGroup>
     <Compile Include="Program.cs" /><Compile Include="SelfTest.cs" /><Compile Include="FixtureHost.cs" /><Compile Include="Catalog.cs" /><Compile Include="ContractExport.cs" />
     <Content Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="[11.0.0-rc.3.26522.148]" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="[11.0.0]" />
     <ProjectReference Include="{{Project("Cehpalon.Engine.Core")}}" />
     <ProjectReference Include="{{Project("Cehpalon.Engine.Composition")}}" />
     <ProjectReference Include="{{Project("Cehpalon.Engine.Identity.Contracts")}}" />

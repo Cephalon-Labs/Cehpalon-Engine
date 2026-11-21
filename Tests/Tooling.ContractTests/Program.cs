@@ -422,8 +422,12 @@ foreach (var invalidSource in new (string Name, string Path, string Text)[]
     ("malformed-sdk-json", "global.json", "{ broken SUPER_SECRET_SOURCE_VALUE"),
     ("scalar-sdk-policy", "global.json", "{\"sdk\":\"SUPER_SECRET_SOURCE_VALUE\"}"),
     ("nonobject-sdk-root", "global.json", "[\"SUPER_SECRET_SOURCE_VALUE\"]"),
-    ("numeric-sdk-version", "global.json", "{\"sdk\":{\"version\":123,\"rollForward\":\"disable\",\"allowPrerelease\":true}}"),
-    ("wrong-sdk-version", "global.json", "{\"sdk\":{\"version\":\"SUPER_SECRET_SOURCE_VALUE\",\"rollForward\":\"disable\",\"allowPrerelease\":true}}"),
+    ("numeric-sdk-version", "global.json", "{\"sdk\":{\"version\":123,\"rollForward\":\"disable\",\"allowPrerelease\":false}}"),
+    ("wrong-sdk-version", "global.json", "{\"sdk\":{\"version\":\"SUPER_SECRET_SOURCE_VALUE\",\"rollForward\":\"disable\",\"allowPrerelease\":false}}"),
+    ("release-candidate-sdk", "global.json", "{\"sdk\":{\"version\":\"11.0.100-rc.3.26522.148\",\"rollForward\":\"disable\",\"allowPrerelease\":false}}"),
+    ("ga-sdk-prerelease-enabled", "global.json", "{\"sdk\":{\"version\":\"11.0.100\",\"rollForward\":\"disable\",\"allowPrerelease\":true}}"),
+    ("ga-sdk-prerelease-unspecified", "global.json", "{\"sdk\":{\"version\":\"11.0.100\",\"rollForward\":\"disable\"}}"),
+    ("ga-sdk-roll-forward-enabled", "global.json", "{\"sdk\":{\"version\":\"11.0.100\",\"rollForward\":\"latestPatch\",\"allowPrerelease\":false}}"),
     ("malformed-package-xml", "NuGet.Config", "<configuration>SUPER_SECRET_SOURCE_VALUE"),
     ("unapproved-package-feed", "NuGet.Config", "<configuration><packageSources><clear/><add key=\"secret\" value=\"https://SUPER_SECRET_SOURCE_VALUE.invalid/feed\" protocolVersion=\"3\"/></packageSources></configuration>")
 })
@@ -693,12 +697,31 @@ string[] SmallArguments(string target) => [.. NewArguments(target), "--profile",
 string[] smallFiles = ["Catalog.cs", "Consumer.csproj", "ContractExport.cs", "FixtureHost.cs", "NuGet.Config", "Program.cs", "README.md", "SelfTest.cs",
     "appsettings.graphql-only.json", "appsettings.graphql.json", "appsettings.json", "appsettings.off.json", "engine-source.json", "global.json"];
 
+Check("small-api-release-candidate-jwt-policy-rejected-before-output", () =>
+{
+    var parent = Scope(); var source = CreateSourceFixture(parent);
+    var policy = Path.Combine(source, "Directory.Packages.props");
+    var text = File.ReadAllText(policy);
+    Assert(text.Contains("[11.0.0]", StringComparison.Ordinal), "Fixture must start at the stable JWT pin.");
+    File.WriteAllText(policy, text.Replace("[11.0.0]", "[11.0.0-rc.3.26522.148]", StringComparison.Ordinal), new UTF8Encoding(false));
+    var before = Snapshot(parent); var target = Path.Combine(parent, "output");
+    var result = Run([.. NewArguments(target, root: source), "--profile", "small-api"]);
+    Assert(result.Code == 3 && !Directory.Exists(target));
+    SameSnapshot(before, parent);
+});
+
 Check("small-api-exact-files-determinism-and-profile-specific-validation", () =>
 {
     var parent = Scope(); var first = Path.Combine(parent, "first"); var second = Path.Combine(parent, "second");
     Assert(Run(SmallArguments(first)).Code == 0); Assert(Run(SmallArguments(second)).Code == 0);
     Assert(Directory.EnumerateFiles(first).Select(Path.GetFileName).Order(StringComparer.Ordinal).SequenceEqual(smallFiles.Order(StringComparer.Ordinal)));
     SameSnapshot(Snapshot(first), second);
+    using var sdkPolicy = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(first, "global.json")));
+    Assert(sdkPolicy.RootElement.GetProperty("sdk").GetProperty("version").GetString() == "11.0.100");
+    Assert(sdkPolicy.RootElement.GetProperty("sdk").GetProperty("allowPrerelease").ValueKind == JsonValueKind.False);
+    var projectText = File.ReadAllText(Path.Combine(first, "Consumer.csproj"));
+    Assert(projectText.Contains("Microsoft.AspNetCore.Authentication.JwtBearer\" Version=\"[11.0.0]\"", StringComparison.Ordinal));
+    Assert(!projectText.Contains("-rc.", StringComparison.Ordinal), "A generated current project must not retain an RC package reference.");
     foreach (var name in new[] { "appsettings.json", "appsettings.graphql.json", "appsettings.graphql-only.json", "appsettings.off.json" })
     {
         var config = Path.Combine(first, name); var before = Snapshot(first);

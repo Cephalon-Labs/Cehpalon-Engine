@@ -202,9 +202,9 @@ public static class CliApplication
         // Pin these portable template inputs rather than copying arbitrary SDK/feed policy.
         using var global = JsonDocument.Parse(inputs["global.json"]);
         if (!global.RootElement.TryGetProperty("sdk", out var sdk)
-            || !sdk.TryGetProperty("version", out var version) || version.GetString() != "11.0.100-rc.3.26522.148"
+            || !sdk.TryGetProperty("version", out var version) || version.GetString() != "11.0.100"
             || !sdk.TryGetProperty("rollForward", out var roll) || roll.GetString() != "disable"
-            || !sdk.TryGetProperty("allowPrerelease", out var allow) || allow.ValueKind != JsonValueKind.True)
+            || !sdk.TryGetProperty("allowPrerelease", out var allow) || allow.ValueKind != JsonValueKind.False)
             throw new PathFailure("source.sdk", "Engine source SDK policy does not match the supported experimental template.");
         var nuget = System.Xml.Linq.XDocument.Parse(Utf8.GetString(inputs["NuGet.Config"]));
         var sources = nuget.Root?.Element("packageSources");

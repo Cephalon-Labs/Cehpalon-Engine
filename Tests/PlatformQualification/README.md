@@ -6,17 +6,17 @@ business E2E, AI, performance or production hosting.
 
 ## Pins and prerequisites
 
-- SDK `11.0.100-rc.3.26522.148`, with roll-forward disabled in root `global.json`.
-- Runtime `11.0.0-rc.3.26522.148` from the same verified private SDK distribution.
+- SDK `11.0.100`, with roll-forward disabled in root `global.json`.
+- Runtime `11.0.0` from the same verified private SDK distribution.
 - Exact direct dependency ranges in `Directory.Packages.props`; commit
   `packages.lock.json` and use `--locked-mode` on subsequent restores.
-- Private SDK archive SHA512 verification and raw OS observations are in
-  `evidence/`. No global SDK/runtime was replaced.
-- Ubuntu 22.04.5 LTS x64/glibc 2.35 is in the published .NET 11 OS list. Local
-  Windows 11 Pro reports DisplayVersion 26H2/build 26300, which is not listed in
-  that support table; its successful runs are observational compatibility only.
+- Earlier RC SDK archive SHA512 verification and raw OS observations are in
+  `evidence/`; they do not verify a GA SDK archive. No global SDK/runtime was replaced.
+- The earlier RC qualification observed Ubuntu 22.04.5 LTS x64/glibc 2.35 in its
+  published OS list and local Windows 11 Pro DisplayVersion 26H2/build 26300
+  outside that table. Those Windows runs remain observational compatibility only.
 
-The exact published OS snapshot is `evidence/dotnet11-supported-os-source.md`.
+The earlier RC qualification OS snapshot is `evidence/dotnet11-supported-os-source.md`; it remains historical evidence. Recheck the current GA support matrix and exact host before promoting a new qualification result.
 The WSL Linux result is not bare-metal/container/Kubernetes performance proof.
 
 ## Reproduce using an already verified SDK
@@ -44,7 +44,7 @@ The caller creates and later cleans up only its own provider fixtures.
 
 ## What the checks establish
 
-- Exact runtime major/x64 and .NET configuration-provider precedence.
+- Exact stable runtime `11.0.0`/x64 and .NET configuration-provider precedence.
 - Npgsql assembly, datasource disposal and pre-cancelled connection behavior.
 - RabbitMQ client assembly and option compatibility.
 - Kestrel HTTPS with an in-process test CA, explicit custom-root chain trust and
@@ -82,7 +82,7 @@ quantities; the retained first checker attempt compared them incorrectly. See
 The corrected inventory does not independently recompute the signed-content hash
 or establish publisher signature trust, legal compatibility or code security.
 
-The restored graph has 63 packages: 60 declare MIT, Npgsql declares PostgreSQL,
+The earlier RC inventory recorded 63 packages: 60 declare MIT, Npgsql declares PostgreSQL,
 RabbitMQ.Client declares Apache-2.0 OR MPL-2.0, and ChilliCream.Nitro.App 32.0.2
 uses a LICENSE file containing ChilliCream License 1.0. The latter remains in the
 artifact graph even though this smoke maps no Nitro IDE. Its exact license text

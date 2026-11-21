@@ -36,9 +36,9 @@ async Task Run(string name, Func<Task> action)
 
 void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
 
-await Run("net11-runtime-and-architecture", () =>
+await Run("net11-ga-runtime-and-architecture", () =>
 {
-    Require(Environment.Version.Major == 11, "Expected runtime major 11");
+    Require(Environment.Version == new Version(11, 0, 0) && RuntimeInformation.FrameworkDescription == ".NET 11.0.0", "Expected exact stable .NET runtime 11.0.0");
     Require(RuntimeInformation.ProcessArchitecture == Architecture.X64, "Expected x64");
     return Task.CompletedTask;
 });

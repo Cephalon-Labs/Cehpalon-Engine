@@ -5,6 +5,7 @@ generates source-checkout consumers of unchanged Core, Composition and the typed
 operation-registration generator. The default portable-request-reply profile is
 an unprotected console example; small-api adds actual HTTPS/JWT HTTP and optional
 GraphQL through the existing guarded tenant boundary and explicit fixture authority.
+Current scaffolding requires exact stable SDK 11.0.100 with roll-forward and prerelease selection disabled; emitted JWT package references use 11.0.0.
 No real IdP/provider, Worker or new runtime semantics are generated. Full #20 and
 platform gates remain outstanding; #3 is not changed by this tool.
 

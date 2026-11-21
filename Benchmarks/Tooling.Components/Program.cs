@@ -211,7 +211,7 @@ static class Runner
             architecture = RuntimeInformation.ProcessArchitecture.ToString(), processorCount = System.Environment.ProcessorCount,
             processId = process.Id, affinity, process.WorkingSet64, gcServer = GCSettings.IsServerGC, gcLatencyMode = GCSettings.LatencyMode.ToString(),
             availableMemoryBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, stopwatchFrequency = Stopwatch.Frequency,
-            sdkPin = "11.0.100-rc.3.26522.148", sdkPinIsActualSdkProbe = false, reference = false, reservedResources = false,
+            sdkPin = "11.0.100", sdkPinIsActualSdkProbe = false, reference = false, reservedResources = false,
             assemblies = new[] { AssemblyInfo(typeof(Runner).Assembly), AssemblyInfo(typeof(OperationAttribute).Assembly), AssemblyInfo(typeof(OperationRegistryGenerator).Assembly), AssemblyInfo(typeof(CSharpCompilation).Assembly) } };
     }
 }
