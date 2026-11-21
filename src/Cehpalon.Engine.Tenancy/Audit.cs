@@ -562,6 +562,33 @@ public sealed class TenantChangeAuditOutboxRelayException : Exception
     public Exception? PrimaryFailure { get; }
     public Exception? ReleaseFailure { get; }
 }
+public enum TenantChangeAuditOutboxDrainStopReason { NoProgress, BatchLimit, RecordLimit }
+/// <summary>Tenant-bound acknowledgement observations; NoProgress does not assert global queue emptiness.</summary>
+public sealed class TenantChangeAuditOutboxDrainResult
+{
+    internal TenantChangeAuditOutboxDrainResult(TenantId tenant, int batches, int acknowledged, TenantChangeAuditOutboxDrainStopReason reason)
+    { Tenant = tenant; CompletedBatches = batches; AcknowledgedCount = acknowledged; StopReason = reason; }
+    public TenantId Tenant { get; }
+    public int CompletedBatches { get; }
+    public int AcknowledgedCount { get; }
+    public TenantChangeAuditOutboxDrainStopReason StopReason { get; }
+}
+public sealed class TenantChangeAuditOutboxDrainException : Exception
+{
+    internal TenantChangeAuditOutboxDrainException(TenantId tenant, int started, int completed, int acknowledged,
+        int interrupted, bool mayHaveDelivered, Exception primary)
+        : base("Bounded outbox delivery stopped; earlier delivery and acknowledgement may already have occurred.", primary)
+    { Tenant = tenant; StartedBatches = started; CompletedBatches = completed; CompletedAcknowledgedCount = acknowledged;
+      InterruptedAcknowledgedCount = interrupted; MayHaveDelivered = mayHaveDelivered; PrimaryFailure = primary; }
+    public TenantId Tenant { get; }
+    public int StartedBatches { get; }
+    public int CompletedBatches { get; }
+    public int CompletedAcknowledgedCount { get; }
+    public int InterruptedAcknowledgedCount { get; }
+    public int AcknowledgedCount => CompletedAcknowledgedCount + InterruptedAcknowledgedCount;
+    public bool MayHaveDelivered { get; }
+    public Exception PrimaryFailure { get; }
+}
 /// <summary>Explicit at-least-once relay with an optional cooperative work budget. It installs no background worker or tenant authority.</summary>
 public sealed class TenantChangeAuditOutboxRelay
 {
@@ -595,7 +622,44 @@ public sealed class TenantChangeAuditOutboxRelay
     }
     private static void Demand(TenantOperationContext context)
         => context.DemandAccess(context.Tenant, "audit-outbox", "tenant", "relay");
-    public async ValueTask<int> RelayAsync(TenantOperationContext context, int maximum = 128, CancellationToken cancellationToken = default)
+    private sealed class RelayInvocation { internal TenantChangeAuditOutboxRelayException? TerminalFailure; }
+    public ValueTask<int> RelayAsync(TenantOperationContext context, int maximum = 128, CancellationToken cancellationToken = default)
+        => RelayCoreAsync(context, maximum, cancellationToken, null);
+    /// <summary>Explicit finite sequential batches. Each batch retains its own optional cooperative budget; no retry or overall timer is added.</summary>
+    public async ValueTask<TenantChangeAuditOutboxDrainResult> DrainAsync(TenantOperationContext context,
+        int maximumBatches = 16, int maximumRecords = 2048, int maximumPerBatch = 128, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (maximumBatches < 1 || maximumBatches > 16) throw new ArgumentOutOfRangeException(nameof(maximumBatches));
+        if (maximumRecords < 1 || maximumRecords > 2048) throw new ArgumentOutOfRangeException(nameof(maximumRecords));
+        if (maximumPerBatch < 1 || maximumPerBatch > 128) throw new ArgumentOutOfRangeException(nameof(maximumPerBatch));
+        cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+        var started = 0; var completed = 0; var acknowledged = 0; var inFlight = false;
+        RelayInvocation? invocation = null;
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+                invocation = new RelayInvocation(); started++; inFlight = true;
+                var count = await RelayCoreAsync(context, Math.Min(maximumPerBatch, maximumRecords - acknowledged), cancellationToken, invocation).ConfigureAwait(false);
+                completed++; acknowledged += count; inFlight = false;
+                cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+                var reason = count == 0 ? TenantChangeAuditOutboxDrainStopReason.NoProgress
+                    : acknowledged >= maximumRecords ? TenantChangeAuditOutboxDrainStopReason.RecordLimit
+                    : completed >= maximumBatches ? TenantChangeAuditOutboxDrainStopReason.BatchLimit
+                    : (TenantChangeAuditOutboxDrainStopReason?)null;
+                if (reason is { } stop) return new(context.Tenant, completed, acknowledged, stop);
+            }
+        }
+        catch (Exception failure) when (started > 0)
+        {
+            var owned = inFlight && ReferenceEquals(failure, invocation?.TerminalFailure) ? invocation!.TerminalFailure : null;
+            throw new TenantChangeAuditOutboxDrainException(context.Tenant, started, completed, acknowledged,
+                owned?.AcknowledgedCount ?? 0, acknowledged > 0 || owned?.MayHaveDelivered == true, failure);
+        }
+    }
+    private async ValueTask<int> RelayCoreAsync(TenantOperationContext context, int maximum, CancellationToken cancellationToken, RelayInvocation? invocation)
     {
         ArgumentNullException.ThrowIfNull(context);
         if (maximum < 1 || maximum > 128) throw new ArgumentOutOfRangeException(nameof(maximum));
@@ -672,7 +736,11 @@ public sealed class TenantChangeAuditOutboxRelay
             catch (Exception completionFailure) { primary = Classify(completionFailure); }
         }
         if (primary is not null || release is not null)
-            throw new TenantChangeAuditOutboxRelayException(acknowledged, attempted, primary, release);
+        {
+            var terminal = new TenantChangeAuditOutboxRelayException(acknowledged, attempted, primary, release);
+            if (invocation is not null) invocation.TerminalFailure = terminal;
+            throw terminal;
+        }
         return acknowledged;
     }
 }
