@@ -1045,11 +1045,33 @@ public interface ITenantChangeAuditResourceHistorySource
 {
     ValueTask<TenantChangeAuditResourcePage> ReadAsync(TenantId authorizedTenant, TenantChangeAuditResourceQuery query, CancellationToken cancellationToken);
 }
+// Per configured invocation only. Provider lifetime and arbitrary callbacks remain provider-owned.
+internal sealed class TenantChangeAuditReadBudget : IDisposable
+{
+    private readonly CancellationToken caller;
+    private readonly CancellationTokenSource deadline;
+    private readonly CancellationTokenSource linked;
+    internal TenantChangeAuditReadBudget(CancellationToken caller, TimeSpan timeout)
+    {
+        this.caller = caller; deadline = new(timeout);
+        try { linked = CancellationTokenSource.CreateLinkedTokenSource(caller, deadline.Token); }
+        catch { deadline.Dispose(); throw; }
+    }
+    internal CancellationToken Token => linked.Token;
+    internal void Demand() { caller.ThrowIfCancellationRequested(); deadline.Token.ThrowIfCancellationRequested(); }
+    internal Exception Classify(OperationCanceledException failure)
+    {
+        if (caller.IsCancellationRequested) return new OperationCanceledException("The audit read caller requested cancellation.", failure, caller);
+        return deadline.IsCancellationRequested ? new TimeoutException("The cooperative audit read budget expired.", failure) : failure;
+    }
+    public void Dispose() { linked.Dispose(); deadline.Dispose(); }
+}
 /// <summary>Exact resource selection under a captured immutable read policy; receipt-key order is not chronological or snapshot order.</summary>
 public sealed class TenantChangeAuditResourceHistoryReader
 {
     private readonly ITenantChangeAuditResourceHistorySource source;
     private readonly TenantChangeAuditPolicy policy;
+    private readonly TimeSpan? readTimeout;
     public TenantChangeAuditResourceHistoryReader(ITenantChangeAuditResourceHistorySource source, TenantChangeAuditPolicy policy)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -1062,6 +1084,18 @@ public sealed class TenantChangeAuditResourceHistoryReader
         ArgumentNullException.ThrowIfNull(sourceFactory);
         return new(sourceFactory() ?? throw new ArgumentException("The trusted resource history source factory returned null."), policy);
     }
+    /// <summary>Optional cooperative budget; null preserves legacy tokens, faults and guard order.</summary>
+    public static TenantChangeAuditResourceHistoryReader? ActivateWithBudget(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditResourceHistorySource>? sourceFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        if (readTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(readTimeout));
+        ArgumentNullException.ThrowIfNull(sourceFactory);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted resource history source factory returned null."), policy, readTimeout);
+    }
+    private TenantChangeAuditResourceHistoryReader(ITenantChangeAuditResourceHistorySource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout)
+        : this(source, policy) { this.readTimeout = readTimeout; }
     private static bool Bound(TenantChangeAuditResourceCursor cursor, TenantId tenant, TenantChangeAuditResourceQuery query)
         => tenant.Equals(cursor.Tenant) && StringComparer.Ordinal.Equals(query.ResourceKind, cursor.ResourceKind) && StringComparer.Ordinal.Equals(query.ResourceId, cursor.ResourceId);
     public async ValueTask<TenantChangeAuditResourcePage> ReadAsync(TenantOperationContext context, TenantChangeAuditResourceQuery query, CancellationToken cancellationToken = default)
@@ -1070,24 +1104,36 @@ public sealed class TenantChangeAuditResourceHistoryReader
         cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
         if (query.Continuation is { } input && !Bound(input, context.Tenant, query))
             throw new ArgumentException("Continuation does not match the authorized tenant and resource selection.", nameof(query));
-        var page = await source.ReadAsync(context.Tenant, query, cancellationToken).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        if (page is null || page.Entries.Count > query.Limit) throw new InvalidOperationException("Resource history source returned an invalid page.");
-        var previous = query.Continuation?.AfterReceiptId.ToString("N");
-        foreach (var record in page.Entries)
+        using var budget = readTimeout is { } bound ? new TenantChangeAuditReadBudget(cancellationToken, bound) : null;
+        try
         {
-            var receipt = record.Receipt; var key = receipt.ReceiptId.ToString("N");
-            if (!context.Tenant.Equals(receipt.Tenant) || !StringComparer.Ordinal.Equals(query.ResourceKind, receipt.ResourceKind) ||
-                !StringComparer.Ordinal.Equals(query.ResourceId, receipt.ResourceId) || previous is not null && StringComparer.Ordinal.Compare(key, previous) <= 0)
-                throw new InvalidOperationException("Resource history source returned an invalid identity or receipt order.");
-            previous = key;
+            budget?.Demand();
+            var page = await source.ReadAsync(context.Tenant, query, budget?.Token ?? cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested(); budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+            if (page is null || page.Entries.Count > query.Limit) throw new InvalidOperationException("Resource history source returned an invalid page.");
+            var previous = query.Continuation?.AfterReceiptId.ToString("N");
+            foreach (var record in page.Entries)
+            {
+                var receipt = record.Receipt; var key = receipt.ReceiptId.ToString("N");
+                if (!context.Tenant.Equals(receipt.Tenant) || !StringComparer.Ordinal.Equals(query.ResourceKind, receipt.ResourceKind) ||
+                    !StringComparer.Ordinal.Equals(query.ResourceId, receipt.ResourceId) || previous is not null && StringComparer.Ordinal.Compare(key, previous) <= 0)
+                    throw new InvalidOperationException("Resource history source returned an invalid identity or receipt order.");
+                previous = key;
+            }
+            if (page.NextCursor is { } next && (page.Entries.Count == 0 || !Bound(next, context.Tenant, query) ||
+                next.AfterReceiptId == Guid.Empty || next.AfterReceiptId != page.Entries[^1].Receipt.ReceiptId))
+                throw new InvalidOperationException("Resource history source returned an invalid continuation.");
+            var projected = new TenantChangeAuditResourcePage(page.Entries.Select(policy.Project), page.NextCursor);
+            cancellationToken.ThrowIfCancellationRequested(); budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+            budget?.Demand();
+            return projected;
         }
-        if (page.NextCursor is { } next && (page.Entries.Count == 0 || !Bound(next, context.Tenant, query) ||
-            next.AfterReceiptId == Guid.Empty || next.AfterReceiptId != page.Entries[^1].Receipt.ReceiptId))
-            throw new InvalidOperationException("Resource history source returned an invalid continuation.");
-        var projected = new TenantChangeAuditResourcePage(page.Entries.Select(policy.Project), page.NextCursor);
-        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        return projected;
+        catch (OperationCanceledException failure) when (budget is not null)
+        {
+            var classified = budget.Classify(failure);
+            if (ReferenceEquals(classified, failure)) throw;
+            throw classified;
+        }
     }
 }
 /// <summary>Exact tenant/receipt lookup under a captured immutable read policy. Null is only the provider's absence observation.</summary>
@@ -1095,6 +1141,7 @@ public sealed class TenantChangeAuditLookupReader
 {
     private readonly ITenantChangeAuditLookupSource source;
     private readonly TenantChangeAuditPolicy policy;
+    private readonly TimeSpan? readTimeout;
     public TenantChangeAuditLookupReader(ITenantChangeAuditLookupSource source, TenantChangeAuditPolicy policy)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -1107,24 +1154,49 @@ public sealed class TenantChangeAuditLookupReader
         ArgumentNullException.ThrowIfNull(sourceFactory);
         return new(sourceFactory() ?? throw new ArgumentException("The trusted trail lookup source factory returned null."), policy);
     }
+    /// <summary>Optional cooperative budget; null preserves legacy tokens, faults and guard order.</summary>
+    public static TenantChangeAuditLookupReader? ActivateWithBudget(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditLookupSource>? sourceFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        if (readTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(readTimeout));
+        ArgumentNullException.ThrowIfNull(sourceFactory);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail lookup source factory returned null."), policy, readTimeout);
+    }
+    private TenantChangeAuditLookupReader(ITenantChangeAuditLookupSource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout)
+        : this(source, policy) { this.readTimeout = readTimeout; }
     public async ValueTask<TenantChangeAuditRecord?> FindAsync(TenantOperationContext context, Guid receiptId, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
         if (receiptId == Guid.Empty) throw new ArgumentException("Receipt ID cannot be empty.", nameof(receiptId));
         cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        var record = await source.FindAsync(context.Tenant, receiptId, cancellationToken).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        if (record is not null && (!context.Tenant.Equals(record.Receipt.Tenant) || record.Receipt.ReceiptId != receiptId))
-            throw new InvalidOperationException("Trail lookup source returned a different tenant or receipt.");
-        var projected = record is null ? null : policy.Project(record);
-        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        return projected;
+        using var budget = readTimeout is { } bound ? new TenantChangeAuditReadBudget(cancellationToken, bound) : null;
+        try
+        {
+            budget?.Demand();
+            var record = await source.FindAsync(context.Tenant, receiptId, budget?.Token ?? cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested(); budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+            if (record is not null && (!context.Tenant.Equals(record.Receipt.Tenant) || record.Receipt.ReceiptId != receiptId))
+                throw new InvalidOperationException("Trail lookup source returned a different tenant or receipt.");
+            var projected = record is null ? null : policy.Project(record);
+            cancellationToken.ThrowIfCancellationRequested(); budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+            budget?.Demand();
+            return projected;
+        }
+        catch (OperationCanceledException failure) when (budget is not null)
+        {
+            var classified = budget.Classify(failure);
+            if (ReferenceEquals(classified, failure)) throw;
+            throw classified;
+        }
     }
 }
 public sealed class TenantChangeAuditHistoryReader
 {
     private readonly ITenantChangeAuditHistorySource source;
     private readonly TenantChangeAuditPolicy policy;
+    private readonly TimeSpan? readTimeout;
     public TenantChangeAuditHistoryReader(ITenantChangeAuditHistorySource source, TenantChangeAuditPolicy policy)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -1137,17 +1209,41 @@ public sealed class TenantChangeAuditHistoryReader
         ArgumentNullException.ThrowIfNull(sourceFactory);
         return new(sourceFactory() ?? throw new ArgumentException("The trusted trail source factory returned null."), policy);
     }
+    /// <summary>Optional cooperative budget; null preserves legacy tokens, faults and guard order.</summary>
+    public static TenantChangeAuditHistoryReader? ActivateWithBudget(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditHistorySource>? sourceFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        if (readTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(readTimeout));
+        ArgumentNullException.ThrowIfNull(sourceFactory);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail source factory returned null."), policy, readTimeout);
+    }
+    private TenantChangeAuditHistoryReader(ITenantChangeAuditHistorySource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout)
+        : this(source, policy) { this.readTimeout = readTimeout; }
     public async ValueTask<TenantChangeAuditPage> ReadAsync(TenantOperationContext context, int limit = 50, string? cursor = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context); ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1); ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, 200);
         if (cursor is not null) Values.Opaque(cursor, 512, nameof(cursor));
         context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read"); cancellationToken.ThrowIfCancellationRequested();
-        var page = await source.ReadAsync(context.Tenant, limit, cursor, cancellationToken).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        if (page is null || page.Entries.Count > limit || page.Entries.Any(x => !context.Tenant.Equals(x.Receipt.Tenant)))
-            throw new InvalidOperationException("Trail source returned an invalid tenant page.");
-        var projected = new TenantChangeAuditPage(page.Entries.Select(policy.Project), page.NextCursor);
-        context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
-        return projected;
+        using var budget = readTimeout is { } bound ? new TenantChangeAuditReadBudget(cancellationToken, bound) : null;
+        try
+        {
+            budget?.Demand();
+            var page = await source.ReadAsync(context.Tenant, limit, cursor, budget?.Token ?? cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested(); budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+            if (page is null || page.Entries.Count > limit || page.Entries.Any(x => !context.Tenant.Equals(x.Receipt.Tenant)))
+                throw new InvalidOperationException("Trail source returned an invalid tenant page.");
+            var projected = new TenantChangeAuditPage(page.Entries.Select(policy.Project), page.NextCursor);
+            budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+            budget?.Demand();
+            return projected;
+        }
+        catch (OperationCanceledException failure) when (budget is not null)
+        {
+            var classified = budget.Classify(failure);
+            if (ReferenceEquals(classified, failure)) throw;
+            throw classified;
+        }
     }
 }

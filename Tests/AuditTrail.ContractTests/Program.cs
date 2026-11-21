@@ -99,6 +99,7 @@ await Check("record field change metadata and captured-mode provenance cannot co
 
 await LookupChecks.Run(Check);
 await ResourceHistoryChecks.Run(Check);
+await ReadBudgetChecks.Run(Check);
 await File.WriteAllTextAsync(output,JsonSerializer.Serialize(new{passed,failed,checks,scope="Bounded explicit provider-reported change audit/trail fixture; no database CDC, durable outbox, IdP/provider or benchmark qualification"},new JsonSerializerOptions{WriteIndented=true}));
 Console.WriteLine($"Audit trail contracts: {passed}/{passed+failed}");return failed==0?0:1;
 
