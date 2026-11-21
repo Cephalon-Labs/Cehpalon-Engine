@@ -623,28 +623,52 @@ public sealed class TenantChangeAuditOutboxRelay
     private static void Demand(TenantOperationContext context)
         => context.DemandAccess(context.Tenant, "audit-outbox", "tenant", "relay");
     private sealed class RelayInvocation { internal TenantChangeAuditOutboxRelayException? TerminalFailure; }
+    private sealed class DrainCancellation(CancellationToken caller, CancellationToken total)
+    {
+        internal CancellationToken Caller { get; } = caller;
+        internal CancellationToken Total { get; } = total;
+        internal void Demand()
+        {
+            Caller.ThrowIfCancellationRequested();
+            if (Total.IsCancellationRequested)
+                throw new TimeoutException("The cooperative outbox drain budget expired.", new OperationCanceledException(Total));
+        }
+    }
     public ValueTask<int> RelayAsync(TenantOperationContext context, int maximum = 128, CancellationToken cancellationToken = default)
-        => RelayCoreAsync(context, maximum, cancellationToken, null);
+        => RelayCoreAsync(context, maximum, cancellationToken, null, null);
     /// <summary>Explicit finite sequential batches. Each batch retains its own optional cooperative budget; no retry or overall timer is added.</summary>
-    public async ValueTask<TenantChangeAuditOutboxDrainResult> DrainAsync(TenantOperationContext context,
+    public ValueTask<TenantChangeAuditOutboxDrainResult> DrainAsync(TenantOperationContext context,
         int maximumBatches = 16, int maximumRecords = 2048, int maximumPerBatch = 128, CancellationToken cancellationToken = default)
+        => DrainCoreAsync(context, null, maximumBatches, maximumRecords, maximumPerBatch, cancellationToken);
+    /// <summary>One optional cooperative budget spans all batches and cleanup. Uncooperative work remains awaited; this is not a hard deadline.</summary>
+    public ValueTask<TenantChangeAuditOutboxDrainResult> DrainWithBudgetAsync(TenantOperationContext context, TimeSpan? drainTimeout,
+        int maximumBatches = 16, int maximumRecords = 2048, int maximumPerBatch = 128, CancellationToken cancellationToken = default)
+        => DrainCoreAsync(context, drainTimeout, maximumBatches, maximumRecords, maximumPerBatch, cancellationToken);
+    private async ValueTask<TenantChangeAuditOutboxDrainResult> DrainCoreAsync(TenantOperationContext context, TimeSpan? drainTimeout,
+        int maximumBatches, int maximumRecords, int maximumPerBatch, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
         if (maximumBatches < 1 || maximumBatches > 16) throw new ArgumentOutOfRangeException(nameof(maximumBatches));
         if (maximumRecords < 1 || maximumRecords > 2048) throw new ArgumentOutOfRangeException(nameof(maximumRecords));
         if (maximumPerBatch < 1 || maximumPerBatch > 128) throw new ArgumentOutOfRangeException(nameof(maximumPerBatch));
+        if (drainTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(drainTimeout));
         cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+        using var total = drainTimeout is { } bound ? new CancellationTokenSource(bound) : null;
+        using var linked = total is not null ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, total.Token) : null;
+        var cancellation = total is not null ? new DrainCancellation(cancellationToken, total.Token) : null;
+        var workToken = linked?.Token ?? cancellationToken;
+        void DemandDrain() { if (cancellation is null) cancellationToken.ThrowIfCancellationRequested(); else cancellation.Demand(); Demand(context); }
         var started = 0; var completed = 0; var acknowledged = 0; var inFlight = false;
         RelayInvocation? invocation = null;
         try
         {
             while (true)
             {
-                cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+                DemandDrain();
                 invocation = new RelayInvocation(); started++; inFlight = true;
-                var count = await RelayCoreAsync(context, Math.Min(maximumPerBatch, maximumRecords - acknowledged), cancellationToken, invocation).ConfigureAwait(false);
+                var count = await RelayCoreAsync(context, Math.Min(maximumPerBatch, maximumRecords - acknowledged), workToken, invocation, cancellation).ConfigureAwait(false);
                 completed++; acknowledged += count; inFlight = false;
-                cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+                DemandDrain();
                 var reason = count == 0 ? TenantChangeAuditOutboxDrainStopReason.NoProgress
                     : acknowledged >= maximumRecords ? TenantChangeAuditOutboxDrainStopReason.RecordLimit
                     : completed >= maximumBatches ? TenantChangeAuditOutboxDrainStopReason.BatchLimit
@@ -659,26 +683,35 @@ public sealed class TenantChangeAuditOutboxRelay
                 owned?.AcknowledgedCount ?? 0, acknowledged > 0 || owned?.MayHaveDelivered == true, failure);
         }
     }
-    private async ValueTask<int> RelayCoreAsync(TenantOperationContext context, int maximum, CancellationToken cancellationToken, RelayInvocation? invocation)
+    private async ValueTask<int> RelayCoreAsync(TenantOperationContext context, int maximum, CancellationToken cancellationToken,
+        RelayInvocation? invocation, DrainCancellation? cancellation)
     {
         ArgumentNullException.ThrowIfNull(context);
         if (maximum < 1 || maximum > 128) throw new ArgumentOutOfRangeException(nameof(maximum));
-        cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+        if (cancellation is null) cancellationToken.ThrowIfCancellationRequested(); else cancellation.Demand();
+        Demand(context);
         var startedUtc = clock.GetUtcNow(); var started = clock.GetTimestamp();
         using var budget = relayTimeout is { } timeout ? new CancellationTokenSource(timeout) : null;
         using var linked = budget is not null ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, budget.Token) : null;
         var workToken = linked?.Token ?? cancellationToken;
-        void DemandWork() { cancellationToken.ThrowIfCancellationRequested(); budget?.Token.ThrowIfCancellationRequested(); }
+        void DemandWork()
+        {
+            if (cancellation is null) cancellationToken.ThrowIfCancellationRequested(); else cancellation.Demand();
+            budget?.Token.ThrowIfCancellationRequested();
+        }
         Exception Classify(Exception failure)
         {
-            if (budget is null || failure is not OperationCanceledException) return failure;
-            if (cancellationToken.IsCancellationRequested)
-                return new OperationCanceledException("The relay caller requested cancellation.", failure, cancellationToken);
-            return budget.IsCancellationRequested ? new TimeoutException("The cooperative outbox relay budget expired.", failure) : failure;
+            if (budget is null && cancellation is null || failure is not OperationCanceledException) return failure;
+            var caller = cancellation?.Caller ?? cancellationToken;
+            if (caller.IsCancellationRequested)
+                return new OperationCanceledException("The relay caller requested cancellation.", failure, caller);
+            if (cancellation?.Total.IsCancellationRequested == true)
+                return new TimeoutException("The cooperative outbox drain budget expired.", failure);
+            return budget?.IsCancellationRequested == true ? new TimeoutException("The cooperative outbox relay budget expired.", failure) : failure;
         }
         TenantChangeAuditOutboxLease? lease;
         try { lease = await source.ClaimAsync(context.Tenant, maximum, leaseDuration, workToken).ConfigureAwait(false); }
-        catch (OperationCanceledException failure) when (budget is not null)
+        catch (OperationCanceledException failure) when (budget is not null || cancellation is not null)
         {
             var classified = Classify(failure);
             if (ReferenceEquals(classified, failure)) throw;
@@ -688,7 +721,7 @@ public sealed class TenantChangeAuditOutboxRelay
         if (lease is null)
         {
             try { DemandWork(); Demand(context); return 0; }
-            catch (OperationCanceledException failure) when (budget is not null) { throw Classify(failure); }
+            catch (OperationCanceledException failure) when (budget is not null || cancellation is not null) { throw Classify(failure); }
         }
         var acknowledged = 0; var attempted = false; var invalid = false;
         Exception? primary = null, release = null;

@@ -120,6 +120,7 @@ await Check("empty provider claim rechecks scope without activating sink",async(
 
 await RelayBudgetChecks.Run(Check);
 await BoundedDrainChecks.Run(Check);
+await TotalDrainBudgetChecks.Run(Check);
 Directory.CreateDirectory(Path.GetDirectoryName(output)!);await File.WriteAllTextAsync(output,JsonSerializer.Serialize(new{passed,failed,checks,scope="Portable trusted-provider transaction/outbox lifecycle and explicit checked at-least-once relay contracts; no durable provider, physical crash, backend exactly-once or production qualification."},new JsonSerializerOptions{WriteIndented=true}));Console.WriteLine($"Audit outbox contracts: {passed}/{passed+failed}");return failed==0?0:1;
 
 interface IBusinessSession{void Mutate();}
