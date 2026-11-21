@@ -12,6 +12,7 @@ on:
       - Tests/AuditPreparation.ContractTests/**
       - Tests/AuditExecution.ContractTests/**
       - Tests/AuditOutbox.ContractTests/**
+      - Tests/OutboxStatus.ContractTests/**
       - Tests/AuditTrail.ContractTests/**
       - Tests/Session.ContractTests/**
       - Tests/KeyRing.ContractTests/**

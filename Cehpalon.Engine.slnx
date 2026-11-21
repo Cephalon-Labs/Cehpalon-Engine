@@ -17,6 +17,7 @@
     <Project Path="Tests/AuditPreparation.ContractTests/AuditPreparation.ContractTests.csproj" />
     <Project Path="Tests/AuditExecution.ContractTests/AuditExecution.ContractTests.csproj" />
     <Project Path="Tests/AuditOutbox.ContractTests/AuditOutbox.ContractTests.csproj" />
+    <Project Path="Tests/OutboxStatus.ContractTests/OutboxStatus.ContractTests.csproj" />
     <Project Path="Tests/AuditTrail.ContractTests/AuditTrail.ContractTests.csproj" />
     <Project Path="Tests/Session.ContractTests/Session.ContractTests.csproj" />
     <Project Path="Tests/KeyRing.ContractTests/KeyRing.ContractTests.csproj" />
