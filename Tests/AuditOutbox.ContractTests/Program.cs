@@ -118,6 +118,7 @@ foreach(var cancel in new[]{false,true})await Check("successful claim cleanup ca
 await Check("empty provider claim rechecks scope without activating sink",async()=>
 {var f=new Fixture();var source=new RelaySource(f.Clock,[]);var sink=new IdempotentSink();await f.Run(async c=>{Require(await Relay(f,source,sink).RelayAsync(c)==0);},"outbox.relay");Require(source.Claims==1&&source.Releases==0&&sink.Calls==0);});
 
+await RelayBudgetChecks.Run(Check);
 Directory.CreateDirectory(Path.GetDirectoryName(output)!);await File.WriteAllTextAsync(output,JsonSerializer.Serialize(new{passed,failed,checks,scope="Portable trusted-provider transaction/outbox lifecycle and explicit checked at-least-once relay contracts; no durable provider, physical crash, backend exactly-once or production qualification."},new JsonSerializerOptions{WriteIndented=true}));Console.WriteLine($"Audit outbox contracts: {passed}/{passed+failed}");return failed==0?0:1;
 
 interface IBusinessSession{void Mutate();}

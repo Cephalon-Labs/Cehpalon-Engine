@@ -562,25 +562,36 @@ public sealed class TenantChangeAuditOutboxRelayException : Exception
     public Exception? PrimaryFailure { get; }
     public Exception? ReleaseFailure { get; }
 }
-/// <summary>Explicit bounded at-least-once relay. It installs no timer, background worker or tenant authority.</summary>
+/// <summary>Explicit at-least-once relay with an optional cooperative work budget. It installs no background worker or tenant authority.</summary>
 public sealed class TenantChangeAuditOutboxRelay
 {
     private readonly ITenantChangeAuditOutboxSource source;
     private readonly ITenantChangeAuditIdempotentSink sink;
     private readonly TimeSpan leaseDuration;
     private readonly TimeProvider clock;
+    private readonly TimeSpan? relayTimeout;
     private TenantChangeAuditOutboxRelay(ITenantChangeAuditOutboxSource source, ITenantChangeAuditIdempotentSink sink,
-        TimeSpan leaseDuration, TimeProvider clock)
-    { this.source = source; this.sink = sink; this.leaseDuration = leaseDuration; this.clock = clock; }
+        TimeSpan leaseDuration, TimeProvider clock, TimeSpan? relayTimeout)
+    { this.source = source; this.sink = sink; this.leaseDuration = leaseDuration; this.clock = clock; this.relayTimeout = relayTimeout; }
     public static TenantChangeAuditOutboxRelay? Activate(bool enabled,
         Func<ITenantChangeAuditOutboxSource>? sourceFactory = null, Func<ITenantChangeAuditIdempotentSink>? sinkFactory = null,
         TimeSpan? leaseDuration = null, TimeProvider? timeProvider = null)
+        => ActivateCore(enabled, null, sourceFactory, sinkFactory, leaseDuration, timeProvider);
+    /// <summary>Requests cancellation after the configured budget; uncooperative work is still awaited. Null retains legacy tokens and faults.</summary>
+    public static TenantChangeAuditOutboxRelay? ActivateWithBudget(bool enabled, TimeSpan? relayTimeout,
+        Func<ITenantChangeAuditOutboxSource>? sourceFactory = null, Func<ITenantChangeAuditIdempotentSink>? sinkFactory = null,
+        TimeSpan? leaseDuration = null, TimeProvider? timeProvider = null)
+        => ActivateCore(enabled, relayTimeout, sourceFactory, sinkFactory, leaseDuration, timeProvider);
+    private static TenantChangeAuditOutboxRelay? ActivateCore(bool enabled, TimeSpan? relayTimeout,
+        Func<ITenantChangeAuditOutboxSource>? sourceFactory, Func<ITenantChangeAuditIdempotentSink>? sinkFactory,
+        TimeSpan? leaseDuration, TimeProvider? timeProvider)
     {
         if (!enabled) return null;
         ArgumentNullException.ThrowIfNull(sourceFactory); ArgumentNullException.ThrowIfNull(sinkFactory);
+        if (relayTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(relayTimeout));
         var bound = TenantChangeAuditOutboxExecutor<object>.RequireBound(leaseDuration ?? TimeSpan.FromSeconds(15), nameof(leaseDuration));
         return new(sourceFactory() ?? throw new ArgumentException("The outbox source factory returned null."),
-            sinkFactory() ?? throw new ArgumentException("The idempotent sink factory returned null."), bound, timeProvider ?? TimeProvider.System);
+            sinkFactory() ?? throw new ArgumentException("The idempotent sink factory returned null."), bound, timeProvider ?? TimeProvider.System, relayTimeout);
     }
     private static void Demand(TenantOperationContext context)
         => context.DemandAccess(context.Tenant, "audit-outbox", "tenant", "relay");
@@ -590,8 +601,31 @@ public sealed class TenantChangeAuditOutboxRelay
         if (maximum < 1 || maximum > 128) throw new ArgumentOutOfRangeException(nameof(maximum));
         cancellationToken.ThrowIfCancellationRequested(); Demand(context);
         var startedUtc = clock.GetUtcNow(); var started = clock.GetTimestamp();
-        var lease = await source.ClaimAsync(context.Tenant, maximum, leaseDuration, cancellationToken).ConfigureAwait(false);
-        if (lease is null) { cancellationToken.ThrowIfCancellationRequested(); Demand(context); return 0; }
+        using var budget = relayTimeout is { } timeout ? new CancellationTokenSource(timeout) : null;
+        using var linked = budget is not null ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, budget.Token) : null;
+        var workToken = linked?.Token ?? cancellationToken;
+        void DemandWork() { cancellationToken.ThrowIfCancellationRequested(); budget?.Token.ThrowIfCancellationRequested(); }
+        Exception Classify(Exception failure)
+        {
+            if (budget is null || failure is not OperationCanceledException) return failure;
+            if (cancellationToken.IsCancellationRequested)
+                return new OperationCanceledException("The relay caller requested cancellation.", failure, cancellationToken);
+            return budget.IsCancellationRequested ? new TimeoutException("The cooperative outbox relay budget expired.", failure) : failure;
+        }
+        TenantChangeAuditOutboxLease? lease;
+        try { lease = await source.ClaimAsync(context.Tenant, maximum, leaseDuration, workToken).ConfigureAwait(false); }
+        catch (OperationCanceledException failure) when (budget is not null)
+        {
+            var classified = Classify(failure);
+            if (ReferenceEquals(classified, failure)) throw;
+            throw classified;
+        }
+        // A returned handle is owned before any post-await budget/authority rejection.
+        if (lease is null)
+        {
+            try { DemandWork(); Demand(context); return 0; }
+            catch (OperationCanceledException failure) when (budget is not null) { throw Classify(failure); }
+        }
         var acknowledged = 0; var attempted = false; var invalid = false;
         Exception? primary = null, release = null;
         void DemandLease()
@@ -608,20 +642,20 @@ public sealed class TenantChangeAuditOutboxRelay
         }
         try
         {
-            cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+            DemandWork(); Demand(context); DemandLease();
             foreach (var record in lease.Records)
             {
-                cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+                DemandWork(); Demand(context); DemandLease();
                 attempted = true;
-                await sink.AppendOnceAsync(record, cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
-                if (!await source.AcknowledgeAsync(lease, record.Receipt.ReceiptId, cancellationToken).ConfigureAwait(false))
+                await sink.AppendOnceAsync(record, workToken).ConfigureAwait(false);
+                DemandWork(); Demand(context); DemandLease();
+                if (!await source.AcknowledgeAsync(lease, record.Receipt.ReceiptId, workToken).ConfigureAwait(false))
                     throw new InvalidOperationException("The provider rejected the fenced outbox acknowledgement.");
                 acknowledged++;
-                cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease();
+                DemandWork(); Demand(context); DemandLease();
             }
         }
-        catch (Exception failure) { primary = failure; }
+        catch (Exception failure) { primary = Classify(failure); }
         finally
         {
             try
@@ -634,8 +668,8 @@ public sealed class TenantChangeAuditOutboxRelay
         }
         if (primary is null && release is null)
         {
-            try { cancellationToken.ThrowIfCancellationRequested(); Demand(context); DemandLease(); }
-            catch (Exception completionFailure) { primary = completionFailure; }
+            try { DemandWork(); Demand(context); DemandLease(); }
+            catch (Exception completionFailure) { primary = Classify(completionFailure); }
         }
         if (primary is not null || release is not null)
             throw new TenantChangeAuditOutboxRelayException(acknowledged, attempted, primary, release);
