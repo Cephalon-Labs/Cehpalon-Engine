@@ -97,6 +97,7 @@ await Check("history rejects more rows than requested and pre-cancelled lookup d
 await Check("record field change metadata and captured-mode provenance cannot contradict clear values",()=>
 {Throws<ArgumentException>(()=>new TenantChangeField("title",TenantChangeValue.Text("a"),TenantChangeValue.Text("b"),false));Throws<ArgumentException>(()=>new TenantChangeAuditRecord(Fixture.UncheckedReceipt(),DateTimeOffset.UtcNow,TenantChangeAuditMode.BeforeAfterSnapshots,[],TenantChangeAuditMode.MetadataOnly));return Task.CompletedTask;});
 
+await LookupChecks.Run(Check);
 await File.WriteAllTextAsync(output,JsonSerializer.Serialize(new{passed,failed,checks,scope="Bounded explicit provider-reported change audit/trail fixture; no database CDC, durable outbox, IdP/provider or benchmark qualification"},new JsonSerializerOptions{WriteIndented=true}));
 Console.WriteLine($"Audit trail contracts: {passed}/{passed+failed}");return failed==0?0:1;
 

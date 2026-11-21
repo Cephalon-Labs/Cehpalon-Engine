@@ -998,6 +998,41 @@ public interface ITenantChangeAuditHistorySource
 {
     ValueTask<TenantChangeAuditPage> ReadAsync(TenantId authorizedTenant, int limit, string? cursor, CancellationToken cancellationToken);
 }
+public interface ITenantChangeAuditLookupSource
+{
+    ValueTask<TenantChangeAuditRecord?> FindAsync(TenantId authorizedTenant, Guid receiptId, CancellationToken cancellationToken);
+}
+/// <summary>Exact tenant/receipt lookup under a captured immutable read policy. Null is only the provider's absence observation.</summary>
+public sealed class TenantChangeAuditLookupReader
+{
+    private readonly ITenantChangeAuditLookupSource source;
+    private readonly TenantChangeAuditPolicy policy;
+    public TenantChangeAuditLookupReader(ITenantChangeAuditLookupSource source, TenantChangeAuditPolicy policy)
+    {
+        this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        if (policy.Mode == TenantChangeAuditMode.Disabled) throw new ArgumentException("A disabled trail lookup reader must not be activated.", nameof(policy));
+    }
+    public static TenantChangeAuditLookupReader? Activate(TenantChangeAuditPolicy policy, Func<ITenantChangeAuditLookupSource>? sourceFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        ArgumentNullException.ThrowIfNull(sourceFactory);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail lookup source factory returned null."), policy);
+    }
+    public async ValueTask<TenantChangeAuditRecord?> FindAsync(TenantOperationContext context, Guid receiptId, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (receiptId == Guid.Empty) throw new ArgumentException("Receipt ID cannot be empty.", nameof(receiptId));
+        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+        var record = await source.FindAsync(context.Tenant, receiptId, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+        if (record is not null && (!context.Tenant.Equals(record.Receipt.Tenant) || record.Receipt.ReceiptId != receiptId))
+            throw new InvalidOperationException("Trail lookup source returned a different tenant or receipt.");
+        var projected = record is null ? null : policy.Project(record);
+        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+        return projected;
+    }
+}
 public sealed class TenantChangeAuditHistoryReader
 {
     private readonly ITenantChangeAuditHistorySource source;
