@@ -468,6 +468,78 @@ public sealed class TenantChangeAuditOutboxLease
     public DateTimeOffset ExpiresAtUtc { get; }
     public IReadOnlyList<TenantChangeAuditRecord> Records { get; }
 }
+/// <summary>Provider-reported aggregate facts. Construction supplies neither tenant authority nor client freshness.</summary>
+public sealed class TenantChangeAuditOutboxStatus
+{
+    public TenantChangeAuditOutboxStatus(TenantId tenant, DateTimeOffset observedAtUtc, long pending,
+        long available, long claimed, long expiredClaims, long delivered, DateTimeOffset? oldestPendingAtUtc = null)
+    {
+        Tenant = tenant ?? throw new ArgumentNullException(nameof(tenant));
+        if (pending < 0 || available < 0 || claimed < 0 || expiredClaims < 0 || delivered < 0 ||
+            available > pending || claimed != pending - available || expiredClaims > available)
+            throw new ArgumentException("Outbox counts must be nonnegative and form a coherent pending partition.");
+        ObservedAtUtc = observedAtUtc.ToUniversalTime();
+        OldestPendingAtUtc = oldestPendingAtUtc?.ToUniversalTime();
+        if ((pending == 0) != (OldestPendingAtUtc is null) || OldestPendingAtUtc > ObservedAtUtc)
+            throw new ArgumentException("Pending records require an oldest timestamp no later than the provider observation.", nameof(oldestPendingAtUtc));
+        Pending = pending; Available = available; Claimed = claimed; ExpiredClaims = expiredClaims; Delivered = delivered;
+    }
+    public TenantId Tenant { get; }
+    public DateTimeOffset ObservedAtUtc { get; }
+    public long Pending { get; }
+    public long Available { get; }
+    public long Claimed { get; }
+    public long ExpiredClaims { get; }
+    public long Delivered { get; }
+    public DateTimeOffset? OldestPendingAtUtc { get; }
+}
+public interface ITenantChangeAuditOutboxStatusSource
+{
+    ValueTask<TenantChangeAuditOutboxStatus> ReadAsync(TenantId tenant, CancellationToken cancellationToken);
+}
+/// <summary>Optional fresh checked aggregate observation; no payloads, caching, listener or background work.</summary>
+public sealed class TenantChangeAuditOutboxStatusReader
+{
+    private readonly ITenantChangeAuditOutboxStatusSource source;
+    private readonly TimeSpan timeout;
+    private TenantChangeAuditOutboxStatusReader(ITenantChangeAuditOutboxStatusSource source, TimeSpan timeout)
+        => (this.source, this.timeout) = (source, timeout);
+    public static TenantChangeAuditOutboxStatusReader? Activate(bool enabled,
+        Func<ITenantChangeAuditOutboxStatusSource>? sourceFactory = null, TimeSpan? readTimeout = null)
+    {
+        if (!enabled) return null;
+        ArgumentNullException.ThrowIfNull(sourceFactory);
+        var bound = readTimeout ?? TimeSpan.FromSeconds(5);
+        if (bound <= TimeSpan.Zero || bound > TimeSpan.FromMinutes(1)) throw new ArgumentOutOfRangeException(nameof(readTimeout));
+        return new(sourceFactory() ?? throw new ArgumentException("The outbox status source factory returned null."), bound);
+    }
+    private static void Demand(TenantOperationContext context)
+        => context.DemandAccess(context.Tenant, "audit-outbox", "tenant", "inspect");
+    public async ValueTask<TenantChangeAuditOutboxStatus> ReadAsync(TenantOperationContext context,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        cancellationToken.ThrowIfCancellationRequested(); Demand(context);
+        using var deadline = new CancellationTokenSource(timeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        TenantChangeAuditOutboxStatus status;
+        try { status = await source.ReadAsync(context.Tenant, linked.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        { cancellationToken.ThrowIfCancellationRequested(); throw; }
+        catch (OperationCanceledException failure) when (deadline.IsCancellationRequested)
+        { throw new TimeoutException("The outbox status read exceeded its cooperative budget.", failure); }
+        void DemandBudget()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (deadline.IsCancellationRequested) throw new TimeoutException("The outbox status read exceeded its cooperative budget.");
+        }
+        DemandBudget(); Demand(context);
+        if (status is null) throw new InvalidOperationException("The outbox status source returned no observation.");
+        if (!status.Tenant.Equals(context.Tenant)) throw new TenantAccessDeniedException();
+        Demand(context); DemandBudget();
+        return status;
+    }
+}
 public interface ITenantChangeAuditOutboxSource
 {
     ValueTask<TenantChangeAuditOutboxLease?> ClaimAsync(TenantId tenant, int maximum, TimeSpan leaseDuration, CancellationToken cancellationToken);
