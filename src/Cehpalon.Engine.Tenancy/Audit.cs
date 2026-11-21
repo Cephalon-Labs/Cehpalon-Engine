@@ -1002,6 +1002,94 @@ public interface ITenantChangeAuditLookupSource
 {
     ValueTask<TenantChangeAuditRecord?> FindAsync(TenantId authorizedTenant, Guid receiptId, CancellationToken cancellationToken);
 }
+/// <summary>Untrusted selection metadata in ascending lowercase Guid-N ordinal order; not authority or a snapshot.</summary>
+public sealed class TenantChangeAuditResourceCursor
+{
+    public TenantChangeAuditResourceCursor(TenantId tenant, string resourceKind, string resourceId, Guid afterReceiptId)
+    {
+        Tenant = tenant ?? throw new ArgumentNullException(nameof(tenant));
+        ResourceKind = Cehpalon.Engine.Core.OperationId.RequireValid(resourceKind); ResourceId = Values.Opaque(resourceId, 512, nameof(resourceId));
+        if (afterReceiptId == Guid.Empty) throw new ArgumentException("Cursor receipt cannot be empty.", nameof(afterReceiptId));
+        AfterReceiptId = afterReceiptId;
+    }
+    public TenantId Tenant { get; }
+    public string ResourceKind { get; }
+    public string ResourceId { get; }
+    public Guid AfterReceiptId { get; }
+}
+public sealed class TenantChangeAuditResourceQuery
+{
+    public TenantChangeAuditResourceQuery(string resourceKind, string resourceId, int limit = 50, TenantChangeAuditResourceCursor? continuation = null)
+    {
+        ResourceKind = Cehpalon.Engine.Core.OperationId.RequireValid(resourceKind); ResourceId = Values.Opaque(resourceId, 512, nameof(resourceId));
+        if (limit < 1 || limit > 200) throw new ArgumentOutOfRangeException(nameof(limit));
+        Limit = limit; Continuation = continuation;
+    }
+    public string ResourceKind { get; }
+    public string ResourceId { get; }
+    public int Limit { get; }
+    public TenantChangeAuditResourceCursor? Continuation { get; }
+}
+public sealed class TenantChangeAuditResourcePage
+{
+    public TenantChangeAuditResourcePage(IEnumerable<TenantChangeAuditRecord> entries, TenantChangeAuditResourceCursor? nextCursor = null)
+    {
+        ArgumentNullException.ThrowIfNull(entries); var copy = entries.Take(201).ToArray();
+        if (copy.Length > 200 || copy.Any(x => x is null)) throw new ArgumentException("Resource history pages contain at most200 non-null records.", nameof(entries));
+        Entries = Array.AsReadOnly(copy); NextCursor = nextCursor;
+    }
+    public IReadOnlyList<TenantChangeAuditRecord> Entries { get; }
+    public TenantChangeAuditResourceCursor? NextCursor { get; }
+}
+public interface ITenantChangeAuditResourceHistorySource
+{
+    ValueTask<TenantChangeAuditResourcePage> ReadAsync(TenantId authorizedTenant, TenantChangeAuditResourceQuery query, CancellationToken cancellationToken);
+}
+/// <summary>Exact resource selection under a captured immutable read policy; receipt-key order is not chronological or snapshot order.</summary>
+public sealed class TenantChangeAuditResourceHistoryReader
+{
+    private readonly ITenantChangeAuditResourceHistorySource source;
+    private readonly TenantChangeAuditPolicy policy;
+    public TenantChangeAuditResourceHistoryReader(ITenantChangeAuditResourceHistorySource source, TenantChangeAuditPolicy policy)
+    {
+        this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        if (policy.Mode == TenantChangeAuditMode.Disabled) throw new ArgumentException("A disabled resource history reader must not be activated.", nameof(policy));
+    }
+    public static TenantChangeAuditResourceHistoryReader? Activate(TenantChangeAuditPolicy policy, Func<ITenantChangeAuditResourceHistorySource>? sourceFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
+        ArgumentNullException.ThrowIfNull(sourceFactory);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted resource history source factory returned null."), policy);
+    }
+    private static bool Bound(TenantChangeAuditResourceCursor cursor, TenantId tenant, TenantChangeAuditResourceQuery query)
+        => tenant.Equals(cursor.Tenant) && StringComparer.Ordinal.Equals(query.ResourceKind, cursor.ResourceKind) && StringComparer.Ordinal.Equals(query.ResourceId, cursor.ResourceId);
+    public async ValueTask<TenantChangeAuditResourcePage> ReadAsync(TenantOperationContext context, TenantChangeAuditResourceQuery query, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context); ArgumentNullException.ThrowIfNull(query);
+        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+        if (query.Continuation is { } input && !Bound(input, context.Tenant, query))
+            throw new ArgumentException("Continuation does not match the authorized tenant and resource selection.", nameof(query));
+        var page = await source.ReadAsync(context.Tenant, query, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+        if (page is null || page.Entries.Count > query.Limit) throw new InvalidOperationException("Resource history source returned an invalid page.");
+        var previous = query.Continuation?.AfterReceiptId.ToString("N");
+        foreach (var record in page.Entries)
+        {
+            var receipt = record.Receipt; var key = receipt.ReceiptId.ToString("N");
+            if (!context.Tenant.Equals(receipt.Tenant) || !StringComparer.Ordinal.Equals(query.ResourceKind, receipt.ResourceKind) ||
+                !StringComparer.Ordinal.Equals(query.ResourceId, receipt.ResourceId) || previous is not null && StringComparer.Ordinal.Compare(key, previous) <= 0)
+                throw new InvalidOperationException("Resource history source returned an invalid identity or receipt order.");
+            previous = key;
+        }
+        if (page.NextCursor is { } next && (page.Entries.Count == 0 || !Bound(next, context.Tenant, query) ||
+            next.AfterReceiptId == Guid.Empty || next.AfterReceiptId != page.Entries[^1].Receipt.ReceiptId))
+            throw new InvalidOperationException("Resource history source returned an invalid continuation.");
+        var projected = new TenantChangeAuditResourcePage(page.Entries.Select(policy.Project), page.NextCursor);
+        cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
+        return projected;
+    }
+}
 /// <summary>Exact tenant/receipt lookup under a captured immutable read policy. Null is only the provider's absence observation.</summary>
 public sealed class TenantChangeAuditLookupReader
 {
