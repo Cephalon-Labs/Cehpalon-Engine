@@ -20,9 +20,27 @@ static class ReadBudgetChecks
         Source Get() { factory?.Invoke(); return source; }
         return lane switch
         {
-            0 => mode == "ctor" ? new TenantChangeAuditHistoryReader(source, policy) : mode == "legacy" ? TenantChangeAuditHistoryReader.Activate(policy, Get) : TenantChangeAuditHistoryReader.ActivateWithBudget(policy, timeout, Get),
-            1 => mode == "ctor" ? new TenantChangeAuditLookupReader(source, policy) : mode == "legacy" ? TenantChangeAuditLookupReader.Activate(policy, Get) : TenantChangeAuditLookupReader.ActivateWithBudget(policy, timeout, Get),
-            _ => mode == "ctor" ? new TenantChangeAuditResourceHistoryReader(source, policy) : mode == "legacy" ? TenantChangeAuditResourceHistoryReader.Activate(policy, Get) : TenantChangeAuditResourceHistoryReader.ActivateWithBudget(policy, timeout, Get)
+            0 => mode switch
+            {
+                "ctor" => new TenantChangeAuditHistoryReader(source, policy),
+                "legacy" => TenantChangeAuditHistoryReader.Activate(policy, Get),
+                "budget-alias" => TenantChangeAuditHistoryReader.ActivateWithBudget(policy, timeout, Get),
+                _ => TenantChangeAuditHistoryReader.ActivateWithReadTimeout(policy, timeout, Get)
+            },
+            1 => mode switch
+            {
+                "ctor" => new TenantChangeAuditLookupReader(source, policy),
+                "legacy" => TenantChangeAuditLookupReader.Activate(policy, Get),
+                "budget-alias" => TenantChangeAuditLookupReader.ActivateWithBudget(policy, timeout, Get),
+                _ => TenantChangeAuditLookupReader.ActivateWithReadTimeout(policy, timeout, Get)
+            },
+            _ => mode switch
+            {
+                "ctor" => new TenantChangeAuditResourceHistoryReader(source, policy),
+                "legacy" => TenantChangeAuditResourceHistoryReader.Activate(policy, Get),
+                "budget-alias" => TenantChangeAuditResourceHistoryReader.ActivateWithBudget(policy, timeout, Get),
+                _ => TenantChangeAuditResourceHistoryReader.ActivateWithReadTimeout(policy, timeout, Get)
+            }
         };
     }
     static async Task<object?> Read(object reader, TenantOperationContext context, CancellationToken token = default, bool invalid = false)
@@ -44,26 +62,30 @@ static class ReadBudgetChecks
             await Case("disabled ignores invalid bounds and poisoned factory", () =>
             {
                 var calls = 0;
-                foreach (var bound in new TimeSpan?[] { null, TimeSpan.Zero, TimeSpan.FromTicks(-1), Long + TimeSpan.FromTicks(1) })
-                    Require(Activate(lane, new(), bound, disabled: true, factory: () => { calls++; throw new IOException(); }) is null);
+                foreach (var mode in new[] { "budget", "budget-alias" })
+                    foreach (var bound in new TimeSpan?[] { null, TimeSpan.Zero, TimeSpan.FromTicks(-1), Long + TimeSpan.FromTicks(1) })
+                        Require(Activate(lane, new(), bound, mode, disabled: true, factory: () => { calls++; throw new IOException(); }) is null);
                 Require(calls == 0); return Task.CompletedTask;
             });
             await Case("enabled invalid bounds precede factory", async () =>
             {
                 var calls = 0;
-                foreach (var bound in new[] { TimeSpan.Zero, TimeSpan.FromTicks(-1), Long + TimeSpan.FromTicks(1) })
-                    await Throws<ArgumentOutOfRangeException>(() => { Activate(lane, new(), bound, factory: () => calls++); return Task.CompletedTask; });
+                foreach (var mode in new[] { "budget", "budget-alias" })
+                    foreach (var bound in new[] { TimeSpan.Zero, TimeSpan.FromTicks(-1), Long + TimeSpan.FromTicks(1) })
+                        await Throws<ArgumentOutOfRangeException>(() => { Activate(lane, new(), bound, mode, factory: () => calls++); return Task.CompletedTask; });
                 Require(calls == 0);
             });
             await Case("positive inclusive bound activation is lazy", () =>
             {
                 var source = new Source(); var factories = 0;
-                foreach (var bound in new[] { TimeSpan.FromTicks(1), Long }) Require(Activate(lane, source, bound, factory: () => factories++) is not null);
-                Require(factories == 2 && source.Calls == 0); return Task.CompletedTask;
+                foreach (var mode in new[] { "budget", "budget-alias" })
+                    foreach (var bound in new[] { TimeSpan.FromTicks(1), Long })
+                        Require(Activate(lane, source, bound, mode, factory: () => factories++) is not null);
+                Require(factories == 4 && source.Calls == 0); return Task.CompletedTask;
             });
             await Case("constructor legacy and null preserve tokens and exact provider faults", async () =>
             {
-                foreach (var mode in new[] { "ctor", "legacy", "budget" }) foreach (var oce in new[] { false, true })
+                foreach (var mode in new[] { "ctor", "legacy", "budget", "budget-alias" }) foreach (var oce in new[] { false, true })
                 {
                     var h = new Harness(); var s = new Source(); using var caller = new CancellationTokenSource();
                     Exception fault = oce ? new OperationCanceledException(new CancellationToken(true)) : new IOException();
@@ -73,7 +95,7 @@ static class ReadBudgetChecks
             });
             await Case("null preserves original final caller guard ordering", async () =>
             {
-                foreach (var mode in new[] { "ctor", "legacy", "budget" })
+                foreach (var mode in new[] { "ctor", "legacy", "budget", "budget-alias" })
                 {
                     var h = new Harness(); var s = new Source(); using var caller = new CancellationTokenSource(); s.After = () => h.Clock.Arm(1, caller.Cancel);
                     await h.Run(async c => { var pending = Read(Activate(lane, s, null, mode)!, c, caller.Token); if (lane == 0) Require(Result(await pending) is not null); else Require((await Throws<OperationCanceledException>(() => pending)).CancellationToken == caller.Token); });
@@ -95,9 +117,12 @@ static class ReadBudgetChecks
             });
             await Case("configured linked token successful policy projection", async () =>
             {
-                var h = new Harness(); var s = new Source(); using var caller = new CancellationTokenSource(); var reader = Activate(lane, s, Long)!;
-                await h.Run(async c => { var row = Result(await Read(reader, c, caller.Token))!; Require(s.Token.CanBeCanceled && s.Token != caller.Token && !s.Token.IsCancellationRequested && row.Receipt.Tenant.Value == "A" && row.Fields.Count == 2 && row.Fields.Single(f => f.Name == "secret").After.Kind == TenantChangeValueKind.Redacted); });
-                caller.Cancel(); Require(!s.Token.IsCancellationRequested && s.Calls == 1);
+                foreach (var mode in new[] { "budget", "budget-alias" })
+                {
+                    var h = new Harness(); var s = new Source(); using var caller = new CancellationTokenSource(); var reader = Activate(lane, s, Long, mode)!;
+                    await h.Run(async c => { var row = Result(await Read(reader, c, caller.Token))!; Require(s.Token.CanBeCanceled && s.Token != caller.Token && !s.Token.IsCancellationRequested && row.Receipt.Tenant.Value == "A" && row.Fields.Count == 2 && row.Fields.Single(f => f.Name == "secret").After.Kind == TenantChangeValueKind.Redacted); });
+                    caller.Cancel(); Require(!s.Token.IsCancellationRequested && s.Calls == 1);
+                }
             });
             await Case("configured tenant integrity before policy publication", async () =>
             {

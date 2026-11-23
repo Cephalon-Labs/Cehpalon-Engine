@@ -1112,8 +1112,13 @@ public sealed class TenantChangeAuditResourceHistoryReader
         ArgumentNullException.ThrowIfNull(sourceFactory);
         return new(sourceFactory() ?? throw new ArgumentException("The trusted resource history source factory returned null."), policy);
     }
-    /// <summary>Optional cooperative read deadline; null preserves legacy tokens, faults and guard order.</summary>
+    /// <summary>Compatibility name for <see cref="ActivateWithReadTimeout"/>.</summary>
     public static TenantChangeAuditResourceHistoryReader? ActivateWithBudget(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditResourceHistorySource>? sourceFactory = null)
+        => ActivateWithReadTimeout(policy, readTimeout, sourceFactory);
+
+    /// <summary>Optional cooperative read timeout; null preserves legacy tokens, faults and guard order.</summary>
+    public static TenantChangeAuditResourceHistoryReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
         Func<ITenantChangeAuditResourceHistorySource>? sourceFactory = null)
     {
         ArgumentNullException.ThrowIfNull(policy);
@@ -1183,8 +1188,13 @@ public sealed class TenantChangeAuditLookupReader
         ArgumentNullException.ThrowIfNull(sourceFactory);
         return new(sourceFactory() ?? throw new ArgumentException("The trusted trail lookup source factory returned null."), policy);
     }
-    /// <summary>Optional cooperative read deadline; null preserves legacy tokens, faults and guard order.</summary>
+    /// <summary>Compatibility name for <see cref="ActivateWithReadTimeout"/>.</summary>
     public static TenantChangeAuditLookupReader? ActivateWithBudget(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditLookupSource>? sourceFactory = null)
+        => ActivateWithReadTimeout(policy, readTimeout, sourceFactory);
+
+    /// <summary>Optional cooperative read timeout; null preserves legacy tokens, faults and guard order.</summary>
+    public static TenantChangeAuditLookupReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
         Func<ITenantChangeAuditLookupSource>? sourceFactory = null)
     {
         ArgumentNullException.ThrowIfNull(policy);
@@ -1238,8 +1248,13 @@ public sealed class TenantChangeAuditHistoryReader
         ArgumentNullException.ThrowIfNull(sourceFactory);
         return new(sourceFactory() ?? throw new ArgumentException("The trusted trail source factory returned null."), policy);
     }
-    /// <summary>Optional cooperative read deadline; null preserves legacy tokens, faults and guard order.</summary>
+    /// <summary>Compatibility name for <see cref="ActivateWithReadTimeout"/>.</summary>
     public static TenantChangeAuditHistoryReader? ActivateWithBudget(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditHistorySource>? sourceFactory = null)
+        => ActivateWithReadTimeout(policy, readTimeout, sourceFactory);
+
+    /// <summary>Optional cooperative read timeout; null preserves legacy tokens, faults and guard order.</summary>
+    public static TenantChangeAuditHistoryReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
         Func<ITenantChangeAuditHistorySource>? sourceFactory = null)
     {
         ArgumentNullException.ThrowIfNull(policy);
