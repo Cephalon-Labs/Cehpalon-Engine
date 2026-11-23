@@ -42,6 +42,44 @@ fixture database is `cehpalon_qual`. Credentials are passed through the child
 process environment; the wrapper does not echo or store them in evidence.
 The caller creates and later cleans up only its own provider fixtures.
 
+## Windows Server 2025 native provider fixture
+
+Dispatch **Platform qualification** with **windows_native_providers** enabled to
+select the standard Windows Server 2025 x64 native job. Pushes, pull requests
+and dispatches with the default value run the existing no-server smoke matrix.
+
+From PowerShell 7 on a supported Windows x64 host, run from the checkout:
+
+    ./Tests/PlatformQualification/run-windows-native-fixtures.ps1 -WorkDirectory D:/scratch/engine-platform-attempt01
+
+Use a new ASCII scratch path for every attempt. Git, Python 3, tar.exe and
+curl.exe must be available. The script checks size and publisher SHA512 or
+SHA256 before extracting the fixed downloads into that scratch path. Optional
+-DotnetArchive and -ProviderArchiveDirectory reuse local copies under the
+same checks. The SDK and providers run from the work directory. The script
+builds the locked harness and starts a fresh loopback PostgreSQL cluster and
+RabbitMQ node with generated fixture credentials. It checks socket ownership
+and connected version, runs the existing 14 checks and verifies shutdown.
+Download or runtime failures stop qualification.
+
+The native archive pins are .NET SDK 11.0.100, PostgreSQL 18.6 (EDB build
+18.6-5), RabbitMQ 4.4.0 and Erlang/OTP 29.1.2. The provider archive bytes are
+specific to Windows. The W0 Linux/amd64 OCI fixture retains its own image
+digests. Keep runner/version provenance, check summaries and listener cleanup
+together. The workflow uploads the credential-free evidence JSON. The
+private directory contains process logs and isolated provider state for local
+diagnosis. A passing run on an unlisted Windows build is observational.
+The run covers platform and client-driver smoke. Full Engine provider and
+benchmark qualification use their own gates.
+
+Sources for the archive pins
+
+- [Microsoft .NET 11 releases](https://builds.dotnet.microsoft.com/dotnet/release-metadata/11.0/releases.json)
+- [EDB PostgreSQL 18.6-5 publisher checksum](https://get.enterprisedb.com/postgresql/postgresql-18.6-5-windows-x64-binaries.zip.sha256)
+- [RabbitMQ 4.4.0 release](https://github.com/rabbitmq/rabbitmq-server/releases/tag/v4.4.0)
+- [Erlang/OTP 29.1.2 release](https://github.com/erlang/otp/releases/tag/OTP-29.1.2)
+
+
 ## What the checks establish
 
 - Exact stable runtime `11.0.0`/x64 and .NET configuration-provider precedence.

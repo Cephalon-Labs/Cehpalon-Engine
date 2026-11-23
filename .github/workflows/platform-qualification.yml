@@ -5,12 +5,18 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      windows_native_providers:
+        description: Run the Windows Server 2025 native PostgreSQL and RabbitMQ fixture
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   sdk-driver-smoke:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_native_providers }}
     name: SDK and driver smoke (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -43,5 +49,33 @@ jobs:
         with:
           name: platform-qualification-${{ matrix.os }}
           path: Tests/PlatformQualification/evidence/ci-smoke.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-native-providers:
+    name: Owned native providers (windows-2025)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_native_providers }}
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13.17'
+      - name: Verify Windows and run the isolated fixture
+        shell: pwsh
+        run: |
+          if ((Get-CimInstance Win32_OperatingSystem).Caption -notmatch 'Windows Server 2025') {
+            throw 'The observed runner is not Windows Server 2025.'
+          }
+          ./Tests/PlatformQualification/run-windows-native-fixtures.ps1 -WorkDirectory (Join-Path $env:RUNNER_TEMP 'native-platform-qualification')
+      - name: Preserve qualification and cleanup summaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: platform-qualification-windows-native-providers
+          path: ${{ runner.temp }}/native-platform-qualification/evidence/*.json
           if-no-files-found: warn
           retention-days: 14
