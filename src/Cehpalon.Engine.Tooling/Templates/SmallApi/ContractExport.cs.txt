@@ -57,6 +57,7 @@ internal static class ContractExport
 {
     private const string SourceRoot = __CEHPALON_ENGINE_SOURCE_ROOT__;
     private static readonly JsonSerializerOptions Json = new() { IncludeFields = true, WriteIndented = true };
+    private static readonly JsonSerializerOptions ArtifactJson = new(Json) { NewLine = "\n" };
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private static readonly StringComparison Paths = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     public static async Task<int> Run(string configurationPath, string outputPath)
@@ -79,7 +80,7 @@ internal static class ContractExport
             var declared = TransportCatalog.Operations.Select(x => x.OperationId).Order(StringComparer.Ordinal).ToArray();
             if (!ids.SequenceEqual(declared, StringComparer.Ordinal)) throw new InvalidOperationException("Generated registry and typed catalog disagree.");
             var files = new SortedDictionary<string,byte[]>(StringComparer.Ordinal);
-            if (enabled.Contains("api")) files.Add("openapi.json", Utf8.GetBytes(OpenApi(counters).ToJsonString(Json) + "\n"));
+            if (enabled.Contains("api")) files.Add("openapi.json", Utf8.GetBytes(OpenApi(counters).ToJsonString(ArtifactJson) + "\n"));
             if (enabled.Contains("graphql"))
                 files.Add("schema.graphql", await GraphQLSchema(counters));
             var artifacts = files.Select(pair => new { name = pair.Key, bytes = pair.Value.LongLength,
@@ -93,7 +94,7 @@ internal static class ContractExport
                     "Structural wire shapes only; custom validators, CLR numeric bounds, duplicate-name/Unicode/byte checks, tenant policy and fixture data constraints are not fully expressed by JSON Schema.",
                     "GraphQL construction is explicit offline artifact work for the enabled module. No WebApplication, TLS/key read, handler or authority call is performed.",
                     "Artifacts do not enable network introspection/schema endpoints or grant tenant authority. Source/build parents are trusted; path observations do not defend hostile races." }
-            }, Json) + "\n"));
+            }, ArtifactJson) + "\n"));
             Publish(destination, files);
             Console.WriteLine(JsonSerializer.Serialize(new { status = "passed", files = files.Keys.ToArray(), counters }, Json));
             return 0;
