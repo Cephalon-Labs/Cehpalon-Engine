@@ -1080,6 +1080,33 @@ public sealed class TenantChangeAuditReadTimeoutException : TimeoutException
         : base("The cooperative audit read timeout expired.", cause) { }
 }
 
+/// <summary>Cumulative counts of reader outcomes. Each counter is sampled independently.</summary>
+public readonly record struct TenantChangeAuditReadStatisticsSnapshot(
+    long Succeeded, long DeadlineExceeded, long CallerCancelled, long Faulted);
+
+/// <summary>Optional caller-owned aggregate for audit reads that pass the reader's initial checks.</summary>
+public sealed class TenantChangeAuditReadStatistics
+{
+    private long succeeded, deadlineExceeded, callerCancelled, faulted;
+
+    public TenantChangeAuditReadStatisticsSnapshot GetSnapshot() => new(
+        Interlocked.Read(ref succeeded), Interlocked.Read(ref deadlineExceeded),
+        Interlocked.Read(ref callerCancelled), Interlocked.Read(ref faulted));
+
+    internal void Record(TenantChangeAuditReadOutcome outcome)
+    {
+        switch (outcome)
+        {
+            case TenantChangeAuditReadOutcome.Succeeded: Interlocked.Increment(ref succeeded); break;
+            case TenantChangeAuditReadOutcome.DeadlineExceeded: Interlocked.Increment(ref deadlineExceeded); break;
+            case TenantChangeAuditReadOutcome.CallerCancelled: Interlocked.Increment(ref callerCancelled); break;
+            case TenantChangeAuditReadOutcome.Faulted: Interlocked.Increment(ref faulted); break;
+        }
+    }
+}
+
+internal enum TenantChangeAuditReadOutcome { Succeeded, DeadlineExceeded, CallerCancelled, Faulted }
+
 // Per configured invocation only. Provider lifetime and arbitrary callbacks remain provider-owned.
 internal sealed class TenantChangeAuditReadDeadline : IDisposable
 {
@@ -1094,10 +1121,19 @@ internal sealed class TenantChangeAuditReadDeadline : IDisposable
     }
     internal CancellationToken Token => linked.Token;
     internal void Demand() { caller.ThrowIfCancellationRequested(); deadline.Token.ThrowIfCancellationRequested(); }
-    internal Exception Classify(OperationCanceledException failure, bool distinguishTimeout)
+    internal Exception Classify(OperationCanceledException failure, bool distinguishTimeout, out TenantChangeAuditReadOutcome outcome)
     {
-        if (caller.IsCancellationRequested) return new OperationCanceledException("The audit read caller requested cancellation.", failure, caller);
-        if (!deadline.IsCancellationRequested) return failure;
+        if (caller.IsCancellationRequested)
+        {
+            outcome = TenantChangeAuditReadOutcome.CallerCancelled;
+            return new OperationCanceledException("The audit read caller requested cancellation.", failure, caller);
+        }
+        if (!deadline.IsCancellationRequested)
+        {
+            outcome = TenantChangeAuditReadOutcome.Faulted;
+            return failure;
+        }
+        outcome = TenantChangeAuditReadOutcome.DeadlineExceeded;
         return distinguishTimeout ? new TenantChangeAuditReadTimeoutException(failure)
             : new TimeoutException("The cooperative audit read budget expired.", failure);
     }
@@ -1110,6 +1146,7 @@ public sealed class TenantChangeAuditResourceHistoryReader
     private readonly TenantChangeAuditPolicy policy;
     private readonly TimeSpan? readTimeout;
     private readonly bool distinguishTimeout;
+    private readonly TenantChangeAuditReadStatistics? statistics;
     public TenantChangeAuditResourceHistoryReader(ITenantChangeAuditResourceHistorySource source, TenantChangeAuditPolicy policy)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -1135,15 +1172,25 @@ public sealed class TenantChangeAuditResourceHistoryReader
     /// <summary>Opt in to a typed exception for this reader's own cooperative deadline.</summary>
     public static TenantChangeAuditResourceHistoryReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
         Func<ITenantChangeAuditResourceHistorySource>? sourceFactory, bool distinguishTimeout)
+        => ActivateWithReadTimeout(policy, readTimeout, sourceFactory, distinguishTimeout, statistics: null);
+
+    /// <summary>Optionally count outcomes after the reader's initial checks.</summary>
+    public static TenantChangeAuditResourceHistoryReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditResourceHistorySource>? sourceFactory, bool distinguishTimeout, TenantChangeAuditReadStatistics? statistics)
     {
         ArgumentNullException.ThrowIfNull(policy);
         if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
         if (readTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(readTimeout));
         ArgumentNullException.ThrowIfNull(sourceFactory);
-        return new(sourceFactory() ?? throw new ArgumentException("The trusted resource history source factory returned null."), policy, readTimeout, distinguishTimeout);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted resource history source factory returned null."), policy, readTimeout, distinguishTimeout, statistics);
     }
-    private TenantChangeAuditResourceHistoryReader(ITenantChangeAuditResourceHistorySource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout, bool distinguishTimeout)
-        : this(source, policy) { this.readTimeout = readTimeout; this.distinguishTimeout = distinguishTimeout; }
+    private TenantChangeAuditResourceHistoryReader(ITenantChangeAuditResourceHistorySource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout, bool distinguishTimeout, TenantChangeAuditReadStatistics? statistics)
+        : this(source, policy)
+    {
+        this.readTimeout = readTimeout;
+        this.distinguishTimeout = distinguishTimeout;
+        this.statistics = statistics;
+    }
     private static bool Bound(TenantChangeAuditResourceCursor cursor, TenantId tenant, TenantChangeAuditResourceQuery query)
         => tenant.Equals(cursor.Tenant) && StringComparer.Ordinal.Equals(query.ResourceKind, cursor.ResourceKind) && StringComparer.Ordinal.Equals(query.ResourceId, cursor.ResourceId);
     public async ValueTask<TenantChangeAuditResourcePage> ReadAsync(TenantOperationContext context, TenantChangeAuditResourceQuery query, CancellationToken cancellationToken = default)
@@ -1153,6 +1200,7 @@ public sealed class TenantChangeAuditResourceHistoryReader
         if (query.Continuation is { } input && !Bound(input, context.Tenant, query))
             throw new ArgumentException("Continuation does not match the authorized tenant and resource selection.", nameof(query));
         using var readDeadline = readTimeout is { } bound ? new TenantChangeAuditReadDeadline(cancellationToken, bound) : null;
+        var outcome = TenantChangeAuditReadOutcome.Faulted;
         try
         {
             readDeadline?.Demand();
@@ -1175,14 +1223,22 @@ public sealed class TenantChangeAuditResourceHistoryReader
             var projected = new TenantChangeAuditResourcePage(page.Entries.Select(policy.Project), page.NextCursor);
             cancellationToken.ThrowIfCancellationRequested(); readDeadline?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
             readDeadline?.Demand();
+            outcome = TenantChangeAuditReadOutcome.Succeeded;
             return projected;
         }
         catch (OperationCanceledException failure) when (readDeadline is not null)
         {
-            var classified = readDeadline.Classify(failure, distinguishTimeout);
+            var classified = readDeadline.Classify(failure, distinguishTimeout, out outcome);
             if (ReferenceEquals(classified, failure)) throw;
             throw classified;
         }
+        catch (OperationCanceledException failure) when (statistics is not null &&
+            cancellationToken.IsCancellationRequested && failure.CancellationToken == cancellationToken)
+        {
+            outcome = TenantChangeAuditReadOutcome.CallerCancelled;
+            throw;
+        }
+        finally { statistics?.Record(outcome); }
     }
 }
 /// <summary>Exact tenant/receipt lookup under a captured immutable read policy. Null is only the provider's absence observation.</summary>
@@ -1192,6 +1248,7 @@ public sealed class TenantChangeAuditLookupReader
     private readonly TenantChangeAuditPolicy policy;
     private readonly TimeSpan? readTimeout;
     private readonly bool distinguishTimeout;
+    private readonly TenantChangeAuditReadStatistics? statistics;
     public TenantChangeAuditLookupReader(ITenantChangeAuditLookupSource source, TenantChangeAuditPolicy policy)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -1217,21 +1274,32 @@ public sealed class TenantChangeAuditLookupReader
     /// <summary>Opt in to a typed exception for this reader's own cooperative deadline.</summary>
     public static TenantChangeAuditLookupReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
         Func<ITenantChangeAuditLookupSource>? sourceFactory, bool distinguishTimeout)
+        => ActivateWithReadTimeout(policy, readTimeout, sourceFactory, distinguishTimeout, statistics: null);
+
+    /// <summary>Optionally count outcomes after the reader's initial checks.</summary>
+    public static TenantChangeAuditLookupReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditLookupSource>? sourceFactory, bool distinguishTimeout, TenantChangeAuditReadStatistics? statistics)
     {
         ArgumentNullException.ThrowIfNull(policy);
         if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
         if (readTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(readTimeout));
         ArgumentNullException.ThrowIfNull(sourceFactory);
-        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail lookup source factory returned null."), policy, readTimeout, distinguishTimeout);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail lookup source factory returned null."), policy, readTimeout, distinguishTimeout, statistics);
     }
-    private TenantChangeAuditLookupReader(ITenantChangeAuditLookupSource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout, bool distinguishTimeout)
-        : this(source, policy) { this.readTimeout = readTimeout; this.distinguishTimeout = distinguishTimeout; }
+    private TenantChangeAuditLookupReader(ITenantChangeAuditLookupSource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout, bool distinguishTimeout, TenantChangeAuditReadStatistics? statistics)
+        : this(source, policy)
+    {
+        this.readTimeout = readTimeout;
+        this.distinguishTimeout = distinguishTimeout;
+        this.statistics = statistics;
+    }
     public async ValueTask<TenantChangeAuditRecord?> FindAsync(TenantOperationContext context, Guid receiptId, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
         if (receiptId == Guid.Empty) throw new ArgumentException("Receipt ID cannot be empty.", nameof(receiptId));
         cancellationToken.ThrowIfCancellationRequested(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
         using var readDeadline = readTimeout is { } bound ? new TenantChangeAuditReadDeadline(cancellationToken, bound) : null;
+        var outcome = TenantChangeAuditReadOutcome.Faulted;
         try
         {
             readDeadline?.Demand();
@@ -1242,14 +1310,22 @@ public sealed class TenantChangeAuditLookupReader
             var projected = record is null ? null : policy.Project(record);
             cancellationToken.ThrowIfCancellationRequested(); readDeadline?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
             readDeadline?.Demand();
+            outcome = TenantChangeAuditReadOutcome.Succeeded;
             return projected;
         }
         catch (OperationCanceledException failure) when (readDeadline is not null)
         {
-            var classified = readDeadline.Classify(failure, distinguishTimeout);
+            var classified = readDeadline.Classify(failure, distinguishTimeout, out outcome);
             if (ReferenceEquals(classified, failure)) throw;
             throw classified;
         }
+        catch (OperationCanceledException failure) when (statistics is not null &&
+            cancellationToken.IsCancellationRequested && failure.CancellationToken == cancellationToken)
+        {
+            outcome = TenantChangeAuditReadOutcome.CallerCancelled;
+            throw;
+        }
+        finally { statistics?.Record(outcome); }
     }
 }
 public sealed class TenantChangeAuditHistoryReader
@@ -1258,6 +1334,7 @@ public sealed class TenantChangeAuditHistoryReader
     private readonly TenantChangeAuditPolicy policy;
     private readonly TimeSpan? readTimeout;
     private readonly bool distinguishTimeout;
+    private readonly TenantChangeAuditReadStatistics? statistics;
     public TenantChangeAuditHistoryReader(ITenantChangeAuditHistorySource source, TenantChangeAuditPolicy policy)
     {
         this.source = source ?? throw new ArgumentNullException(nameof(source)); this.policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -1283,21 +1360,32 @@ public sealed class TenantChangeAuditHistoryReader
     /// <summary>Opt in to a typed exception for this reader's own cooperative deadline.</summary>
     public static TenantChangeAuditHistoryReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
         Func<ITenantChangeAuditHistorySource>? sourceFactory, bool distinguishTimeout)
+        => ActivateWithReadTimeout(policy, readTimeout, sourceFactory, distinguishTimeout, statistics: null);
+
+    /// <summary>Optionally count outcomes after the reader's initial checks.</summary>
+    public static TenantChangeAuditHistoryReader? ActivateWithReadTimeout(TenantChangeAuditPolicy policy, TimeSpan? readTimeout,
+        Func<ITenantChangeAuditHistorySource>? sourceFactory, bool distinguishTimeout, TenantChangeAuditReadStatistics? statistics)
     {
         ArgumentNullException.ThrowIfNull(policy);
         if (policy.Mode == TenantChangeAuditMode.Disabled) return null;
         if (readTimeout is { } timeout) TenantChangeAuditOutboxExecutor<object>.RequireBound(timeout, nameof(readTimeout));
         ArgumentNullException.ThrowIfNull(sourceFactory);
-        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail source factory returned null."), policy, readTimeout, distinguishTimeout);
+        return new(sourceFactory() ?? throw new ArgumentException("The trusted trail source factory returned null."), policy, readTimeout, distinguishTimeout, statistics);
     }
-    private TenantChangeAuditHistoryReader(ITenantChangeAuditHistorySource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout, bool distinguishTimeout)
-        : this(source, policy) { this.readTimeout = readTimeout; this.distinguishTimeout = distinguishTimeout; }
+    private TenantChangeAuditHistoryReader(ITenantChangeAuditHistorySource source, TenantChangeAuditPolicy policy, TimeSpan? readTimeout, bool distinguishTimeout, TenantChangeAuditReadStatistics? statistics)
+        : this(source, policy)
+    {
+        this.readTimeout = readTimeout;
+        this.distinguishTimeout = distinguishTimeout;
+        this.statistics = statistics;
+    }
     public async ValueTask<TenantChangeAuditPage> ReadAsync(TenantOperationContext context, int limit = 50, string? cursor = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context); ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1); ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, 200);
         if (cursor is not null) Values.Opaque(cursor, 512, nameof(cursor));
         context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read"); cancellationToken.ThrowIfCancellationRequested();
         using var readDeadline = readTimeout is { } bound ? new TenantChangeAuditReadDeadline(cancellationToken, bound) : null;
+        var outcome = TenantChangeAuditReadOutcome.Faulted;
         try
         {
             readDeadline?.Demand();
@@ -1308,13 +1396,21 @@ public sealed class TenantChangeAuditHistoryReader
             var projected = new TenantChangeAuditPage(page.Entries.Select(policy.Project), page.NextCursor);
             readDeadline?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
             readDeadline?.Demand();
+            outcome = TenantChangeAuditReadOutcome.Succeeded;
             return projected;
         }
         catch (OperationCanceledException failure) when (readDeadline is not null)
         {
-            var classified = readDeadline.Classify(failure, distinguishTimeout);
+            var classified = readDeadline.Classify(failure, distinguishTimeout, out outcome);
             if (ReferenceEquals(classified, failure)) throw;
             throw classified;
         }
+        catch (OperationCanceledException failure) when (statistics is not null &&
+            cancellationToken.IsCancellationRequested && failure.CancellationToken == cancellationToken)
+        {
+            outcome = TenantChangeAuditReadOutcome.CallerCancelled;
+            throw;
+        }
+        finally { statistics?.Record(outcome); }
     }
 }

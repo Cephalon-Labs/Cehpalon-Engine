@@ -46,6 +46,18 @@ static class ReadBudgetChecks
             }
         };
     }
+    static object? Observe(int lane, Source source, TimeSpan? timeout, TenantChangeAuditReadStatistics? statistics,
+        bool distinguishTimeout = false, bool disabled = false, Action? factory = null)
+    {
+        var policy = Policy(disabled);
+        Source Get() { factory?.Invoke(); return source; }
+        return lane switch
+        {
+            0 => TenantChangeAuditHistoryReader.ActivateWithReadTimeout(policy, timeout, Get, distinguishTimeout, statistics),
+            1 => TenantChangeAuditLookupReader.ActivateWithReadTimeout(policy, timeout, Get, distinguishTimeout, statistics),
+            _ => TenantChangeAuditResourceHistoryReader.ActivateWithReadTimeout(policy, timeout, Get, distinguishTimeout, statistics)
+        };
+    }
     static async Task<object?> Read(object reader, TenantOperationContext context, CancellationToken token = default, bool invalid = false)
         => reader switch
         {
@@ -135,21 +147,24 @@ static class ReadBudgetChecks
             await Case("cooperative private cancellation normalizes exact inner OCE", async () =>
             {
                 var h = new Harness(); var s = new Source(); var signals = new Signals(); OperationCanceledException? original = null;
+                var statistics = new TenantChangeAuditReadStatistics();
                 s.Hook = async token => { await signals.Cancellation(token); original = new(token); throw original; };
                 await h.Run(async c =>
                 {
-                    var pending = Read(Activate(lane, s, Short)!, c);
+                    var pending = Read(Observe(lane, s, Short, statistics)!, c);
                     try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); signals.Finish.TrySetResult(); var failure = await Throws<TimeoutException>(() => pending); Require(failure.GetType() == typeof(TimeoutException) && ReferenceEquals(failure.InnerException, original)); }
                     finally { signals.Finish.TrySetResult(); await Join(pending); }
                 });
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 1, 0, 0));
             });
             await Case("typed timeout opt-in only classifies the reader deadline", async () =>
             {
                 var h = new Harness(); var s = new Source(); var signals = new Signals(); OperationCanceledException? original = null;
+                var statistics = new TenantChangeAuditReadStatistics();
                 s.Hook = async token => { await signals.Cancellation(token); original = new(token); throw original; };
                 await h.Run(async c =>
                 {
-                    var reader = Activate(lane, s, Short, "typed-timeout")!;
+                    var reader = Observe(lane, s, Short, statistics, distinguishTimeout: true)!;
                     var pending = Read(reader, c);
                     try
                     {
@@ -163,8 +178,11 @@ static class ReadBudgetChecks
                     var foreign = new TimeoutException("Controlled provider fault.");
                     s.Hook = _ => throw foreign;
                     Require(ReferenceEquals(await Throws<TimeoutException>(() => Read(reader, c)), foreign));
+                    Require(ReferenceEquals(await Throws<TimeoutException>(() => Read(Observe(lane, s, null, statistics, distinguishTimeout: true)!, c)), foreign));
                     Require(ReferenceEquals(await Throws<TimeoutException>(() => Read(Activate(lane, s, null, "typed-timeout")!, c)), foreign));
+                    Require(ReferenceEquals(await Throws<TimeoutException>(() => Read(Observe(lane, s, null, null, distinguishTimeout: true)!, c)), foreign));
                 });
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 1, 0, 2));
             });
             await Case("caller cancellation normalizes original token and inner", async () =>
             {
@@ -180,37 +198,43 @@ static class ReadBudgetChecks
             await Case("observed budget then caller wins at primary selection", async () =>
             {
                 var h = new Harness(); var s = new Source(); using var caller = new CancellationTokenSource(); var signals = new Signals(); OperationCanceledException? original = null;
+                var statistics = new TenantChangeAuditReadStatistics();
                 s.Hook = async token => { await signals.Hold(token); caller.Cancel(); original = new(token); throw original; };
                 await h.Run(async c =>
                 {
-                    var pending = Read(Activate(lane, s, Short, "typed-timeout")!, c, caller.Token);
+                    var pending = Read(Observe(lane, s, Short, statistics, distinguishTimeout: true)!, c, caller.Token);
                     try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); Require(!caller.IsCancellationRequested && !pending.IsCompleted); signals.Finish.TrySetResult(); var error = await Throws<OperationCanceledException>(() => pending); Require(error.CancellationToken == caller.Token && ReferenceEquals(error.InnerException, original)); }
                     finally { signals.Finish.TrySetResult(); await Join(pending); }
                 });
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 0, 1, 0));
             });
             await Case("foreign OCE and late non-OCE retain exact references", async () =>
             {
                 var h = new Harness(); var s = new Source(); var foreign = new OperationCanceledException(new CancellationToken(true));
+                var statistics = new TenantChangeAuditReadStatistics();
                 s.Hook = token => { Require(!token.IsCancellationRequested); throw foreign; };
-                await h.Run(async c => Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Read(Activate(lane, s, Long)!, c)), foreign)));
+                await h.Run(async c => Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Read(Observe(lane, s, Long, statistics)!, c)), foreign)));
                 var late = new IOException(); var signals = new Signals(); s.Hook = async token => { await signals.Hold(token); throw late; };
                 await new Harness().Run(async c =>
                 {
-                    var pending = Read(Activate(lane, s, Short)!, c);
+                    var pending = Read(Observe(lane, s, Short, statistics)!, c);
                     try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); signals.Finish.TrySetResult(); Require(ReferenceEquals(await Throws<IOException>(() => pending), late)); }
                     finally { signals.Finish.TrySetResult(); await Join(pending); }
                 });
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 0, 0, 2));
             });
             foreach (var empty in new[] { false, true })
                 await Case("uncooperative " + (empty ? "empty or null" : "populated") + " result stays owned after private signal", async () =>
                 {
                     var h = new Harness(); var s = new Source { Empty = empty }; var signals = new Signals(); s.Hook = signals.Hold;
+                    var statistics = new TenantChangeAuditReadStatistics();
                     await h.Run(async c =>
                     {
-                        var pending = Read(Activate(lane, s, Short)!, c);
-                        try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); Require(!pending.IsCompleted); signals.Finish.TrySetResult(); await Throws<TimeoutException>(() => pending); }
+                        var pending = Read(Observe(lane, s, Short, statistics)!, c);
+                        try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); Require(!pending.IsCompleted && statistics.GetSnapshot() == default); signals.Finish.TrySetResult(); await Throws<TimeoutException>(() => pending); }
                         finally { signals.Finish.TrySetResult(); await Join(pending); }
                     });
+                    Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 1, 0, 0));
                 });
             await Case("final publication private budget veto after live scope includes empty", async () =>
             {
@@ -233,13 +257,88 @@ static class ReadBudgetChecks
             });
             await Case("post-await scope denial latches and final caller veto", async () =>
             {
-                var h = new Harness(); var s = new Source { After = null }; s.After = h.Clock.Advance; var reader = Activate(lane, s, Long)!;
+                var statistics = new TenantChangeAuditReadStatistics();
+                var h = new Harness(); var s = new Source { After = null }; s.After = h.Clock.Advance; var reader = Observe(lane, s, Long, statistics)!;
                 await h.Run(async c => { await Throws<TenantAccessDeniedException>(() => Read(reader, c)); h.Clock.Restore(); await Throws<TenantAccessDeniedException>(() => Read(reader, c)); }); Require(s.Calls == 1);
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 0, 0, 1));
                 foreach (var empty in new[] { false, true })
                 {
                     var other = new Harness(); var source = new Source { Empty = empty }; using var caller = new CancellationTokenSource(); source.After = () => other.Clock.Arm(2, caller.Cancel);
                     await other.Run(async c => Require((await Throws<OperationCanceledException>(() => Read(Activate(lane, source, Long)!, c, caller.Token))).CancellationToken == caller.Token));
                 }
+            });
+            await Case("statistics ignore disabled reads and failed admission", async () =>
+            {
+                var statistics = new TenantChangeAuditReadStatistics();
+                var source = new Source();
+                Require(Observe(lane, source, TimeSpan.Zero, statistics, disabled: true, factory: () => throw new IOException()) is null);
+                var reader = Observe(lane, source, Long, statistics)!;
+                var harness = new Harness();
+                using var caller = new CancellationTokenSource();
+                await harness.Run(async context =>
+                {
+                    await Throws<ArgumentException>(() => Read(reader, context, invalid: true));
+                    caller.Cancel();
+                    await Throws<OperationCanceledException>(() => Read(reader, context, caller.Token));
+                    harness.Clock.Advance();
+                    await Throws<TenantAccessDeniedException>(() => Read(reader, context));
+                });
+                Require(source.Calls == 0 && statistics.GetSnapshot() == default);
+            });
+            await Case("statistics classify unconfigured cancellations by caller state and token", async () =>
+            {
+                var statistics = new TenantChangeAuditReadStatistics();
+                var providerFailure = new OperationCanceledException(new CancellationToken(true));
+                var source = new Source { Hook = _ => throw providerFailure };
+                var reader = Observe(lane, source, null, statistics)!;
+                using var caller = new CancellationTokenSource();
+                using var matchingCaller = new CancellationTokenSource();
+                await new Harness().Run(async context =>
+                {
+                    Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Read(reader, context, caller.Token)), providerFailure));
+                    source.Hook = token =>
+                    {
+                        Require(token == caller.Token);
+                        caller.Cancel();
+                        throw providerFailure;
+                    };
+                    Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Read(reader, context, caller.Token)), providerFailure));
+                    source.Hook = token =>
+                    {
+                        matchingCaller.Cancel();
+                        throw new OperationCanceledException(token);
+                    };
+                    Require((await Throws<OperationCanceledException>(() => Read(reader, context, matchingCaller.Token))).CancellationToken == matchingCaller.Token);
+                });
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(0, 0, 1, 2));
+            });
+            await Case("statistics count concurrent populated and empty reads once", async () =>
+            {
+                const int reads = 32;
+                var statistics = new TenantChangeAuditReadStatistics();
+                var finish = Signal();
+                var populated = new Source { Hook = _ => new ValueTask(finish.Task) };
+                var empty = new Source { Empty = true, Hook = populated.Hook };
+                var populatedReader = Observe(lane, populated, null, statistics)!;
+                var emptyReader = Observe(lane, empty, Long, statistics)!;
+                await new Harness().Run(async context =>
+                {
+                    var pending = Enumerable.Range(0, reads).Select(i => Read(i % 2 == 0 ? populatedReader : emptyReader, context)).ToArray();
+                    try
+                    {
+                        Require(populated.Calls == reads / 2 && empty.Calls == reads / 2 && statistics.GetSnapshot() == default);
+                        finish.TrySetResult();
+                        var results = await Task.WhenAll(pending);
+                        for (var i = 0; i < results.Length; i++)
+                            Require((Result(results[i]) is not null) == (i % 2 == 0));
+                    }
+                    finally
+                    {
+                        finish.TrySetResult();
+                        await Join(Task.WhenAll(pending));
+                    }
+                });
+                Require(statistics.GetSnapshot() == new TenantChangeAuditReadStatisticsSnapshot(reads, 0, 0, 0));
             });
         }
     }
