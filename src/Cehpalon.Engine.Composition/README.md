@@ -57,6 +57,23 @@ with the activation/cancellation exception first. Cleanup-only errors aggregate
 and remain observable on repeated lease disposal. A resource must not await its
 own owning lease's disposal from its disposal callback.
 
+The `Cehpalon.Engine.Composition` meter publishes the process-wide
+`cehpalon.module.lifecycle.duration` histogram in seconds when activation
+first reaches an eligible module. With measurement enabled, Engine makes one
+recording attempt per attempted activation, rollback, or disposal, with only
+`phase` and `outcome` tags.
+Phases are `activation`, `rollback`, and `disposal`. Outcomes are `success`
+or `fault`, with `canceled` for a factory that throws cancellation for the
+requested caller token. An acquired resource followed by cancellation can
+therefore yield an activation success and a separate rollback observation.
+Empty or rejected plans and uninvoked factories produce no samples.
+
+Attempts overlapping instrument publication can proceed without samples.
+A publication callback failure leaves the histogram unavailable until process
+restart. Exceptions thrown by measurement callbacks do not replace lifecycle
+results. Callbacks run synchronously and must return without waiting for a
+lifecycle attempt they are observing.
+
 API/GraphQL/Worker labels in the contract suite are counters/recorder fixtures,
 not implemented HTTP/GraphQL/Worker hosts. This slice does not establish external
 provider integration, tenant/authentication authority, topology portability,

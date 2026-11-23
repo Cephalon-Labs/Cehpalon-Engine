@@ -30,3 +30,25 @@ The attribute and `IOperationHandlerFactory` are the compile-time bridge for the
 separate code generator. Core does not scan assemblies or use runtime activation.
 Release/provider/platform qualification and benchmarks remain separate gates;
 these contracts do not make unsupported Windows or hosted CI pass.
+
+## Dispatch duration
+
+Hosts can subscribe to the `cehpalon.operation.dispatch.duration` histogram on
+the `Cehpalon.Engine.Core` meter. It reports seconds for registered, type-matched
+dispatches through owned handler cleanup. Input validation, registry lookup,
+contract mismatch and cancellation before dispatch are outside the measurement.
+A request can invoke Core more than once through layered dispatchers, so use the
+histogram to count Core invocations and track transport requests separately.
+
+The single `outcome` tag is `success`, `failure` for a business error result,
+`canceled` for an execution cancellation carrying the requested caller token,
+or `fault`. Factory or handler exceptions outside caller cancellation and all
+cleanup errors count as `fault`. Measurements carry no IDs, payloads or
+exception data.
+
+Core publishes the histogram on the first eligible dispatch and starts timing
+only when a listener enables it. Concurrent or reentrant dispatches during
+publication proceed without timing. A publication callback that throws leaves
+this process without the histogram until restart. Exceptions from measurement
+callbacks preserve the dispatch result and owned cleanup behavior. Listener
+callbacks run synchronously and should complete promptly.

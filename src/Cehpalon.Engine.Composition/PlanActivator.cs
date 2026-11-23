@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Runtime.ExceptionServices;
 
 namespace Cehpalon.Engine.Composition;
@@ -30,18 +32,32 @@ public static class PlanActivator
             foreach (var id in plan.ActivationOrder)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var resource = await factories[id].Factory(cancellationToken).ConfigureAwait(false)
-                    ?? throw new InvalidOperationException("Module factory returned null: " + id);
-                if (resources.Contains(resource, ReferenceEqualityComparer.Instance))
-                    throw new InvalidOperationException("Module factories must transfer distinct owned resources.");
-                resources.Add(resource);
+                var started = ModuleLifecycleMetrics.Start();
+                cancellationToken.ThrowIfCancellationRequested();
+                var outcome = "fault";
+                try
+                {
+                    var resource = await factories[id].Factory(cancellationToken).ConfigureAwait(false)
+                        ?? throw new InvalidOperationException("Module factory returned null: " + id);
+                    if (resources.Contains(resource, ReferenceEqualityComparer.Instance))
+                        throw new InvalidOperationException("Module factories must transfer distinct owned resources.");
+                    resources.Add(resource);
+                    outcome = "success";
+                }
+                catch (OperationCanceledException error) when (
+                    cancellationToken.IsCancellationRequested && error.CancellationToken == cancellationToken)
+                {
+                    outcome = "canceled";
+                    throw;
+                }
+                finally { ModuleLifecycleMetrics.Record(started, "activation", outcome); }
                 cancellationToken.ThrowIfCancellationRequested();
             }
             return new ActivationLease(resources);
         }
         catch (Exception failure)
         {
-            var errors = await ActivationLease.DisposeAll(resources).ConfigureAwait(false);
+            var errors = await ActivationLease.DisposeAll(resources, "rollback").ConfigureAwait(false);
             if (errors.Count != 0) throw new AggregateException("Activation failed and rollback encountered errors.", new[] { failure }.Concat(errors));
             ExceptionDispatchInfo.Capture(failure).Throw();
             throw;
@@ -79,19 +95,83 @@ public sealed class ActivationLease : IAsyncDisposable
     {
         try
         {
-            var errors = await DisposeAll(resources).ConfigureAwait(false);
+            var errors = await DisposeAll(resources, "disposal").ConfigureAwait(false);
             if (errors.Count != 0) completion.TrySetException(new AggregateException("Module cleanup encountered errors.", errors));
             else completion.TrySetResult();
         }
         catch (Exception error) { completion.TrySetException(error); }
     }
 
-    internal static async ValueTask<IReadOnlyList<Exception>> DisposeAll(IReadOnlyList<IAsyncDisposable> resources)
+    internal static async ValueTask<IReadOnlyList<Exception>> DisposeAll(IReadOnlyList<IAsyncDisposable> resources, string phase)
     {
         var errors = new List<Exception>();
         for (var i = resources.Count - 1; i >= 0; --i)
-            try { await resources[i].DisposeAsync().ConfigureAwait(false); }
+        {
+            var started = ModuleLifecycleMetrics.Start();
+            var outcome = "fault";
+            try
+            {
+                await resources[i].DisposeAsync().ConfigureAwait(false);
+                outcome = "success";
+            }
             catch (Exception error) { errors.Add(error); }
+            finally { ModuleLifecycleMetrics.Record(started, phase, outcome); }
+        }
         return errors;
+    }
+}
+
+internal static class ModuleLifecycleMetrics
+{
+    private static Histogram<double>? duration;
+    private static int publicationClaimed;
+
+    internal static long? Start()
+    {
+        var instrument = Volatile.Read(ref duration);
+        if (instrument is null && Volatile.Read(ref publicationClaimed) == 0)
+            instrument = TryPublishDuration();
+        return instrument?.Enabled == true ? Stopwatch.GetTimestamp() : null;
+    }
+
+    private static Histogram<double>? TryPublishDuration()
+    {
+        // Publication invokes listeners synchronously. Reentrant and concurrent
+        // attempts can proceed without measurements until the instrument is ready.
+        if (Interlocked.CompareExchange(ref publicationClaimed, 1, 0) != 0)
+            return Volatile.Read(ref duration);
+
+        Meter? meter = null;
+        try
+        {
+            meter = new("Cehpalon.Engine.Composition");
+            var instrument = meter.CreateHistogram<double>("cehpalon.module.lifecycle.duration", "s",
+                "Duration of an individual module activation, rollback or disposal attempt.");
+            Volatile.Write(ref duration, instrument);
+            return instrument;
+        }
+        catch (Exception)
+        {
+            // A failed publication leaves the histogram unavailable until restart.
+            try { meter?.Dispose(); }
+            catch (Exception) { /* A completion callback can also throw. */ }
+            return null;
+        }
+    }
+
+    internal static void Record(long? started, string phase, string outcome)
+    {
+        if (started is not long timestamp) return;
+        try
+        {
+            // Start returns a timestamp only after successful publication.
+            duration!.Record(Stopwatch.GetElapsedTime(timestamp).TotalSeconds,
+                new KeyValuePair<string, object?>("phase", phase),
+                new KeyValuePair<string, object?>("outcome", outcome));
+        }
+        catch (Exception)
+        {
+            // A listener failure must not interrupt activation or cleanup.
+        }
     }
 }

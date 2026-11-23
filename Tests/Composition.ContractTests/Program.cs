@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -36,6 +38,150 @@ void Invalid(string json, string code, IEnumerable<ModuleDescriptor>? modules = 
     var result = CompositionCompiler.Compile(json, modules ?? Catalog());
     Assert(!result.IsSuccess && result.Plan is null && result.Diagnostics.Any(d => d.Code == code), "Expected " + code + ": " + string.Join(";", result.Diagnostics));
 }
+
+const string publicationFaultProbe = "--composition-metrics-publication-fault";
+const string publicationReentryProbe = "--composition-metrics-publication-reentry";
+if (args is [publicationFaultProbe])
+{
+    await CheckPublicationFault();
+    return 0;
+}
+if (args is [publicationReentryProbe])
+{
+    await CheckPublicationReentry();
+    return 0;
+}
+
+bool IsLifecycleHistogram(Instrument instrument) =>
+    instrument.Meter.Name == "Cehpalon.Engine.Composition" &&
+    instrument.Name == "cehpalon.module.lifecycle.duration";
+
+async Task RunPublicationProbe(string probe)
+{
+    var executable = Environment.ProcessPath ?? throw new InvalidOperationException("The test host path is unavailable.");
+    var start = new ProcessStartInfo(executable)
+    {
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true
+    };
+    if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+        start.ArgumentList.Add(Assembly.GetExecutingAssembly().Location);
+    start.ArgumentList.Add(probe);
+    using var child = Process.Start(start) ?? throw new InvalidOperationException("The publication probe did not start.");
+    var output = Task.WhenAll(child.StandardOutput.ReadToEndAsync(), child.StandardError.ReadToEndAsync());
+    using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+    try { await child.WaitForExitAsync(watchdog.Token); }
+    catch (OperationCanceledException) when (watchdog.IsCancellationRequested)
+    {
+        if (!child.HasExited) child.Kill();
+        await child.WaitForExitAsync();
+        throw new TimeoutException("The publication probe did not exit: " + probe);
+    }
+    Assert(child.ExitCode == 0, string.Join(Environment.NewLine, await output));
+}
+
+async Task CheckPublicationFault()
+{
+    var publications = 0;
+    var completions = 0;
+    var calls = 0;
+    var disabledCalls = 0;
+    var events = new List<string>();
+    var active = Plan(Json(("core", true)));
+    var core = new ModuleRegistration("core", _ =>
+    {
+        calls++;
+        return ValueTask.FromResult<IAsyncDisposable>(new Resource("core", new Counter(), events));
+    });
+    using (var listener = new MeterListener())
+    {
+        listener.InstrumentPublished = (instrument, current) =>
+        {
+            if (!IsLifecycleHistogram(instrument)) return;
+            publications++;
+            current.EnableMeasurementEvents(instrument);
+            throw new InvalidOperationException("Publication callback failed.");
+        };
+        listener.MeasurementsCompleted = (instrument, _) =>
+        {
+            if (!IsLifecycleHistogram(instrument)) return;
+            completions++;
+            throw new InvalidOperationException("Completion callback failed.");
+        };
+        listener.Start();
+
+        var disabled = new ModuleRegistration("api", _ =>
+        {
+            disabledCalls++;
+            return ValueTask.FromResult<IAsyncDisposable>(new Resource());
+        });
+        await using (await PlanActivator.ActivateAsync(Plan(Json(("api", false))), [disabled])) { }
+        await ThrowsAsync<ArgumentException>(async () => await PlanActivator.ActivateAsync(active, []));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await ThrowsAsync<OperationCanceledException>(async () =>
+            await PlanActivator.ActivateAsync(active, [core], cancellation.Token));
+        Assert(publications == 0 && calls == 0 && disabledCalls == 0);
+
+        await using (await PlanActivator.ActivateAsync(active, [core])) { }
+        Assert(publications == 1 && completions == 1 && calls == 1 && events.SequenceEqual(["start:core", "stop:core"]));
+    }
+
+    var latePublications = 0;
+    using var lateListener = new MeterListener
+    {
+        InstrumentPublished = (instrument, _) => { if (IsLifecycleHistogram(instrument)) latePublications++; }
+    };
+    lateListener.Start();
+    await using (await PlanActivator.ActivateAsync(active, [core])) { }
+    var failure = new ApplicationException("Activation failure.");
+    var rolledBack = await ThrowsAsync<ApplicationException>(async () =>
+        await PlanActivator.ActivateAsync(Plan(Json(("api", true))), [core, new("api", _ => throw failure)]));
+    Assert(ReferenceEquals(failure, rolledBack) && publications == 1 && latePublications == 0 &&
+        calls == 3 && events.SequenceEqual(["start:core", "stop:core", "start:core", "stop:core", "start:core", "stop:core"]));
+}
+
+async Task CheckPublicationReentry()
+{
+    var publications = 0;
+    var measurements = new List<string>();
+    var events = new List<string>();
+    var plan = Plan(Json(("core", true)));
+    using var cancellation = new CancellationTokenSource();
+    using var listener = new MeterListener
+    {
+        InstrumentPublished = (instrument, current) =>
+        {
+            if (!IsLifecycleHistogram(instrument)) return;
+            publications++;
+            current.EnableMeasurementEvents(instrument);
+
+            // Join a separate caller to catch a lock held across publication.
+            Task.Run(async () =>
+            {
+                var nested = new ModuleRegistration("core", _ =>
+                    ValueTask.FromResult<IAsyncDisposable>(new Resource("nested", new Counter(), events)));
+                await using var lease = await PlanActivator.ActivateAsync(plan, [nested]);
+            }).GetAwaiter().GetResult();
+            cancellation.Cancel();
+        }
+    };
+    listener.SetMeasurementEventCallback<double>((_, _, tags, _) => measurements.Add((string)tags[0].Value!));
+    listener.Start();
+    var outer = new ModuleRegistration("core", _ =>
+        ValueTask.FromResult<IAsyncDisposable>(new Resource("outer", new Counter(), events)));
+    var canceled = await ThrowsAsync<OperationCanceledException>(async () =>
+        await PlanActivator.ActivateAsync(plan, [outer], cancellation.Token));
+    Assert(canceled.CancellationToken == cancellation.Token && measurements.Count == 0 &&
+        events.SequenceEqual(["start:nested", "stop:nested"]));
+    await using (await PlanActivator.ActivateAsync(plan, [outer])) { }
+    Assert(publications == 1 && measurements.SequenceEqual(["activation", "disposal"]) &&
+        events.SequenceEqual(["start:nested", "stop:nested", "start:outer", "stop:outer"]));
+}
+
+Async("first publication and completion callback failures leave lifecycle intact", () => RunPublicationProbe(publicationFaultProbe));
+Async("activation proceeds without metrics when a publication callback reenters", () => RunPublicationProbe(publicationReentryProbe));
 
 Add("empty selections activate nothing", () => Assert(Plan(Json()).ActivationOrder.Count == 0));
 Add("API-only plan explains implicit support and disabled entrypoints", () =>
@@ -253,6 +399,62 @@ Add("compilation is pure metadata even for invalid and valid plans", () =>
     var method = typeof(CompositionCompiler).GetMethod("Compile")!;
     Assert(method.GetParameters().Select(p => p.ParameterType).SequenceEqual([typeof(string), typeof(IEnumerable<ModuleDescriptor>)]));
     Assert(Plan(Json(("api", true))).SchemaVersion == 1);
+});
+
+Async("module lifecycle measures attempted work and preserves cleanup errors", async () =>
+{
+    var measurements = new List<(string Phase, string Outcome)>();
+    var validMeasurements = true;
+    using var listener = new MeterListener();
+    listener.InstrumentPublished = (instrument, current) =>
+    {
+        if (IsLifecycleHistogram(instrument))
+        {
+            validMeasurements &= instrument.Unit == "s";
+            current.EnableMeasurementEvents(instrument);
+        }
+    };
+    listener.SetMeasurementEventCallback<double>((_, seconds, tags, _) =>
+    {
+        validMeasurements &= double.IsFinite(seconds) && seconds >= 0 &&
+            tags.Length == 2 && tags[0].Key == "phase" && tags[1].Key == "outcome";
+        if (tags.Length == 2 && tags[0].Value is string phase && tags[1].Value is string outcome)
+            measurements.Add((phase, outcome));
+        throw new InvalidOperationException("Listener failure");
+    });
+    listener.Start();
+
+    var disabledCalls = 0;
+    var disabled = new ModuleRegistration("graphql", _ =>
+    {
+        disabledCalls++;
+        return ValueTask.FromResult<IAsyncDisposable>(new Resource());
+    });
+    var plan = Plan(Json(("api", true), ("graphql", false)));
+    var core = new ModuleRegistration("core", _ => ValueTask.FromResult<IAsyncDisposable>(new Resource()));
+    var api = new ModuleRegistration("api", _ => ValueTask.FromResult<IAsyncDisposable>(new Resource()));
+    var lease = await PlanActivator.ActivateAsync(plan, [core, api, disabled]);
+    await lease.DisposeAsync();
+    await lease.DisposeAsync();
+
+    using var cancellation = new CancellationTokenSource();
+    var failingCore = new ModuleRegistration("core", _ => ValueTask.FromResult<IAsyncDisposable>(
+        new Resource("private", new Counter(), [], fail: true)));
+    var canceledApi = new ModuleRegistration("api", token =>
+    {
+        cancellation.Cancel();
+        return ValueTask.FromCanceled<IAsyncDisposable>(token);
+    });
+    var error = await ThrowsAsync<AggregateException>(async () =>
+        await PlanActivator.ActivateAsync(plan, [failingCore, canceledApi, disabled], cancellation.Token));
+    Assert(error.InnerExceptions.Count == 2 &&
+        error.InnerExceptions[0] is OperationCanceledException canceled && canceled.CancellationToken == cancellation.Token &&
+        error.InnerExceptions[1] is InvalidOperationException { Message: "cleanup:private" });
+
+    Assert(disabledCalls == 0 && validMeasurements && measurements.SequenceEqual([
+        ("activation", "success"), ("activation", "success"), ("disposal", "success"), ("disposal", "success"),
+        ("activation", "success"), ("activation", "canceled"), ("rollback", "fault")]),
+        $"Unexpected lifecycle measurements: {string.Join(", ", measurements)}.");
 });
 
 var failed = 0;

@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Runtime.ExceptionServices;
 
 namespace Cehpalon.Engine.Core;
@@ -55,7 +57,62 @@ public sealed class OperationDispatcher
         if (registration is not Registration<TRequest, TResponse> typed)
             return ValueTask.FromResult(OperationResult<TResponse>.Failure(new OperationError(
                 "operation.contract_mismatch", "The requested operation does not use these request/response contracts.")));
-        return typed.DispatchAsync(request, context, cancellationToken);
+        return typed.DispatchAsync(request, context, cancellationToken, OperationDispatchMetrics.GetEnabledDuration());
+    }
+}
+
+internal static class OperationDispatchMetrics
+{
+    private static Histogram<double>? duration;
+    private static int publicationClaimed;
+
+    internal static Histogram<double>? GetEnabledDuration()
+    {
+        var instrument = Volatile.Read(ref duration) ?? TryPublishDuration();
+        return instrument?.Enabled == true ? instrument : null;
+    }
+
+    private static Histogram<double>? TryPublishDuration()
+    {
+        // Publication can invoke listeners inline. Concurrent and reentrant calls proceed without timing.
+        if (Volatile.Read(ref publicationClaimed) != 0 || Interlocked.CompareExchange(ref publicationClaimed, 1, 0) != 0)
+            return null;
+
+        Meter? meter = null;
+        try
+        {
+            meter = new Meter("Cehpalon.Engine.Core");
+            var instrument = meter.CreateHistogram<double>("cehpalon.operation.dispatch.duration", "s",
+                "Duration of dispatch for a registered operation, including owned handler cleanup.");
+            Volatile.Write(ref duration, instrument);
+            return instrument;
+        }
+        catch (Exception)
+        {
+            // Leave collection disabled after failed publication. Disposing can also invoke a listener.
+            try
+            {
+                meter?.Dispose();
+            }
+            catch (Exception)
+            {
+                // Keep observer failures outside the dispatch contract.
+            }
+            return null;
+        }
+    }
+
+    internal static void Record(Histogram<double> instrument, long started, string outcome)
+    {
+        try
+        {
+            instrument.Record(Stopwatch.GetElapsedTime(started).TotalSeconds,
+                new KeyValuePair<string, object?>("outcome", outcome));
+        }
+        catch (Exception)
+        {
+            // A listener callback must not replace the operation result or its exception.
+        }
     }
 }
 
@@ -64,39 +121,57 @@ internal interface IRegistration;
 internal sealed class Registration<TRequest, TResponse>(Func<IOperationHandler<TRequest, TResponse>> factory) : IRegistration
 {
     internal async ValueTask<OperationResult<TResponse>> DispatchAsync(
-        TRequest request, OperationContext context, CancellationToken cancellationToken)
+        TRequest request, OperationContext context, CancellationToken cancellationToken, Histogram<double>? duration)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        var handler = factory() ?? throw new InvalidOperationException("The operation factory returned a null handler.");
-        OperationResult<TResponse>? result = null;
-        Exception? primaryFailure = null;
+        var started = duration is null ? 0 : Stopwatch.GetTimestamp();
+        var outcome = "fault";
+        var cleanupFailed = false;
         try
         {
-            // A synchronous factory can cancel while constructing the owned handler.
-            // Keep this check inside cleanup scope so business work is skipped without leaking it.
             cancellationToken.ThrowIfCancellationRequested();
-            result = await handler.HandleAsync(request, context, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException("The operation handler returned a null result.");
-        }
-        catch (Exception error)
-        {
-            primaryFailure = error;
-        }
+            var handler = factory() ?? throw new InvalidOperationException("The operation factory returned a null handler.");
+            OperationResult<TResponse>? result = null;
+            Exception? primaryFailure = null;
+            try
+            {
+                // A synchronous factory can cancel while constructing the owned handler.
+                // Keep this check inside cleanup scope so business work is skipped without leaking it.
+                cancellationToken.ThrowIfCancellationRequested();
+                result = await handler.HandleAsync(request, context, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The operation handler returned a null result.");
+            }
+            catch (Exception error)
+            {
+                primaryFailure = error;
+            }
 
-        try
-        {
-            if (handler is IAsyncDisposable asyncDisposable)
-                await asyncDisposable.DisposeAsync().ConfigureAwait(false);
-            else if (handler is IDisposable disposable)
-                disposable.Dispose();
+            try
+            {
+                if (handler is IAsyncDisposable asyncDisposable)
+                    await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                else if (handler is IDisposable disposable)
+                    disposable.Dispose();
+            }
+            catch (Exception cleanupFailure)
+            {
+                cleanupFailed = true;
+                if (primaryFailure is not null)
+                    throw new AggregateException("Operation execution and owned-handler cleanup both failed.", primaryFailure, cleanupFailure);
+                throw;
+            }
+            if (primaryFailure is not null) ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+            outcome = result!.IsSuccess ? "success" : "failure";
+            return result;
         }
-        catch (Exception cleanupFailure)
+        catch (OperationCanceledException error) when (
+            !cleanupFailed && cancellationToken.IsCancellationRequested && error.CancellationToken == cancellationToken)
         {
-            if (primaryFailure is not null)
-                throw new AggregateException("Operation execution and owned-handler cleanup both failed.", primaryFailure, cleanupFailure);
+            outcome = "canceled";
             throw;
         }
-        if (primaryFailure is not null) ExceptionDispatchInfo.Capture(primaryFailure).Throw();
-        return result!;
+        finally
+        {
+            if (duration is not null) OperationDispatchMetrics.Record(duration, started, outcome);
+        }
     }
 }

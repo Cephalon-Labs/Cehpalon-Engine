@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Cehpalon.Engine.Core;
@@ -36,6 +38,201 @@ async Task<T> ThrowsAsync<T>(Func<Task> action) where T : Exception
 }
 OperationDispatcher Dispatcher(Func<IOperationHandler<int, int>> factory)
     => new(new OperationRegistryBuilder().Register("test.run", factory).Build());
+
+bool IsDispatchDuration(Instrument instrument) => instrument.Meter.Name == "Cehpalon.Engine.Core" &&
+    instrument.Name == "cehpalon.operation.dispatch.duration";
+
+async Task CheckFirstPublication(bool failPublication)
+{
+    var factories = 0;
+    var cleanups = 0;
+    var publications = 0;
+    var unpublications = 0;
+    var measurements = 0;
+    var dispatcher = Dispatcher(() =>
+    {
+        Interlocked.Increment(ref factories);
+        return new Handler(cleanup: () => Interlocked.Increment(ref cleanups));
+    });
+
+    async Task Dispatch(int value) =>
+        Assert((await dispatcher.DispatchAsync<int, int>("test.run", value, context)).Value == value);
+
+    using (var observer = new MeterListener())
+    {
+        observer.InstrumentPublished = (instrument, current) =>
+        {
+            if (!IsDispatchDuration(instrument)) return;
+            publications++;
+            current.EnableMeasurementEvents(instrument);
+            if (failPublication) throw new InvalidOperationException("Publishing listener failed.");
+
+            Dispatch(2).GetAwaiter().GetResult();
+            Task.Run(() => Dispatch(3)).GetAwaiter().GetResult();
+        };
+        observer.MeasurementsCompleted = (instrument, _) =>
+        {
+            if (!IsDispatchDuration(instrument) || !failPublication) return;
+            unpublications++;
+            throw new InvalidOperationException("Completing listener failed.");
+        };
+        observer.SetMeasurementEventCallback<double>((_, _, _, _) => Interlocked.Increment(ref measurements));
+        observer.Start();
+        Assert(publications == 0, "The probe must start before the instrument exists.");
+        await Dispatch(1);
+        var expectedCalls = failPublication ? 1 : 3;
+        Assert(factories == expectedCalls && cleanups == expectedCalls);
+        Assert(publications == 1 && unpublications == (failPublication ? 1 : 0));
+        Assert(measurements == (failPublication ? 0 : 1), "Only the owning publication attempt can be timed.");
+    }
+
+    if (failPublication)
+    {
+        using var laterObserver = new MeterListener();
+        laterObserver.InstrumentPublished = (instrument, _) =>
+        {
+            if (IsDispatchDuration(instrument)) publications++;
+        };
+        laterObserver.Start();
+        await Dispatch(4);
+        Assert(factories == 2 && cleanups == 2 && publications == 1,
+            "A failed publication must neither strand the original meter nor disable later dispatch.");
+    }
+}
+
+const string publicationFault = "--dispatch-publication-fault-probe";
+const string publicationReentry = "--dispatch-publication-reentry-probe";
+if (args is [publicationFault] or [publicationReentry])
+{
+    try
+    {
+        await CheckFirstPublication(args[0] == publicationFault);
+        return 0;
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine(error);
+        return 1;
+    }
+}
+
+async Task RunPublicationProbe(string argument)
+{
+    var launcher = Environment.ProcessPath ?? throw new InvalidOperationException("The test launcher path is missing.");
+    var start = new ProcessStartInfo(launcher) { RedirectStandardError = true };
+    if (string.Equals(Path.GetFileNameWithoutExtension(launcher), "dotnet", StringComparison.OrdinalIgnoreCase))
+        start.ArgumentList.Add(typeof(Handler).Assembly.Location);
+    start.ArgumentList.Add(argument);
+    using var child = Process.Start(start) ?? throw new InvalidOperationException("Could not start the publication probe.");
+    var error = child.StandardError.ReadToEndAsync();
+    try
+    {
+        await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+    }
+    catch (TimeoutException)
+    {
+        if (!child.HasExited) child.Kill(entireProcessTree: true);
+        await child.WaitForExitAsync();
+        throw;
+    }
+    Assert(child.ExitCode == 0, $"Publication probe exited with {child.ExitCode}. {await error}");
+}
+
+await Check("dispatch-first-publication-fault-preserves-ownership", () => RunPublicationProbe(publicationFault));
+await Check("dispatch-first-publication-allows-reentrant-and-concurrent-callers", () => RunPublicationProbe(publicationReentry));
+
+await Check("dispatch-duration-records-only-bounded-outcomes", async () =>
+{
+    var outcomes = new List<string>();
+    var validMeasurements = true;
+    var success = Dispatcher(() => new Handler((_, _, _) =>
+        ValueTask.FromResult(OperationResult<int>.Success(1))));
+    Assert((await success.DispatchAsync<int, int>("test.run", 0, context)).Value == 1);
+    var callbacks = 0;
+    Instrument? observed = null;
+    using var listener = new MeterListener();
+    listener.InstrumentPublished = (instrument, _) =>
+    {
+        if (IsDispatchDuration(instrument))
+        {
+            validMeasurements &= instrument.Unit == "s";
+            observed = instrument;
+        }
+    };
+    listener.SetMeasurementEventCallback<double>((_, seconds, tags, _) =>
+    {
+        validMeasurements &= double.IsFinite(seconds) && seconds >= 0 &&
+            tags.Length == 1 && tags[0].Key == "outcome";
+        callbacks++;
+        if (tags.Length == 1 && tags[0].Value is string outcome)
+            outcomes.Add(outcome);
+        throw new InvalidOperationException("Listener failure");
+    });
+    listener.Start();
+    Assert(observed is not null, "Dispatch histogram was not published.");
+    listener.EnableMeasurementEvents(observed!);
+    Assert(observed?.Enabled == true, "Dispatch histogram was not enabled.");
+
+    Assert((await success.DispatchAsync<int, int>("test.run", 0, context)).Value == 1);
+
+    var failure = Dispatcher(() => new Handler((_, _, _) =>
+        ValueTask.FromResult(OperationResult<int>.Failure(new OperationError("test.failure", "private")))));
+    Assert(!(await failure.DispatchAsync<int, int>("test.run", 0, context)).IsSuccess);
+
+    using var cts = new CancellationTokenSource();
+    var canceled = Dispatcher(() => new Handler((_, _, token) =>
+    {
+        cts.Cancel();
+        return ValueTask.FromCanceled<OperationResult<int>>(token);
+    }));
+    var cancellation = await ThrowsAsync<OperationCanceledException>(async () =>
+        await canceled.DispatchAsync<int, int>("test.run", 0, context, cts.Token));
+    Assert(cancellation.CancellationToken == cts.Token);
+
+    var expected = new InvalidOperationException("private factory exception");
+    var fault = Dispatcher(() => throw expected);
+    var actual = await ThrowsAsync<InvalidOperationException>(async () =>
+        await fault.DispatchAsync<int, int>("test.run", 0, context));
+    Assert(ReferenceEquals(expected, actual));
+    var cleanupFault = Dispatcher(() => new Handler(cleanup: () => throw expected));
+    var cleanupError = await ThrowsAsync<InvalidOperationException>(async () =>
+        await cleanupFault.DispatchAsync<int, int>("test.run", 0, context));
+    Assert(ReferenceEquals(expected, cleanupError));
+
+    using var cleanupCancellation = new CancellationTokenSource();
+    var expectedCleanupCancellation = new OperationCanceledException(cleanupCancellation.Token);
+    var canceledCleanup = Dispatcher(() => new Handler(cleanup: () =>
+    {
+        cleanupCancellation.Cancel();
+        throw expectedCleanupCancellation;
+    }));
+    var canceledCleanupError = await ThrowsAsync<OperationCanceledException>(async () =>
+        await canceledCleanup.DispatchAsync<int, int>("test.run", 0, context, cleanupCancellation.Token));
+    Assert(ReferenceEquals(expectedCleanupCancellation, canceledCleanupError));
+
+    var cleanupGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var asynchronousHandler = new AsyncHandler(() => new ValueTask(cleanupGate.Task));
+    var pending = Dispatcher(() => asynchronousHandler).DispatchAsync<int, int>("test.run", 14, context);
+    OperationResult<int> afterCleanup;
+    try
+    {
+        Assert(asynchronousHandler.AsyncDisposeCalls == 1 && !pending.IsCompleted && callbacks == 6,
+            "The measurement must wait for cleanup completion.");
+    }
+    finally
+    {
+        cleanupGate.TrySetResult();
+        afterCleanup = await pending;
+    }
+    Assert(afterCleanup.Value == 14);
+
+    Assert(!(await success.DispatchAsync<int, int>("unknown", 0, context)).IsSuccess);
+    Assert(!(await success.DispatchAsync<string, int>("test.run", "mismatch", context)).IsSuccess);
+    await ThrowsAsync<OperationCanceledException>(async () =>
+        await success.DispatchAsync<int, int>("test.run", 0, context, cts.Token));
+    Assert(validMeasurements && outcomes.SequenceEqual(new[] { "success", "failure", "canceled", "fault", "fault", "fault", "success" }),
+        $"Valid measurements: {validMeasurements}. Callbacks: {callbacks}. Outcomes: {string.Join(", ", outcomes)}.");
+});
 
 await Check("canonical-id-grammar-and-boundaries", () => Sync(() =>
 {
