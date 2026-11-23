@@ -75,7 +75,7 @@ public sealed class GraphQLOperationCatalog
             // The endpoint guards authentication; check again before dispatch so alternate executor wiring fails closed.
             var http = context.Service<IHttpContextAccessor>().HttpContext;
             if (http is null || !http.User.Identities.Any(identity => identity.IsAuthenticated))
-                throw Error(TransportErrors.AccessDenied());
+                return ReportError(context, TransportErrors.AccessDenied());
             using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(http.RequestAborted, context.RequestAborted);
             OperationResult<TResponse> result;
             try
@@ -93,12 +93,14 @@ public sealed class GraphQLOperationCatalog
                 cancellation.Token.ThrowIfCancellationRequested();
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
-            catch { throw Error(TransportErrors.InternalError()); }
-            // Only adapter-created protocol errors are emitted; exceptions from host components are always sanitized.
-            return result.IsSuccess ? result.Value : throw Error(TransportErrors.ForClient(result.Error));
+            catch { result = OperationResult<TResponse>.Failure(TransportErrors.InternalError()); }
+            return result.IsSuccess ? result.Value : ReportError(context, TransportErrors.ForClient(result.Error));
         }
 
-        private static GraphQLException Error(OperationError error) => new(ErrorBuilder.New()
-            .SetCode(error.Code).SetMessage(error.Message).Build());
+        private static object? ReportError(IResolverContext context, OperationError error)
+        {
+            context.ReportError(ErrorBuilder.New().SetCode(error.Code).SetMessage(error.Message).Build());
+            return null;
+        }
     }
 }

@@ -74,6 +74,31 @@ await Check("typed-validation-normalizes-error-before-dispatch",async () =>
 { Fixture.Reset();var r=await Post(Query(-1));Assert(r.Status==200 && Code(r.Body)=="validation.failed" && !r.Body.Contains("private") && Fixture.Calls==0,r.Body); });
 await Check("access-denial-is-generic-semantic-graphql-error",async () =>
 { Fixture.Reset();var r=await Post(Query(1,"B"));Assert(r.Status==200 && Code(r.Body)=="access.denied" && !r.Body.Contains("tenant B secret"),r.Body); });
+await Check("denied-field-reports-error-without-throwing-and-keeps-sibling-data", async () =>
+{
+    const string query = "{\n  denied: catalogItem(input:{tenant:\"B\",id:1}){id}\n  allowed: catalogItem(input:{tenant:\"A\",id:1}){id}\n}";
+    var throws = 0;
+    void CountThrows(object? sender, System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs args)
+    {
+        if (args.Exception is HotChocolate.GraphQLException)
+            Interlocked.Increment(ref throws);
+    }
+
+    AppDomain.CurrentDomain.FirstChanceException += CountThrows;
+    (int Status, string Body) response;
+    try { response = await Post(Envelope(query)); }
+    finally { AppDomain.CurrentDomain.FirstChanceException -= CountThrows; }
+
+    using var json = JsonDocument.Parse(response.Body);
+    var data = json.RootElement.GetProperty("data");
+    var error = json.RootElement.GetProperty("errors").EnumerateArray().Single();
+    Assert(response.Status == 200 && data.GetProperty("denied").ValueKind == JsonValueKind.Null
+        && data.GetProperty("allowed").GetProperty("id").GetInt32() == 1, response.Body);
+    Assert(error.GetProperty("message").GetString() == "Access denied."
+        && error.GetProperty("extensions").GetProperty("code").GetString() == "access.denied"
+        && error.TryGetProperty("path", out var path) && path.EnumerateArray().Single().GetString() == "denied", response.Body);
+    Assert(Volatile.Read(ref throws) == 0, $"Debugger-visible GraphQLException throws: {throws}. {response.Body}");
+});
 await Check("domain-error-code-is-preserved",async () =>
 { Fixture.Reset();var r=await Post(Query(2));Assert(r.Status==200 && Code(r.Body)=="catalog.conflict",r.Body); });
 await Check("reserved-capacity-message-is-generic-in-graphql", async () =>
