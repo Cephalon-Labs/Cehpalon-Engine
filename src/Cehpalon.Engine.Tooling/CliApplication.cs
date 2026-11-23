@@ -39,7 +39,7 @@ public static class CliApplication
         ArgumentNullException.ThrowIfNull(fileSystem);
         try
         {
-            if (args.Length == 1 && args[0] == "--help")
+            if (args.Length == 0 || args.Length == 1 && args[0] == "--help")
             {
                 Write(output, new { success = true, version = Version, commands = new[] {
                     "new --name <ASCIIUpperIdentifier> --output <new-directory> --engine-root <existing-checkout> [--profile portable-request-reply|small-api]",
@@ -53,7 +53,6 @@ public static class CliApplication
                 Write(output, new { success = true, version = Version });
                 return 0;
             }
-            if (args.Length == 0) throw new UsageFailure("usage.command", "Use new, validate, --help or --version.");
             return args[0] switch
             {
                 "new" => New(Parse(args, ["--name", "--output", "--engine-root", "--profile"]), output, fileSystem),

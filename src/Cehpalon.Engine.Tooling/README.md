@@ -18,6 +18,7 @@ cehpalon validate --config <file> [--profile portable-request-reply|small-api]
 
 `CliApplication.Run(string[], TextWriter, TextWriter)` returns 0 for success, 2 for
 usage/configuration rejection, and 3 for path/I/O/source failure. Results are JSON;
+An empty-argument CLI launch displays help with exit0 and no filesystem work.
 success goes to output and diagnostics to error. Unknown or duplicate options,
 extra positional arguments, unsupported profiles and names outside
 `[A-Z][A-Za-z0-9]{0,63}` are rejected. DOS device names CON/PRN/AUX/NUL/COM1-9/LPT1-9
@@ -56,6 +57,10 @@ sources in the CLI assembly and does not read a Samples checkout at generation t
 before activation, in addition to Composition graph validation.
 
 The generated Small API runtime has explicit `--self-test --output <new-report>`
+and defaults to this same finite fixture self-test when F5 supplies no arguments,
+using a fresh report under the binary's `.local/self-test-runs` directory. It
+prints the report path and preserves previous reports. This default does not
+select persistent serving or caller trust. The explicit command provides
 for real localhost HTTPS/JWT/cross-tenant/disabled/cancellation/lifecycle fixture
 checks. It reads all four emitted configurations. `--serve --config <json>
 --certificate <user.pfx> --public-key <RS256-public.pem> --ready <new-ready.json>`

@@ -112,9 +112,16 @@ Check("version-without-filesystem-work", () =>
     SameSnapshot(before, runRoot);
 });
 
+Check("no-command-shows-help-without-filesystem-work", () =>
+{
+    var before = Snapshot(runRoot);
+    var result = Run();
+    Assert(result.Code == 0 && result.Error.Length == 0 && result.Output.Contains("new", StringComparison.Ordinal));
+    SameSnapshot(before, runRoot);
+});
+
 foreach (var invocation in new (string Name, string[] Arguments)[]
 {
-    ("no-command", []),
     ("unknown-command", ["launch"]),
     ("help-extra-argument", ["--help", "extra"]),
     ("version-extra-argument", ["--version", "extra"]),

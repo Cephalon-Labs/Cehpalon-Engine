@@ -100,6 +100,9 @@ This generated source-checkout consumer uses existing Core, Composition, Identit
 Tenancy, HTTP/GraphQL adapters and actual typed/lazy generated Core gateways.
 It is a bounded HTTPS/JWT fixture-backed profile, not production scaffolding,
 a real IdP/provider, database/RLS proof or an installable distribution.
+F5 or an empty-argument run selects the existing ephemeral self-test and prints
+a fresh report path under the binary's .local/self-test-runs directory. It exits
+after the checks; persistent serving still requires explicit caller-provided trust.
 Assembly PortableConsumer.{{name}} and fixed namespace PortableConsumers.Generated
 avoid framework/Engine naming collisions.
 

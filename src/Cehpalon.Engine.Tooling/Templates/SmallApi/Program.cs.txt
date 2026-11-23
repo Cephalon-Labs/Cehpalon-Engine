@@ -19,6 +19,12 @@ internal static class Program
         Dictionary<string, string> options;
         try
         {
+            if (args.Length == 0)
+            {
+                var report = Path.Combine(AppContext.BaseDirectory, ".local", "self-test-runs", Guid.NewGuid().ToString("N") + ".json");
+                Console.WriteLine("Report: " + report);
+                args = ["--self-test", "--output", report];
+            }
             if (args.Length == 1 && args[0] == "--help")
             {
                 Console.WriteLine(JsonSerializer.Serialize(new { status = "passed", commands = new[] {
@@ -94,7 +100,7 @@ internal static class Program
                 return 0;
             }
             // Serving requires caller-provided trust. Ephemeral private test keys are
-            // generated exclusively by the explicit --self-test command.
+            // generated exclusively by self-test mode, including the empty-args default.
             using var certificate = X509CertificateLoader.LoadPkcs12FromFile(options["--certificate"],
                 Environment.GetEnvironmentVariable("CEHPALON_TLS_PASSWORD"), OperatingSystem.IsWindows() ? X509KeyStorageFlags.UserKeySet : X509KeyStorageFlags.EphemeralKeySet);
             if (!certificate.HasPrivateKey || certificate.NotAfter.ToUniversalTime() <= DateTime.UtcNow
