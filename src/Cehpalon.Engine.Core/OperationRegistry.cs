@@ -39,10 +39,17 @@ public sealed class OperationRegistry
 public sealed class OperationDispatcher
 {
     private readonly OperationRegistry registry;
+    private readonly Action<OperationDispatchCompletion>? completionObserver;
+
     public OperationDispatcher(OperationRegistry registry)
+        : this(registry, null) { }
+
+    /// <summary>Opt in to a synchronous, best-effort completion callback for registered dispatches.</summary>
+    public OperationDispatcher(OperationRegistry registry, Action<OperationDispatchCompletion>? completionObserver)
     {
         ArgumentNullException.ThrowIfNull(registry);
         this.registry = registry;
+        this.completionObserver = completionObserver;
     }
 
     public ValueTask<OperationResult<TResponse>> DispatchAsync<TRequest, TResponse>(
@@ -57,7 +64,47 @@ public sealed class OperationDispatcher
         if (registration is not Registration<TRequest, TResponse> typed)
             return ValueTask.FromResult(OperationResult<TResponse>.Failure(new OperationError(
                 "operation.contract_mismatch", "The requested operation does not use these request/response contracts.")));
-        return typed.DispatchAsync(request, context, cancellationToken, OperationDispatchMetrics.GetEnabledDuration());
+        var observation = completionObserver is null ? default : OperationDispatchObservation.Capture(completionObserver);
+        return typed.DispatchAsync(request, context, cancellationToken, OperationDispatchMetrics.GetEnabledDuration(), observation);
+    }
+}
+
+internal readonly struct OperationDispatchObservation(
+    Action<OperationDispatchCompletion> observer, long started, ActivityTraceId? traceId, ActivitySpanId? spanId)
+{
+    private static readonly AsyncLocal<object?> notificationFlow = new();
+    private static readonly object notificationMarker = new();
+
+    internal bool IsEnabled => observer is not null;
+
+    internal static OperationDispatchObservation Capture(Action<OperationDispatchCompletion> observer)
+    {
+        if (notificationFlow.Value is not null) return default;
+
+        var started = Stopwatch.GetTimestamp();
+        var activity = Activity.Current;
+        return activity?.IdFormat == ActivityIdFormat.W3C
+            ? new(observer, started, activity.TraceId, activity.SpanId)
+            : new(observer, started, null, null);
+    }
+
+    internal void Notify(OperationDispatchOutcome outcome, long completed)
+    {
+        if (observer is null) return;
+
+        notificationFlow.Value = notificationMarker;
+        try
+        {
+            observer(new(outcome, Stopwatch.GetElapsedTime(started, completed), traceId, spanId));
+        }
+        catch (Exception)
+        {
+            // A host callback must not replace the dispatch result or its exception.
+        }
+        finally
+        {
+            notificationFlow.Value = null;
+        }
     }
 }
 
@@ -102,12 +149,19 @@ internal static class OperationDispatchMetrics
         }
     }
 
-    internal static void Record(Histogram<double> instrument, long started, string outcome)
+    internal static void Record(Histogram<double> instrument, long started, long completed, OperationDispatchOutcome outcome)
     {
         try
         {
-            instrument.Record(Stopwatch.GetElapsedTime(started).TotalSeconds,
-                new KeyValuePair<string, object?>("outcome", outcome));
+            var label = outcome switch
+            {
+                OperationDispatchOutcome.Success => "success",
+                OperationDispatchOutcome.Failure => "failure",
+                OperationDispatchOutcome.Canceled => "canceled",
+                _ => "fault"
+            };
+            instrument.Record(Stopwatch.GetElapsedTime(started, completed).TotalSeconds,
+                new KeyValuePair<string, object?>("outcome", label));
         }
         catch (Exception)
         {
@@ -121,10 +175,11 @@ internal interface IRegistration;
 internal sealed class Registration<TRequest, TResponse>(Func<IOperationHandler<TRequest, TResponse>> factory) : IRegistration
 {
     internal async ValueTask<OperationResult<TResponse>> DispatchAsync(
-        TRequest request, OperationContext context, CancellationToken cancellationToken, Histogram<double>? duration)
+        TRequest request, OperationContext context, CancellationToken cancellationToken, Histogram<double>? duration,
+        OperationDispatchObservation observation)
     {
         var started = duration is null ? 0 : Stopwatch.GetTimestamp();
-        var outcome = "fault";
+        var outcome = OperationDispatchOutcome.Fault;
         var cleanupFailed = false;
         try
         {
@@ -160,18 +215,23 @@ internal sealed class Registration<TRequest, TResponse>(Func<IOperationHandler<T
                 throw;
             }
             if (primaryFailure is not null) ExceptionDispatchInfo.Capture(primaryFailure).Throw();
-            outcome = result!.IsSuccess ? "success" : "failure";
+            outcome = result!.IsSuccess ? OperationDispatchOutcome.Success : OperationDispatchOutcome.Failure;
             return result;
         }
         catch (OperationCanceledException error) when (
             !cleanupFailed && cancellationToken.IsCancellationRequested && error.CancellationToken == cancellationToken)
         {
-            outcome = "canceled";
+            outcome = OperationDispatchOutcome.Canceled;
             throw;
         }
         finally
         {
-            if (duration is not null) OperationDispatchMetrics.Record(duration, started, outcome);
+            if (duration is not null || observation.IsEnabled)
+            {
+                var completed = Stopwatch.GetTimestamp();
+                if (duration is not null) OperationDispatchMetrics.Record(duration, started, completed, outcome);
+                observation.Notify(outcome, completed);
+            }
         }
     }
 }

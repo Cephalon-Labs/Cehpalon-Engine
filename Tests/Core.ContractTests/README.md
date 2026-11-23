@@ -9,11 +9,11 @@ dotnet build Tests/Core.ContractTests/Core.ContractTests.csproj -c Release --no-
 dotnet Tests/Core.ContractTests/bin/Release/net11.0/Core.ContractTests.dll --output=.local/core-results.json
 ```
 
-32 checks cover canonical IDs; result/context snapshots and guards; lazy immutable
-registration; unknown/type-mismatched calls doing zero factory work; cancellation
-before dispatch, during factory and during handler; correct owned synchronous and
-asynchronous disposal; preserved execution/cleanup failures; overlapping concurrent
-dispatches; shared business contracts; and the BCL-only Core assembly boundary.
+Checks cover canonical IDs, result/context snapshots and guards, lazy immutable
+registration, cancellation, synchronous and asynchronous disposal, preservation
+of execution and cleanup failures, concurrent dispatch, shared handlers, and the
+BCL-only assembly boundary. Dispatch telemetry cases exercise first publication,
+bounded outcomes, trace capture and overlap, async cleanup, and callback reentry.
 
 These are local component proofs. Windows26H2 is an observational host, not the
 listed supported Windows evidence required by #3. They do not establish tenant or

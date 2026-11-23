@@ -36,8 +36,9 @@ async Task<T> ThrowsAsync<T>(Func<Task> action) where T : Exception
     try { await action(); } catch (T error) { return error; }
     throw new InvalidOperationException("Expected " + typeof(T).Name);
 }
-OperationDispatcher Dispatcher(Func<IOperationHandler<int, int>> factory)
-    => new(new OperationRegistryBuilder().Register("test.run", factory).Build());
+OperationDispatcher Dispatcher(Func<IOperationHandler<int, int>> factory,
+    Action<OperationDispatchCompletion>? observer = null)
+    => new(new OperationRegistryBuilder().Register("test.run", factory).Build(), observer);
 
 bool IsDispatchDuration(Instrument instrument) => instrument.Meter.Name == "Cehpalon.Engine.Core" &&
     instrument.Name == "cehpalon.operation.dispatch.duration";
@@ -102,11 +103,38 @@ async Task CheckFirstPublication(bool failPublication)
 
 const string publicationFault = "--dispatch-publication-fault-probe";
 const string publicationReentry = "--dispatch-publication-reentry-probe";
-if (args is [publicationFault] or [publicationReentry])
+const string publicationTrace = "--dispatch-publication-trace-probe";
+if (args is [publicationFault] or [publicationReentry] or [publicationTrace])
 {
     try
     {
-        await CheckFirstPublication(args[0] == publicationFault);
+        if (args[0] == publicationTrace)
+        {
+            using var entry = new Activity("dispatch-entry").SetIdFormat(ActivityIdFormat.W3C).Start();
+            using var replacement = new Activity("instrument-publication").SetIdFormat(ActivityIdFormat.W3C);
+            OperationDispatchCompletion? record = null;
+            var publications = 0;
+            var dispatcher = Dispatcher(() => new Handler((request, _, _) =>
+            {
+                Assert(ReferenceEquals(Activity.Current, replacement));
+                return ValueTask.FromResult(OperationResult<int>.Success(request));
+            }), completion => record = completion);
+            using var listener = new MeterListener();
+            listener.InstrumentPublished = (instrument, _) =>
+            {
+                if (!IsDispatchDuration(instrument)) return;
+                publications++;
+                replacement.Start();
+            };
+            listener.Start();
+            Assert(publications == 0, "The probe must start before the instrument exists.");
+            Assert((await dispatcher.DispatchAsync<int, int>("test.run", 1, context)).Value == 1);
+            Assert(publications == 1 && record?.TraceId == entry.TraceId && record?.SpanId == entry.SpanId);
+        }
+        else
+        {
+            await CheckFirstPublication(args[0] == publicationFault);
+        }
         return 0;
     }
     catch (Exception error)
@@ -140,6 +168,7 @@ async Task RunPublicationProbe(string argument)
 
 await Check("dispatch-first-publication-fault-preserves-ownership", () => RunPublicationProbe(publicationFault));
 await Check("dispatch-first-publication-allows-reentrant-and-concurrent-callers", () => RunPublicationProbe(publicationReentry));
+await Check("dispatch-completion-captures-entry-before-instrument-publication", () => RunPublicationProbe(publicationTrace));
 
 await Check("dispatch-duration-records-only-bounded-outcomes", async () =>
 {
@@ -232,6 +261,183 @@ await Check("dispatch-duration-records-only-bounded-outcomes", async () =>
         await success.DispatchAsync<int, int>("test.run", 0, context, cts.Token));
     Assert(validMeasurements && outcomes.SequenceEqual(new[] { "success", "failure", "canceled", "fault", "fault", "fault", "success" }),
         $"Valid measurements: {validMeasurements}. Callbacks: {callbacks}. Outcomes: {string.Join(", ", outcomes)}.");
+});
+
+await Check("dispatch-completion-uses-fixed-projection-and-optional-w3c-ids", async () =>
+{
+    var completions = new List<OperationDispatchCompletion>();
+    var registry = new OperationRegistryBuilder().Register<int, int>("test.run", () => new Handler()).Build();
+    var observed = new OperationDispatcher(registry, completions.Add);
+    var privateContext = new OperationContext("private-correlation",
+        new Dictionary<string, string> { ["private-key"] = "private-value" });
+    Assert((await new OperationDispatcher(registry).DispatchAsync<int, int>("test.run", 1, privateContext)).Value == 1);
+    Assert((await new OperationDispatcher(registry, null).DispatchAsync<int, int>("test.run", 2, privateContext)).Value == 2);
+    Assert(completions.Count == 0 && Activity.Current is null);
+    await observed.DispatchAsync<int, int>("test.run", 3, privateContext);
+    using var hierarchical = new Activity("private-activity").SetIdFormat(ActivityIdFormat.Hierarchical).Start();
+    hierarchical.AddBaggage("private-baggage", "private-value");
+    await observed.DispatchAsync<int, int>("test.run", 4, privateContext);
+    Assert(ReferenceEquals(Activity.Current, hierarchical));
+    Assert(completions.Count == 2 && completions.All(record => record.Outcome == OperationDispatchOutcome.Success &&
+        record.TraceId is null && record.SpanId is null && record.Duration >= TimeSpan.Zero));
+    Assert(OperationDispatchCompletion.EventName == "cehpalon.operation.dispatch.completed");
+    var fields = typeof(OperationDispatchCompletion).GetProperties().Select(property => property.Name).Order();
+    Assert(fields.SequenceEqual(new[] { "Duration", "Outcome", "SpanId", "TraceId" }));
+});
+
+await Check("dispatch-completion-only-observes-validated-registered-invocations", async () =>
+{
+    var factoryCalls = 0;
+    var callbacks = 0;
+    var observed = Dispatcher(() => { factoryCalls++; return new Handler(); }, _ => callbacks++);
+    using var canceled = new CancellationTokenSource();
+    canceled.Cancel();
+    await ThrowsAsync<ArgumentException>(() => observed.DispatchAsync<int, int>("Bad", 0, context).AsTask());
+    await ThrowsAsync<ArgumentNullException>(() => observed.DispatchAsync<int, int>("test.run", 0, null!).AsTask());
+    await ThrowsAsync<OperationCanceledException>(() => observed.DispatchAsync<int, int>("test.run", 0, context, canceled.Token).AsTask());
+    Assert((await observed.DispatchAsync<int, int>("unknown", 0, context)).Error.Code == "operation.not_found");
+    Assert((await observed.DispatchAsync<string, int>("test.run", "mismatch", context)).Error.Code == "operation.contract_mismatch");
+    Assert(factoryCalls == 0 && callbacks == 0);
+});
+
+await Check("dispatch-completion-observes-bounded-outcomes-without-changing-results", async () =>
+{
+    var outcomes = new List<OperationDispatchOutcome>();
+    var observerError = new InvalidOperationException("observer fault");
+    OperationDispatcher Observe(Func<IOperationHandler<int, int>> factory) => Dispatcher(factory, completion =>
+    {
+        outcomes.Add(completion.Outcome);
+        throw observerError;
+    });
+
+    Assert((await Observe(() => new Handler()).DispatchAsync<int, int>("test.run", 8, context)).Value == 8);
+    var expectedFailure = new OperationError("test.failure", "Private detail.");
+    var failure = new Handler((_, _, _) => ValueTask.FromResult(OperationResult<int>.Failure(expectedFailure)));
+    Assert(ReferenceEquals((await Observe(() => failure).DispatchAsync<int, int>("test.run", 1, context)).Error, expectedFailure));
+
+    using var cancellation = new CancellationTokenSource();
+    var expectedCancellation = new OperationCanceledException(cancellation.Token);
+    var canceled = new Handler((_, _, _) => { cancellation.Cancel(); throw expectedCancellation; });
+    var actualCancellation = await ThrowsAsync<OperationCanceledException>(() =>
+        Observe(() => canceled).DispatchAsync<int, int>("test.run", 0, context, cancellation.Token).AsTask());
+    Assert(ReferenceEquals(actualCancellation, expectedCancellation));
+
+    var execution = new ApplicationException("execution fault");
+    var executionFault = new Handler((_, _, _) => throw execution);
+    Assert(ReferenceEquals(await ThrowsAsync<ApplicationException>(() =>
+        Observe(() => executionFault).DispatchAsync<int, int>("test.run", 0, context).AsTask()), execution));
+
+    using var cleanupCancellation = new CancellationTokenSource();
+    var cleanup = new OperationCanceledException(cleanupCancellation.Token);
+    var cleanupFault = new Handler(cleanup: () => { cleanupCancellation.Cancel(); throw cleanup; });
+    Assert(ReferenceEquals(await ThrowsAsync<OperationCanceledException>(() =>
+        Observe(() => cleanupFault).DispatchAsync<int, int>("test.run", 0, context, cleanupCancellation.Token).AsTask()), cleanup));
+
+    var bothFault = new Handler((_, _, _) => throw execution, () => throw cleanup);
+    var aggregate = await ThrowsAsync<AggregateException>(() =>
+        Observe(() => bothFault).DispatchAsync<int, int>("test.run", 0, context).AsTask());
+    Assert(aggregate.InnerExceptions.SequenceEqual(new Exception[] { execution, cleanup }));
+    Assert(new[] { failure, canceled, executionFault, cleanupFault, bothFault }.All(handler => handler.DisposeCalls == 1));
+    Assert(outcomes.SequenceEqual(new[] { OperationDispatchOutcome.Success, OperationDispatchOutcome.Failure,
+        OperationDispatchOutcome.Canceled, OperationDispatchOutcome.Fault, OperationDispatchOutcome.Fault,
+        OperationDispatchOutcome.Fault }));
+});
+
+await Check("dispatch-completion-waits-for-cleanup-and-ends-its-clock-before-callback", async () =>
+{
+    var cleanupRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var cleanupStarted = 0L;
+    var cleanupCompleted = 0L;
+    var callbackStarted = 0L;
+    OperationDispatchCompletion? observed = null;
+    var handler = new AsyncHandler(async () =>
+    {
+        cleanupStarted = Stopwatch.GetTimestamp();
+        await cleanupRelease.Task;
+        cleanupCompleted = Stopwatch.GetTimestamp();
+    });
+    var dispatcher = Dispatcher(() => handler, completion =>
+    {
+        callbackStarted = Stopwatch.GetTimestamp();
+        observed = completion;
+    });
+    var beforeDispatch = Stopwatch.GetTimestamp();
+    var pending = dispatcher.DispatchAsync<int, int>("test.run", 9, context);
+    try
+    {
+        Assert(!pending.IsCompleted && handler.AsyncDisposeCalls == 1 && observed is null);
+    }
+    finally
+    {
+        cleanupRelease.TrySetResult();
+    }
+    Assert((await pending.AsTask().WaitAsync(TimeSpan.FromSeconds(5))).Value == 9);
+    Assert(observed is { } record && record.Duration >= Stopwatch.GetElapsedTime(cleanupStarted, cleanupCompleted) &&
+        record.Duration <= Stopwatch.GetElapsedTime(beforeDispatch, callbackStarted) &&
+        callbackStarted >= cleanupCompleted && handler.SyncDisposeCalls == 0);
+});
+
+await Check("dispatch-completion-suppresses-callback-originated-flow-across-awaits", async () =>
+{
+    var callbacks = 0;
+    var nestedCallbacks = 0;
+    var nestedCleanups = 0;
+    var nestedResult = 0;
+    var nested = Dispatcher(() => new Handler(async (request, _, _) =>
+    {
+        await Task.Yield();
+        return OperationResult<int>.Success(request);
+    }, () => Interlocked.Increment(ref nestedCleanups)), _ => Interlocked.Increment(ref nestedCallbacks));
+    var outer = Dispatcher(() => new Handler(), _ =>
+    {
+        callbacks++;
+        nestedResult = Task.Run(async () => (await nested.DispatchAsync<int, int>("test.run", 42, context)).Value)
+            .WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+        throw new ApplicationException("observer fault after nested dispatch");
+    });
+    Assert((await outer.DispatchAsync<int, int>("test.run", 1, context)).Value == 1);
+    Assert(callbacks == 1 && nestedResult == 42 && nestedCleanups == 1 && nestedCallbacks == 0);
+    Assert((await nested.DispatchAsync<int, int>("test.run", 2, context)).Value == 2);
+    Assert(nestedCallbacks == 1 && nestedCleanups == 2);
+});
+
+await Check("dispatch-completion-captures-independent-w3c-contexts-during-overlap", async () =>
+{
+    var bothEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var entered = 0;
+    var records = new System.Collections.Concurrent.ConcurrentQueue<OperationDispatchCompletion>();
+    var dispatcher = Dispatcher(() => new Handler(async (request, _, _) =>
+    {
+        if (Interlocked.Increment(ref entered) == 2) bothEntered.TrySetResult();
+        await release.Task;
+        return OperationResult<int>.Success(request);
+    }), records.Enqueue);
+
+    async Task<(ActivityTraceId, ActivitySpanId)> Invoke(int request)
+    {
+        using var activity = new Activity("private-dispatch-context").SetIdFormat(ActivityIdFormat.W3C).Start();
+        var ids = (activity.TraceId, activity.SpanId);
+        Assert((await dispatcher.DispatchAsync<int, int>("test.run", request, context)).Value == request);
+        Assert(ReferenceEquals(Activity.Current, activity));
+        return ids;
+    }
+
+    var first = Task.Run(() => Invoke(1));
+    var second = Task.Run(() => Invoke(2));
+    try
+    {
+        await bothEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert(records.IsEmpty);
+    }
+    finally
+    {
+        release.TrySetResult();
+    }
+    var expected = await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+    var actual = records.ToArray();
+    Assert(expected[0].Item1 != expected[1].Item1 && actual.Length == 2 &&
+        expected.All(ids => actual.Count(record => record.TraceId == ids.Item1 && record.SpanId == ids.Item2) == 1));
 });
 
 await Check("canonical-id-grammar-and-boundaries", () => Sync(() =>

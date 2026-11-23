@@ -52,3 +52,26 @@ publication proceed without timing. A publication callback that throws leaves
 this process without the histogram until restart. Exceptions from measurement
 callbacks preserve the dispatch result and owned cleanup behavior. Listener
 callbacks run synchronously and should complete promptly.
+
+## Dispatch completion records
+
+Pass a callback to `new OperationDispatcher(registry, completionObserver)` to
+observe eligible dispatches on that instance. A registered, type-matched
+dispatch that passes the initial guards emits one completion after its owned
+handler cleanup. The enum outcome follows the histogram's classification.
+The completion clock begins before possible histogram publication and ends
+before either telemetry callback runs.
+
+The fixed event name is `OperationDispatchCompletion.EventName`. Its record
+contains the outcome, duration, and nullable W3C trace and span IDs copied
+from the entry-time ambient `Activity`. Both IDs are absent when the
+activity is absent or uses a different ID format. The IDs are diagnostic
+values. The host owns structured logging, export and retention.
+
+Callbacks run synchronously outside Core locks and may run concurrently.
+Callback exceptions preserve the result and cleanup behavior. Dispatches
+originating in a callback's flowing `ExecutionContext` skip completion
+notification while retaining normal dispatch behavior. A detached call
+whose execution context does not flow is an independent invocation. Use a
+prompt callback that returns without waiting for its own operation or for an
+enclosing admission budget to drain.

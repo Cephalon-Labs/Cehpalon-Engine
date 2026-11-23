@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 
 namespace Cehpalon.Engine.Core;
@@ -48,6 +49,25 @@ public sealed class OperationContext
 
     public string CorrelationId { get; }
     public IReadOnlyDictionary<string, string> Metadata { get; }
+}
+
+/// <summary>Bounded outcomes shared by the completion observer and dispatch duration histogram.</summary>
+public enum OperationDispatchOutcome
+{
+    Success,
+    Failure,
+    Canceled,
+    Fault
+}
+
+/// <summary>A dispatch outcome and duration through handler cleanup, with optional entry-time W3C IDs.</summary>
+public readonly record struct OperationDispatchCompletion(
+    OperationDispatchOutcome Outcome,
+    TimeSpan Duration,
+    ActivityTraceId? TraceId,
+    ActivitySpanId? SpanId)
+{
+    public const string EventName = "cehpalon.operation.dispatch.completed";
 }
 
 public static class OperationId
