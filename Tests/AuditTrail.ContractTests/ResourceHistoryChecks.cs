@@ -161,6 +161,58 @@ static class ResourceHistoryChecks
             var h = new Harness(); var s = new Source { Page = new(Keys.Select((key, index) => { var row = Row(key); return new TenantChangeAuditRecord(row.Receipt, row.RecordedAtUtc.AddMinutes(-index), row.Mode, row.Fields); })) };
             await h.Run(async c => { var page = await new TenantChangeAuditResourceHistoryReader(s, Policy()).ReadAsync(c, Query()); Require(page.Entries.Select(r => r.Receipt.ReceiptId).SequenceEqual(Keys) && page.Entries[0].RecordedAtUtc > page.Entries[^1].RecordedAtUtc); });
         });
+        await check("resource history accepts a full canonical page after a high-bit bookmark", async () =>
+        {
+            var random = new Random(3701);
+            var bytes = new byte[16];
+            var boundaries = new[] { "00000001-7fff-ffff-ffff-ffffffffffff", "00000001-8000-0000-0000-000000000000",
+                "00000001-8000-7fff-ffff-ffffffffffff", "00000001-8000-8000-0000-000000000000",
+                "00000001-8000-8000-7fff-ffffffffffff", "00000001-8000-8000-8000-000000000000" };
+            var keys = Enumerable.Range(0, 195).Select(_ =>
+            {
+                random.NextBytes(bytes);
+                return new Guid(bytes);
+            }).Concat(boundaries.Select(Guid.Parse)).OrderBy(key => key.ToString("N"), StringComparer.Ordinal).ToArray();
+            var query = Query(200, Cursor(keys[0]));
+            var expected = keys[1..];
+            var next = Cursor(keys[^1]);
+            var source = new Source { Page = new(expected.Select(key => Row(key)), next) };
+            var reader = new TenantChangeAuditResourceHistoryReader(source, Policy());
+            await new Harness().Run(async context =>
+            {
+                var result = await reader.ReadAsync(context, query);
+                Require(result.Entries.Count == 200 && result.Entries.Select(row => row.Receipt.ReceiptId).SequenceEqual(expected));
+                Require(ReferenceEquals(next, result.NextCursor));
+
+                source.Page = new(expected.Reverse().Select(key => Row(key)));
+                await Throws<InvalidOperationException>(() => reader.ReadAsync(context, query).AsTask());
+            });
+        });
+        await check("resource projection matches exact names through a full immutable field rule", async () =>
+        {
+            var fields = Enumerable.Range(0, 60).Select(i => new TenantChangeFieldRule($"field-{i:D2}"))
+                .Concat([new("title", true), new("Title"), new("stable"), new("เอกสาร")]).Reverse().ToArray();
+            var rule = new TenantChangeAuditRule("document.update", "write", "document", fields);
+            var policy = new TenantChangeAuditPolicy(TenantChangeAuditMode.ChangedFields,
+                [new("document.update", "read", "document", [new("TITLE")]), rule]);
+            var original = Row(Keys[0]);
+            var oldValue = TenantChangeValue.Text("old");
+            var newValue = TenantChangeValue.Text("new");
+            var raw = new TenantChangeAuditRecord(original.Receipt, original.RecordedAtUtc, original.Mode,
+                [new("เอกสาร", oldValue, newValue), new("title", oldValue, newValue), new("TITLE", oldValue, newValue),
+                 new("Title", oldValue, newValue), new("field-00", oldValue, newValue), new("field-59", oldValue, newValue),
+                 new("stable", oldValue, oldValue)]);
+            var reader = new TenantChangeAuditResourceHistoryReader(new Source { Page = new([raw]) }, policy);
+            await new Harness().Run(async context =>
+            {
+                var projected = (await reader.ReadAsync(context, Query())).Entries.Single();
+                Require(projected.Mode == TenantChangeAuditMode.ChangedFields && projected.CapturedMode == raw.CapturedMode);
+                Require(projected.Fields.Select(field => field.Name).SequenceEqual(["เอกสาร", "title", "Title", "field-00", "field-59"]));
+                Require(projected.Fields[1].Before.Kind == TenantChangeValueKind.Redacted &&
+                    projected.Fields[1].After.Kind == TenantChangeValueKind.Redacted && projected.Fields[1].WasChanged);
+                Require(projected.Fields[2].Before.Equals(oldValue) && projected.Fields[2].After.Equals(newValue));
+            });
+        });
         await check("resource history caller-constructed bound bookmark needs no row or authenticity", async () =>
         {
             var h = new Harness(); var s = new Source { Page = new([Row(Keys[2])]) }; var query = Query(cursor: Cursor(Keys[1]));

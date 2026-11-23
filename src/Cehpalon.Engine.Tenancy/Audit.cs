@@ -202,6 +202,23 @@ public sealed class TenantChangeAuditRule
     public string Action { get; }
     public string ResourceKind { get; }
     public IReadOnlyList<TenantChangeFieldRule> Fields { get; }
+
+    internal TenantChangeFieldRule? FindField(string name)
+    {
+        // Construction sorts the immutable rule fields using the same ordinal comparer.
+        var low = 0;
+        var high = Fields.Count - 1;
+        while (low <= high)
+        {
+            var middle = low + (high - low) / 2;
+            var field = Fields[middle];
+            var comparison = StringComparer.Ordinal.Compare(field.Name, name);
+            if (comparison == 0) return field;
+            if (comparison < 0) low = middle + 1;
+            else high = middle - 1;
+        }
+        return null;
+    }
 }
 
 /// <summary>Immutable exact project rules. Empty/unmatched rules deny recording; unknown history rules expose metadata only.</summary>
@@ -218,23 +235,34 @@ public sealed class TenantChangeAuditPolicy
     private static (string, string, string) Key(TenantChangeAuditRule r) => (r.OperationId, r.Action, r.ResourceKind);
     public TenantChangeAuditMode Mode { get; }
     public IReadOnlyList<TenantChangeAuditRule> Rules { get; }
-    internal TenantChangeAuditRule? Find(TenantChangeReceipt receipt) => Rules.FirstOrDefault(r =>
-        StringComparer.Ordinal.Equals(r.OperationId, receipt.OperationId) && StringComparer.Ordinal.Equals(r.Action, receipt.Action) &&
-        StringComparer.Ordinal.Equals(r.ResourceKind, receipt.ResourceKind));
+    internal TenantChangeAuditRule? Find(TenantChangeReceipt receipt)
+    {
+        for (var i = 0; i < Rules.Count; i++)
+        {
+            var rule = Rules[i];
+            if (StringComparer.Ordinal.Equals(rule.OperationId, receipt.OperationId) &&
+                StringComparer.Ordinal.Equals(rule.Action, receipt.Action) &&
+                StringComparer.Ordinal.Equals(rule.ResourceKind, receipt.ResourceKind))
+                return rule;
+        }
+        return null;
+    }
     internal TenantChangeAuditRecord Project(TenantChangeAuditRecord record)
     {
-        var rule = Find(record.Receipt);
-        if (Mode is TenantChangeAuditMode.Disabled or TenantChangeAuditMode.MetadataOnly || rule is null)
+        var rule = Mode is TenantChangeAuditMode.Disabled or TenantChangeAuditMode.MetadataOnly || record.Mode == TenantChangeAuditMode.MetadataOnly
+            ? null : Find(record.Receipt);
+        if (rule is null)
             return new(record.Receipt, record.RecordedAtUtc, TenantChangeAuditMode.MetadataOnly, [], record.CapturedMode);
         var projected = new List<TenantChangeField>();
         foreach (var field in record.Fields)
         {
-            var allowed = rule.Fields.FirstOrDefault(f => StringComparer.Ordinal.Equals(f.Name, field.Name));
-            if (allowed is null || Mode == TenantChangeAuditMode.ChangedFields && !field.WasChanged) continue;
+            if (Mode == TenantChangeAuditMode.ChangedFields && !field.WasChanged) continue;
+            var allowed = rule.FindField(field.Name);
+            if (allowed is null) continue;
             projected.Add(allowed.Redact ? new(field.Name, TenantChangeValue.Redacted, TenantChangeValue.Redacted, field.WasChanged) : field);
         }
-        var effective = record.Mode == TenantChangeAuditMode.MetadataOnly ? TenantChangeAuditMode.MetadataOnly
-            : Mode == TenantChangeAuditMode.ChangedFields || record.Mode == TenantChangeAuditMode.ChangedFields ? TenantChangeAuditMode.ChangedFields : TenantChangeAuditMode.BeforeAfterSnapshots;
+        var effective = Mode == TenantChangeAuditMode.ChangedFields || record.Mode == TenantChangeAuditMode.ChangedFields
+            ? TenantChangeAuditMode.ChangedFields : TenantChangeAuditMode.BeforeAfterSnapshots;
         return new(record.Receipt, record.RecordedAtUtc, effective, projected, record.CapturedMode);
     }
 }
@@ -1111,14 +1139,15 @@ public sealed class TenantChangeAuditResourceHistoryReader
             var page = await source.ReadAsync(context.Tenant, query, budget?.Token ?? cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested(); budget?.Demand(); context.DemandAccess(context.Tenant, "audit-trail", "tenant", "read");
             if (page is null || page.Entries.Count > query.Limit) throw new InvalidOperationException("Resource history source returned an invalid page.");
-            var previous = query.Continuation?.AfterReceiptId.ToString("N");
+            var previous = query.Continuation?.AfterReceiptId;
             foreach (var record in page.Entries)
             {
-                var receipt = record.Receipt; var key = receipt.ReceiptId.ToString("N");
+                var receipt = record.Receipt;
+                // Guid.CompareTo compares the canonical fields as unsigned components, matching lowercase Guid-N ordinal order.
                 if (!context.Tenant.Equals(receipt.Tenant) || !StringComparer.Ordinal.Equals(query.ResourceKind, receipt.ResourceKind) ||
-                    !StringComparer.Ordinal.Equals(query.ResourceId, receipt.ResourceId) || previous is not null && StringComparer.Ordinal.Compare(key, previous) <= 0)
+                    !StringComparer.Ordinal.Equals(query.ResourceId, receipt.ResourceId) || previous is { } key && receipt.ReceiptId.CompareTo(key) <= 0)
                     throw new InvalidOperationException("Resource history source returned an invalid identity or receipt order.");
-                previous = key;
+                previous = receipt.ReceiptId;
             }
             if (page.NextCursor is { } next && (page.Entries.Count == 0 || !Bound(next, context.Tenant, query) ||
                 next.AfterReceiptId == Guid.Empty || next.AfterReceiptId != page.Entries[^1].Receipt.ReceiptId))
