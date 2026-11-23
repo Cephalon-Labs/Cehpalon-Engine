@@ -133,6 +133,12 @@ await Check("http-and-graphql-share-actual-budget-and-admit-after-release", asyn
     var recovered = await Post(Envelope(query)).WaitAsync(deadline.Token);
     Assert(recovered.Status == 200 && !recovered.Body.Contains("errors") && fixture.BudgetFactories == 2, recovered.Body);
 });
+await Check("audit-read-timeout-is-a-redacted-graphql-field-error", async () =>
+{
+    var response = await Post(Query(8));
+    Assert(response.Status == 200 && Code(response.Body) == TransportErrors.AuditReadTimeoutCode, response.Body);
+    Assert(response.Body.Contains("The audit read deadline expired.") && !response.Body.Contains("private"), response.Body);
+});
 foreach(var id in new[]{3,4,6})
 await Check("unexpected-fault-is-safe-internal-error-"+id,async () =>
 { Fixture.Reset();var r=await Post(Query(id));Assert(r.Status==200 && Code(r.Body)=="internal.error" && !r.Body.Contains("secret") && !r.Body.Contains("exception",StringComparison.OrdinalIgnoreCase),r.Body); });
@@ -233,6 +239,7 @@ public sealed class Fixture : ITransportOperationDispatcher
         if(input.Id==3) throw new InvalidOperationException("secret exception");
         if(input.Id==7) return OperationResult<TResponse>.Failure(new(
             OperationConcurrencyBudget.CapacityExceededCode, "private capacity details"));
+        if(input.Id==8) return OperationResult<TResponse>.Failure(new(TransportErrors.AuditReadTimeoutCode, "private database detail"));
         if(input.Id==4) throw new OperationCanceledException("secret cancelled but request active");
         if(input.Id==6) throw new HotChocolate.GraphQLException(HotChocolate.ErrorBuilder.New().SetMessage("secret GraphQL exception").SetExtension("private","secret").Build());
         if(input.Id==5){Entered.TrySetResult();try{await Task.Delay(Timeout.InfiniteTimeSpan,cancellationToken);}catch(OperationCanceledException){Cancelled.TrySetResult();throw;}}

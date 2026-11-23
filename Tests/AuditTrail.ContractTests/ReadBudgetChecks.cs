@@ -25,6 +25,7 @@ static class ReadBudgetChecks
                 "ctor" => new TenantChangeAuditHistoryReader(source, policy),
                 "legacy" => TenantChangeAuditHistoryReader.Activate(policy, Get),
                 "budget-alias" => TenantChangeAuditHistoryReader.ActivateWithBudget(policy, timeout, Get),
+                "typed-timeout" => TenantChangeAuditHistoryReader.ActivateWithReadTimeout(policy, timeout, Get, distinguishTimeout: true),
                 _ => TenantChangeAuditHistoryReader.ActivateWithReadTimeout(policy, timeout, Get)
             },
             1 => mode switch
@@ -32,6 +33,7 @@ static class ReadBudgetChecks
                 "ctor" => new TenantChangeAuditLookupReader(source, policy),
                 "legacy" => TenantChangeAuditLookupReader.Activate(policy, Get),
                 "budget-alias" => TenantChangeAuditLookupReader.ActivateWithBudget(policy, timeout, Get),
+                "typed-timeout" => TenantChangeAuditLookupReader.ActivateWithReadTimeout(policy, timeout, Get, distinguishTimeout: true),
                 _ => TenantChangeAuditLookupReader.ActivateWithReadTimeout(policy, timeout, Get)
             },
             _ => mode switch
@@ -39,6 +41,7 @@ static class ReadBudgetChecks
                 "ctor" => new TenantChangeAuditResourceHistoryReader(source, policy),
                 "legacy" => TenantChangeAuditResourceHistoryReader.Activate(policy, Get),
                 "budget-alias" => TenantChangeAuditResourceHistoryReader.ActivateWithBudget(policy, timeout, Get),
+                "typed-timeout" => TenantChangeAuditResourceHistoryReader.ActivateWithReadTimeout(policy, timeout, Get, distinguishTimeout: true),
                 _ => TenantChangeAuditResourceHistoryReader.ActivateWithReadTimeout(policy, timeout, Get)
             }
         };
@@ -136,8 +139,31 @@ static class ReadBudgetChecks
                 await h.Run(async c =>
                 {
                     var pending = Read(Activate(lane, s, Short)!, c);
-                    try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); signals.Finish.TrySetResult(); Require(ReferenceEquals((await Throws<TimeoutException>(() => pending)).InnerException, original)); }
+                    try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); signals.Finish.TrySetResult(); var failure = await Throws<TimeoutException>(() => pending); Require(failure.GetType() == typeof(TimeoutException) && ReferenceEquals(failure.InnerException, original)); }
                     finally { signals.Finish.TrySetResult(); await Join(pending); }
+                });
+            });
+            await Case("typed timeout opt-in only classifies the reader deadline", async () =>
+            {
+                var h = new Harness(); var s = new Source(); var signals = new Signals(); OperationCanceledException? original = null;
+                s.Hook = async token => { await signals.Cancellation(token); original = new(token); throw original; };
+                await h.Run(async c =>
+                {
+                    var reader = Activate(lane, s, Short, "typed-timeout")!;
+                    var pending = Read(reader, c);
+                    try
+                    {
+                        await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                        await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                        signals.Finish.TrySetResult();
+                        Require(ReferenceEquals((await Throws<TenantChangeAuditReadTimeoutException>(() => pending)).InnerException, original));
+                    }
+                    finally { signals.Finish.TrySetResult(); await Join(pending); }
+
+                    var foreign = new TimeoutException("Controlled provider fault.");
+                    s.Hook = _ => throw foreign;
+                    Require(ReferenceEquals(await Throws<TimeoutException>(() => Read(reader, c)), foreign));
+                    Require(ReferenceEquals(await Throws<TimeoutException>(() => Read(Activate(lane, s, null, "typed-timeout")!, c)), foreign));
                 });
             });
             await Case("caller cancellation normalizes original token and inner", async () =>
@@ -157,7 +183,7 @@ static class ReadBudgetChecks
                 s.Hook = async token => { await signals.Hold(token); caller.Cancel(); original = new(token); throw original; };
                 await h.Run(async c =>
                 {
-                    var pending = Read(Activate(lane, s, Short)!, c, caller.Token);
+                    var pending = Read(Activate(lane, s, Short, "typed-timeout")!, c, caller.Token);
                     try { await signals.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await signals.Expired.Task.WaitAsync(TimeSpan.FromSeconds(5)); Require(!caller.IsCancellationRequested && !pending.IsCompleted); signals.Finish.TrySetResult(); var error = await Throws<OperationCanceledException>(() => pending); Require(error.CancellationToken == caller.Token && ReferenceEquals(error.InnerException, original)); }
                     finally { signals.Finish.TrySetResult(); await Join(pending); }
                 });

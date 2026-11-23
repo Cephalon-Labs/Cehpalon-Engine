@@ -228,6 +228,15 @@ await Check("intentional-business-errors-have-explicit-status", async () =>
         Assert(context.Response.StatusCode == status && Body(context).Contains(code));
     }
 });
+await Check("audit-read-timeout-error-is-generic-gateway-timeout", async () =>
+{
+    var context = Context(probe: new Probe { ResultError = new(TransportErrors.AuditReadTimeoutCode, "private database detail") });
+    await OperationHttpAdapter.ExecuteAsync(context, binding);
+    using var json = JsonDocument.Parse(Body(context));
+    Assert(context.Response.StatusCode == 504 && json.RootElement.GetProperty("status").GetInt32() == 504);
+    Assert(json.RootElement.GetProperty("code").GetString() == TransportErrors.AuditReadTimeoutCode);
+    Assert(Body(context).Contains("The audit read deadline expired.") && !Body(context).Contains("private"));
+});
 await Check("unexpected-fault-is-safe-internal-error", async () =>
 {
     var context = Context(probe: new Probe { Fault = new InvalidOperationException("private infrastructure detail") });

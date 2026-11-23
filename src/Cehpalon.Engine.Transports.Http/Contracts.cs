@@ -36,6 +36,7 @@ public static class TransportErrors
     public const string AccessDeniedCode = "access.denied";
     public const string CancelledCode = "operation.cancelled";
     public const string InternalCode = "internal.error";
+    public const string AuditReadTimeoutCode = "audit.read_timeout";
     public static OperationError ValidationFailed() => new(ValidationCode, "Request validation failed.");
     public static OperationError AccessDenied() => new(AccessDeniedCode, "Access denied.");
     public static OperationError InternalError() => new(InternalCode, "An internal error occurred.");
@@ -43,10 +44,13 @@ public static class TransportErrors
     private static readonly OperationError CapacityUnavailable = new(
         OperationConcurrencyBudget.CapacityExceededCode, "Operation capacity is temporarily unavailable.");
 
-    /// <summary>Use fixed public messages for reserved authority and capacity failures.</summary>
+    public static OperationError AuditReadTimeout() => new(AuditReadTimeoutCode, "The audit read deadline expired.");
+
+    /// <summary>Use fixed public messages for reserved authority, capacity and audit timeout failures.</summary>
     public static OperationError ForClient(OperationError error) => error.Code switch
     {
         AccessDeniedCode => AccessDenied(),
+        AuditReadTimeoutCode => AuditReadTimeout(),
         OperationConcurrencyBudget.CapacityExceededCode => CapacityUnavailable,
         _ => error
     };

@@ -170,6 +170,7 @@ public static class OperationHttpAdapter
             "resource.not_found" => 404,
             "resource.conflict" => 409,
             OperationConcurrencyBudget.CapacityExceededCode => 503,
+            TransportErrors.AuditReadTimeoutCode => 504,
             TransportErrors.InternalCode => 500,
             _ => 422
         };
