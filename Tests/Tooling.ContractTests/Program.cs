@@ -49,6 +49,26 @@ CliResult Invoke(string[] arguments, IToolingFileSystem? fileSystem = null)
 }
 CliResult Run(params string[] arguments) => Invoke(arguments);
 
+void AssertDiagnostic(CliResult result, string code, string? redacted = null, string? nestedCode = null)
+{
+    Assert(result.Code == 2, "Expected validation exit 2.");
+    Assert(result.Output.Length == 0, "Validation errors must not write to stdout.");
+    if (redacted is not null)
+        Assert(!result.Error.Contains(redacted, StringComparison.Ordinal), "Diagnostic echoed rejected input.");
+    using var json = JsonDocument.Parse(result.Error);
+    var error = json.RootElement;
+    Assert(error.GetProperty("success").ValueKind == JsonValueKind.False);
+    Assert(error.GetProperty("code").GetString() == code, "Unexpected diagnostic code; expected " + code);
+    Assert(!string.IsNullOrWhiteSpace(error.GetProperty("message").GetString()));
+    if (nestedCode is not null)
+    {
+        var diagnostics = error.GetProperty("diagnostics");
+        Assert(diagnostics.EnumerateArray().Any(diagnostic => diagnostic.GetProperty("code").GetString() == nestedCode));
+        Assert(diagnostics.EnumerateArray().All(diagnostic => diagnostic.GetProperty("path").GetString() == "$.Cehpalon"
+            && !string.IsNullOrWhiteSpace(diagnostic.GetProperty("message").GetString())));
+    }
+}
+
 string[] NewArguments(string target, string name = "Demo", string? root = null)
     => ["new", "--name", name, "--output", target, "--engine-root", root ?? engineRoot];
 
@@ -144,7 +164,25 @@ foreach (var invocation in new (string Name, string[] Arguments)[]
     Check(invocation.Name, () => UsageWithoutFiles(invocation.Arguments));
 }
 
-foreach (var name in new[] { "", "lower", "0Demo", "With-Dash", "With.Space", "With Space", "../Escape", "A/B", "A\\B", "ไทย", "Demo\nInjected", "CON", "PRN", "AUX", "NUL", "COM1", "LPT9", "Com1", new string('A', 65) })
+foreach (var scenario in new (string Name, string Code, string[] ProfileArguments)[]
+{
+    ("unsupported", "usage.profile", ["--profile", "rejected-profile-fixture"]),
+    ("duplicate", "usage.duplicate", ["--profile", "small-api", "--profile", "rejected-profile-fixture"]),
+    ("missing-value", "usage.value", ["--profile"])
+})
+{
+    Check("validate-profile-diagnostic-" + scenario.Name, () =>
+    {
+        var parent = Scope();
+        var config = Path.Combine(parent, "missing.json");
+        const string rejectedProfile = "rejected-profile-fixture";
+        AssertDiagnostic(Run(["validate", "--config", config, .. scenario.ProfileArguments]), scenario.Code,
+            scenario.ProfileArguments.Contains(rejectedProfile, StringComparer.Ordinal) ? rejectedProfile : null);
+        AssertNoPublish(parent, config);
+    });
+}
+
+foreach (var name in new[] { "", "lower", "0Demo", "With-Dash", "With.Space", "With Space", "../Escape", "A/B", "A\\B", "ไทย", "Demo\nInjected", "CON", "PRN", "AUX", "NUL", "LPT9", "Com1", new string('A', 65) })
 {
     var description = name.Length > 20 ? "length-" + name.Length : name.Replace("\n", "\\n", StringComparison.Ordinal);
     Check("invalid-name-before-publish-" + description, () =>
@@ -619,7 +657,7 @@ foreach (var setting in new (string Name, string From, string To)[]
         File.WriteAllText(path, original.Replace(setting.From, setting.To, StringComparison.Ordinal), new UTF8Encoding(false));
         var before = Snapshot(parent);
         var result = Run("validate", "--config", path);
-        Assert(result.Code == 2, "Unsupported config combination must be exit2.");
+        AssertDiagnostic(result, "config.invalid", setting.To, "CFG_PROFILE");
         SameSnapshot(before, parent);
     });
 }
@@ -752,7 +790,7 @@ foreach (var capability in new[] { "worker", "database", "cache", "broker", "ai"
         config["Cehpalon"]!["Modules"]![capability] = new System.Text.Json.Nodes.JsonObject { ["Enabled"] = true };
         File.WriteAllText(path, config.ToJsonString()); var before = Snapshot(target);
         var result = Run("validate", "--profile", "small-api", "--config", path);
-        Assert(result.Code == 2 && result.Output.Length == 0); SameSnapshot(before, target);
+        AssertDiagnostic(result, "config.capability"); SameSnapshot(before, target);
     });
 }
 
