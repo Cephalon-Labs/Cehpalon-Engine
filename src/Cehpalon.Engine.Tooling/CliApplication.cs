@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Cehpalon.Engine.Composition;
 
 namespace Cehpalon.Engine.Tooling;
@@ -67,8 +68,12 @@ public static class CliApplication
         }
         catch (ConfigurationFailure failure)
         {
+            // CFG_PROFILE details contain only fixed schema field names and supported literals.
+            // Other diagnostics can include input-derived paths and must stay redacted.
             Write(error, new { success = false, code = "config.invalid", message = "Configuration was rejected before activation.",
-                    diagnostics = failure.Diagnostics.Select(diagnostic => new { diagnostic.Code, path = "$.Cehpalon", message = "Configuration violates the selected profile." }) });
+                    diagnostics = failure.Diagnostics.Select(diagnostic => new CliConfigurationDiagnostic(
+                        diagnostic.Code, "$.Cehpalon", "Configuration violates the selected profile.",
+                        diagnostic.Code == "CFG_PROFILE" ? $"{diagnostic.Path}: {diagnostic.Message}" : null)) });
             return 2;
         }
         catch (PathFailure failure)
@@ -324,6 +329,8 @@ public static class CliApplication
 
     private static void Write(TextWriter writer, object value) => writer.WriteLine(JsonSerializer.Serialize(value, JsonOptions));
     private sealed record SourceInput(string Path, string Sha256, long Bytes);
+    private sealed record CliConfigurationDiagnostic(string Code, string Path, string Message,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Hint);
     private sealed class UsageFailure(string code, string message) : Exception(message) { public string Code { get; } = code; }
     private sealed class PathFailure(string code, string message) : Exception(message) { public string Code { get; } = code; }
     private sealed class ConfigurationFailure(IReadOnlyList<CompositionDiagnostic> diagnostics) : Exception

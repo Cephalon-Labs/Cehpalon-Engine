@@ -662,6 +662,36 @@ foreach (var setting in new (string Name, string From, string To)[]
     });
 }
 
+foreach (var profile in new[] { "portable-request-reply", "small-api" })
+foreach (var setting in new (string Field, string Supported)[]
+{
+    ("Architecture", "Modular"),
+    ("Topology", "SingleProcess"),
+    ("Pattern", "RequestReply")
+})
+{
+    Check($"{profile}-unsupported-{setting.Field}-suggests-supported-value", () =>
+    {
+        var parent = Scope();
+        var target = Path.Combine(parent, "consumer");
+        Assert(Run([.. NewArguments(target), "--profile", profile]).Code == 0);
+        var path = Path.Combine(target, "appsettings.json");
+        var config = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!;
+        const string rejectedValue = "rejected-tuple-value-fixture";
+        config["Cehpalon"]![setting.Field] = rejectedValue;
+        File.WriteAllText(path, config.ToJsonString());
+        var before = Snapshot(parent);
+        var result = Run("validate", "--profile", profile, "--config", path);
+        AssertDiagnostic(result, "config.invalid", rejectedValue, "CFG_PROFILE");
+        using var error = JsonDocument.Parse(result.Error);
+        var diagnostic = error.RootElement.GetProperty("diagnostics").EnumerateArray().Single();
+        Assert(diagnostic.TryGetProperty("hint", out var hint)
+            && hint.GetString() == $"$.Cehpalon.{setting.Field}: Only {setting.Supported} is supported in schema 1.",
+            "Expected a hint naming the rejected setting and its supported value.");
+        SameSnapshot(before, parent);
+    });
+}
+
 Check("unknown-module-config-diagnostic-does-not-disclose-module-key", () =>
 {
     var parent = Scope();
@@ -675,6 +705,10 @@ Check("unknown-module-config-diagnostic-does-not-disclose-module-key", () =>
     var result = Run("validate", "--config", path);
     Assert(result.Code == 2);
     Assert(!(result.Output + result.Error).Contains("SUPER_SECRET_CONFIG_VALUE", StringComparison.Ordinal), "Unknown module key leaked in diagnostic code/path/message.");
+    using var error = JsonDocument.Parse(result.Error);
+    var diagnostic = error.RootElement.GetProperty("diagnostics").EnumerateArray().Single();
+    Assert(diagnostic.GetProperty("code").GetString() == "CFG_UNKNOWN_MODULE" && !diagnostic.TryGetProperty("hint", out _),
+        "Only unsupported profile tuple diagnostics may include a hint.");
     SameSnapshot(before, parent);
 });
 
