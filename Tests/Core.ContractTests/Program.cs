@@ -440,6 +440,54 @@ await Check("dispatch-completion-captures-independent-w3c-contexts-during-overla
         expected.All(ids => actual.Count(record => record.TraceId == ids.Item1 && record.SpanId == ids.Item2) == 1));
 });
 
+const string traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+const string parentSpanId = "00f067aa0ba902b7";
+const string validTraceParent = "00-" + traceId + "-" + parentSpanId + "-01";
+
+foreach (var (flagsHex, flags) in new[] { ("00", 0), ("01", 1), ("af", 0xaf) })
+{
+    await Check($"traceparent-accepts-55-characters-with-flags-{flagsHex}", () => Sync(() =>
+    {
+        var value = validTraceParent[..^2] + flagsHex;
+        Assert(value.Length == 55);
+        var parsed = TraceParent.ParseOrNull([value]);
+        Assert(parsed is { } result &&
+            result.TraceId == ActivityTraceId.CreateFromString(traceId) &&
+            result.ParentSpanId == ActivitySpanId.CreateFromString(parentSpanId) && result.Flags == flags);
+    }));
+}
+
+Task RejectTraceParent(string reason, params string?[] values) =>
+    Check($"traceparent-rejects-{reason}", () => Sync(() => Assert(TraceParent.ParseOrNull(values) is null)));
+
+await RejectTraceParent("absent", []);
+await RejectTraceParent("null-value", [null]);
+await RejectTraceParent("empty-value", "");
+await RejectTraceParent("duplicate-values", validTraceParent, validTraceParent);
+await RejectTraceParent("multiple-values-even-if-one-is-empty", "", validTraceParent);
+await RejectTraceParent("comma-combined-values", validTraceParent + "," + validTraceParent);
+await RejectTraceParent("54-characters", validTraceParent[..^1]);
+await RejectTraceParent("56-characters", validTraceParent + "0");
+await RejectTraceParent("uppercase-trace-id", $"00-{traceId.ToUpperInvariant()}-{parentSpanId}-01");
+await RejectTraceParent("uppercase-parent-id", $"00-{traceId}-{parentSpanId.ToUpperInvariant()}-01");
+await RejectTraceParent("uppercase-flags", validTraceParent[..^2] + "aF");
+await RejectTraceParent("non-ascii-hex-lookalike", validTraceParent[..^1] + "\uFF11");
+await RejectTraceParent("unsupported-version", "01" + validTraceParent[2..]);
+await RejectTraceParent("invalid-version-ff", "ff" + validTraceParent[2..]);
+await RejectTraceParent("zero-trace-id", $"00-{new string('0', 32)}-{parentSpanId}-01");
+await RejectTraceParent("zero-parent-id", $"00-{traceId}-{new string('0', 16)}-01");
+await RejectTraceParent("non-hex-flags", validTraceParent[..^1] + "g");
+await RejectTraceParent("whitespace-padding", " " + validTraceParent);
+foreach (var index in new[] { 2, 35, 52 })
+    await RejectTraceParent($"bad-separator-at-{index}", validTraceParent[..index] + ":" + validTraceParent[(index + 1)..]);
+
+await Check("traceparent-invalid-input-never-throws-or-yields-a-partial-result", () => Sync(() =>
+{
+    for (var index = 0; index < validTraceParent.Length; index++)
+        Assert(TraceParent.ParseOrNull([validTraceParent[..index] + '\0' + validTraceParent[(index + 1)..]]) is null,
+            $"Invalid character at offset {index} must be treated as absent.");
+}));
+
 await Check("canonical-id-grammar-and-boundaries", () => Sync(() =>
 {
     foreach (var value in new[] { "a", "test.run-1_v2", new string('a', 128) }) Assert(OperationId.IsValid(value));
