@@ -44,14 +44,18 @@ public static class TransportErrors
     private static readonly OperationError CapacityUnavailable = new(
         OperationConcurrencyBudget.CapacityExceededCode, "Operation capacity is temporarily unavailable.");
 
+    private static readonly OperationError OperationDeadlineExpired = new(
+        OperationDeadline.DeadlineExceededCode, "The operation deadline expired.");
+
     public static OperationError AuditReadTimeout() => new(AuditReadTimeoutCode, "The audit read deadline expired.");
 
-    /// <summary>Use fixed public messages for reserved authority, capacity and audit timeout failures.</summary>
+    /// <summary>Use fixed public messages for reserved authority, capacity and deadline failures.</summary>
     public static OperationError ForClient(OperationError error) => error.Code switch
     {
         AccessDeniedCode => AccessDenied(),
         AuditReadTimeoutCode => AuditReadTimeout(),
         OperationConcurrencyBudget.CapacityExceededCode => CapacityUnavailable,
+        OperationDeadline.DeadlineExceededCode => OperationDeadlineExpired,
         _ => error
     };
 }

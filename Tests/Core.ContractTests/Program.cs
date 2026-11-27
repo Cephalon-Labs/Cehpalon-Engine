@@ -740,6 +740,219 @@ await Check("core-assembly-has-only-bcl-references", () => Sync(() =>
     Assert(names.All(x => x.StartsWith("System.", StringComparison.Ordinal) || x == "netstandard"), string.Join(",", names));
 }));
 
+var shortDeadline = TimeSpan.FromMilliseconds(50);
+var longDeadline = TimeSpan.FromHours(1);
+var deadlineWatchdog = TimeSpan.FromSeconds(10); // Only a hang guard, not a timing assertion.
+
+void AssertDeadlineFailure(OperationResult<int> result)
+{
+    Assert(OperationDeadline.DeadlineExceededCode == "operation.deadline_exceeded");
+    Assert(!result.IsSuccess && result.Error.Code == OperationDeadline.DeadlineExceededCode &&
+        result.Error.Message == "The operation deadline expired.");
+}
+
+await Check("operation-deadline-validates-timeout-bounds", () => Sync(() =>
+{
+    foreach (var timeout in new[] { TimeSpan.Zero, TimeSpan.FromTicks(-1), longDeadline.Add(TimeSpan.FromTicks(1)) })
+        Assert(Throws<ArgumentOutOfRangeException>(() => new OperationDeadline(timeout)).ParamName == "timeout");
+    Assert(new OperationDeadline(longDeadline).Timeout == longDeadline);
+    Assert(new OperationDeadline(TimeSpan.FromTicks(1)).Timeout == TimeSpan.FromTicks(1));
+}));
+await Check("operation-deadline-rejects-null-operation", async () =>
+{
+    var error = await ThrowsAsync<ArgumentNullException>(() => new OperationDeadline(longDeadline).ExecuteAsync<int>(null!).AsTask());
+    Assert(error.ParamName == "operation");
+});
+await Check("operation-deadline-pre-canceled-caller-skips-operation", async () =>
+{
+    using var caller = new CancellationTokenSource();
+    caller.Cancel();
+    var clock = new DeadlineTestClock();
+    var calls = 0;
+    var error = await ThrowsAsync<OperationCanceledException>(() => new OperationDeadline(longDeadline, clock)
+        .ExecuteAsync(_ => { calls++; return ValueTask.FromResult(OperationResult<int>.Success(1)); }, caller.Token).AsTask());
+    Assert(error.CancellationToken == caller.Token && calls == 0 && clock.Timer is null);
+});
+await Check("operation-deadline-preserves-immediate-success-and-business-failure", async () =>
+{
+    var deadline = new OperationDeadline(longDeadline);
+    var calls = 0;
+    foreach (var result in new[] { OperationResult<int>.Success(7), OperationResult<int>.Failure(new("business.denied", "Denied.")) })
+    {
+        var actual = await deadline.ExecuteAsync(token =>
+        {
+            calls++;
+            Assert(token.CanBeCanceled && !token.IsCancellationRequested);
+            return ValueTask.FromResult(result);
+        });
+        Assert(ReferenceEquals(actual, result));
+    }
+    Assert(calls == 2);
+});
+await Check("operation-deadline-default-clock-expiry-returns-exact-failure", async () =>
+{
+    var calls = 0;
+    var result = await new OperationDeadline(shortDeadline, timeProvider: null).ExecuteAsync<int>(async token =>
+    {
+        calls++;
+        await Task.Delay(Timeout.InfiniteTimeSpan, token);
+        return OperationResult<int>.Success(1);
+    }).AsTask().WaitAsync(deadlineWatchdog);
+    AssertDeadlineFailure(result);
+    Assert(calls == 1);
+});
+await Check("operation-deadline-does-not-abandon-work-that-ignores-cancellation", async () =>
+{
+    var clock = new DeadlineTestClock();
+    var entered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var expected = OperationResult<int>.Success(7);
+    var pending = new OperationDeadline(shortDeadline, clock).ExecuteAsync(async token =>
+    {
+        entered.SetResult(token);
+        await release.Task;
+        return expected;
+    }).AsTask();
+    try
+    {
+        var token = await entered.Task.WaitAsync(deadlineWatchdog);
+        Assert(clock.Timer?.DueTime == shortDeadline && !token.IsCancellationRequested);
+        clock.Expire();
+        Assert(token.IsCancellationRequested && !pending.IsCompleted);
+    }
+    finally { release.TrySetResult(); }
+    Assert(ReferenceEquals(await pending.WaitAsync(deadlineWatchdog), expected) && clock.Timer?.Disposed == true);
+});
+await Check("operation-deadline-caller-cancellation-reaches-linked-token", async () =>
+{
+    using var caller = new CancellationTokenSource();
+    var clock = new DeadlineTestClock();
+    var error = await ThrowsAsync<OperationCanceledException>(() => new OperationDeadline(longDeadline, clock)
+        .ExecuteAsync<int>(async token =>
+        {
+            Assert(token != caller.Token && !token.IsCancellationRequested);
+            caller.Cancel();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            return OperationResult<int>.Success(1);
+        }, caller.Token).AsTask().WaitAsync(deadlineWatchdog));
+    Assert(error.CancellationToken == caller.Token && clock.Timer?.Disposed == true);
+});
+await Check("operation-deadline-caller-cancellation-wins-after-expiry", async () =>
+{
+    using var caller = new CancellationTokenSource();
+    var clock = new DeadlineTestClock();
+    var error = await ThrowsAsync<OperationCanceledException>(() => new OperationDeadline(shortDeadline, clock)
+        .ExecuteAsync<int>(async token =>
+        {
+            clock.Expire();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            catch (OperationCanceledException) { caller.Cancel(); throw; }
+            return OperationResult<int>.Success(1);
+        }, caller.Token).AsTask().WaitAsync(deadlineWatchdog));
+    Assert(error.CancellationToken == caller.Token);
+});
+await Check("operation-deadline-preserves-foreign-cancellation-after-expiry", async () =>
+{
+    using var foreign = new CancellationTokenSource();
+    foreign.Cancel();
+    var expected = new OperationCanceledException(foreign.Token);
+    var clock = new DeadlineTestClock();
+    var actual = await ThrowsAsync<OperationCanceledException>(() => new OperationDeadline(shortDeadline, clock)
+        .ExecuteAsync<int>(async token =>
+        {
+            clock.Expire();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            catch (OperationCanceledException) { throw expected; }
+            return OperationResult<int>.Success(1);
+        }).AsTask().WaitAsync(deadlineWatchdog));
+    Assert(ReferenceEquals(actual, expected));
+});
+await Check("operation-deadline-does-not-convert-token-match-before-expiry", async () =>
+{
+    OperationCanceledException? expected = null;
+    var clock = new DeadlineTestClock();
+    var actual = await ThrowsAsync<OperationCanceledException>(() => new OperationDeadline(longDeadline, clock)
+        .ExecuteAsync<int>(token =>
+        {
+            expected = new OperationCanceledException(token);
+            throw expected;
+        }).AsTask());
+    Assert(ReferenceEquals(actual, expected) && clock.Timer?.Disposed == true);
+});
+await Check("operation-deadline-preserves-dispatch-handler-fault", async () =>
+{
+    var expected = new ApplicationException("handler fault");
+    var handler = new Handler((_, _, _) => throw expected);
+    var clock = new DeadlineTestClock();
+    var actual = await ThrowsAsync<ApplicationException>(() => new OperationDeadline(longDeadline, clock)
+        .DispatchAsync<int, int>(Dispatcher(() => handler), "test.run", 1, context).AsTask());
+    Assert(ReferenceEquals(actual, expected) && handler.DisposeCalls == 1 && clock.Timer?.Disposed == true);
+});
+await Check("operation-deadline-rejects-null-result", async () =>
+{
+    var clock = new DeadlineTestClock();
+    await ThrowsAsync<InvalidOperationException>(() => new OperationDeadline(longDeadline, clock)
+        .ExecuteAsync(_ => ValueTask.FromResult<OperationResult<int>>(null!)).AsTask());
+    Assert(clock.Timer?.Disposed == true);
+});
+await Check("operation-deadline-dispatch-validates-arguments-before-work", async () =>
+{
+    var clock = new DeadlineTestClock();
+    var deadline = new OperationDeadline(longDeadline, clock);
+    var calls = 0;
+    var dispatcher = Dispatcher(() => { calls++; return new Handler(); });
+    using var canceled = new CancellationTokenSource();
+    canceled.Cancel();
+    Assert((await ThrowsAsync<ArgumentNullException>(() => deadline
+        .DispatchAsync<int, int>(null!, "Bad", 1, null!, canceled.Token).AsTask())).ParamName == "dispatcher");
+    Assert((await ThrowsAsync<ArgumentException>(() => deadline
+        .DispatchAsync<int, int>(dispatcher, "Bad", 1, null!, canceled.Token).AsTask())).ParamName == "value");
+    Assert((await ThrowsAsync<ArgumentNullException>(() => deadline
+        .DispatchAsync<int, int>(dispatcher, "test.run", 1, null!, canceled.Token).AsTask())).ParamName == "context");
+    Assert((await ThrowsAsync<OperationCanceledException>(() => deadline
+        .DispatchAsync<int, int>(dispatcher, "test.run", 1, context, canceled.Token).AsTask())).CancellationToken == canceled.Token);
+    Assert(calls == 0 && clock.Timer is null);
+});
+await Check("operation-deadline-dispatch-runs-registered-handler-and-disposes-timer", async () =>
+{
+    var clock = new DeadlineTestClock();
+    var handler = new Handler((request, suppliedContext, token) =>
+    {
+        Assert(ReferenceEquals(suppliedContext, context) && !token.IsCancellationRequested);
+        return ValueTask.FromResult(OperationResult<int>.Success(request * 2));
+    });
+    var result = await new OperationDeadline(longDeadline, clock)
+        .DispatchAsync<int, int>(Dispatcher(() => handler), "test.run", 6, context);
+    Assert(result.Value == 12 && handler.DisposeCalls == 1 && clock.Timer?.Disposed == true);
+});
+
+foreach (var useBudget in new[] { false, true })
+    await Check(useBudget ? "operation-deadline-expiry-releases-concurrency-permit" :
+        "operation-deadline-dispatch-expiry-disposes-handler-and-observes-canceled", async () =>
+    {
+        var clock = new DeadlineTestClock();
+        var deadline = new OperationDeadline(shortDeadline, clock);
+        var budget = new OperationConcurrencyBudget(1);
+        var observed = new List<OperationDispatchOutcome>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new Handler(async (_, _, token) =>
+        {
+            entered.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            return OperationResult<int>.Success(1);
+        });
+        var dispatcher = Dispatcher(() => handler, completion => observed.Add(completion.Outcome));
+        var pending = (useBudget
+            ? deadline.ExecuteAsync(token => budget.DispatchAsync<int, int>(dispatcher, "test.run", 1, context, token))
+            : deadline.DispatchAsync<int, int>(dispatcher, "test.run", 1, context)).AsTask();
+        await entered.Task.WaitAsync(deadlineWatchdog);
+        try { Assert(!useBudget || budget.GetSnapshot().ActiveOperations == 1); }
+        finally { clock.Expire(); }
+        AssertDeadlineFailure(await pending.WaitAsync(deadlineWatchdog));
+        Assert(handler.DisposeCalls == 1 && observed.SequenceEqual([OperationDispatchOutcome.Canceled]));
+        Assert(budget.GetSnapshot().ActiveOperations == 0);
+    });
+
 var output = new
 {
     observedAtUtc = DateTimeOffset.UtcNow,
@@ -780,4 +993,24 @@ sealed class AsyncHandler(Func<ValueTask> cleanup) : IOperationHandler<int, int>
         => ValueTask.FromResult(OperationResult<int>.Success(request));
     public async ValueTask DisposeAsync() { AsyncDisposeCalls++; await cleanup(); }
     public void Dispose() => SyncDisposeCalls++;
+}
+
+sealed class DeadlineTestClock : TimeProvider
+{
+    public ProbeTimer? Timer { get; private set; }
+
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        => Timer = new ProbeTimer(callback, state, dueTime);
+
+    public void Expire() => (Timer ?? throw new InvalidOperationException("No deadline timer was created.")).Fire();
+
+    public sealed class ProbeTimer(TimerCallback callback, object? state, TimeSpan dueTime) : ITimer
+    {
+        public TimeSpan DueTime { get; } = dueTime;
+        public bool Disposed { get; private set; }
+        public void Fire() { if (!Disposed) callback(state); }
+        public bool Change(TimeSpan dueTime, TimeSpan period) => throw new NotSupportedException();
+        public void Dispose() => Disposed = true;
+        public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+    }
 }
