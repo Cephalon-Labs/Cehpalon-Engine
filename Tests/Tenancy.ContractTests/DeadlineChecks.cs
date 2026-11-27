@@ -98,7 +98,9 @@ internal static class DeadlineChecks
                 try
                 {
                     await ready.Task.WaitAsync(Watchdog);
-                    Require(!pending.IsCompleted && f.Timer?.Disposed == false && Active() == 1);
+                    // The runtime can dispose a fired one-shot timer as it cancels the token.
+                    Require(f.ObservedCancellation?.CancellationToken.IsCancellationRequested == true);
+                    Require(!pending.IsCompleted && Active() == 1);
                     var rejected = await Call(unconfigured.WithOperationDeadline(peer.Deadline));
                     Require(ReferenceEquals(rejected, await Call(unconfigured)));
                     Require(rejected.Error.Code == OperationConcurrencyBudget.CapacityExceededCode && peer.Created == 0 && peer.Timer?.Disposed == true);
@@ -128,6 +130,22 @@ internal static class DeadlineChecks
                 f.Business = (_, token) => { f.Expire(); Require(token.IsCancellationRequested); return expected; };
                 Require(ReferenceEquals(await Call(f.Build().WithOperationDeadline(f.Deadline)), expected) && f.Disposed == 1);
             }
+        });
+
+        await check("tenant-deadline-remains-active-during-owned-cleanup-without-replacing-result", async () =>
+        {
+            var f = new Probe();
+            var expected = OperationResult<int>.Success(42);
+            CancellationToken linked = default;
+            f.Business = (_, token) => { linked = token; return expected; };
+            f.Cleanup = () =>
+            {
+                Require(!linked.IsCancellationRequested);
+                f.Expire();
+                Require(linked.IsCancellationRequested);
+                return ValueTask.CompletedTask;
+            };
+            Require(ReferenceEquals(await Call(f.Build().WithOperationDeadline(f.Deadline)), expected) && f.Disposed == 1);
         });
 
         await check("tenant-deadline-observed-expiry-awaits-terminal-cancelled-audit", async () =>
