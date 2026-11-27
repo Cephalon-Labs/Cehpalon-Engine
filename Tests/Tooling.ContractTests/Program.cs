@@ -221,6 +221,65 @@ foreach (var invocation in new (string Name, string Code, string[] Arguments)[]
 })
     Check(invocation.Name, () => AssertDiagnostic(Run(invocation.Arguments), invocation.Code, rejectedHelpInput));
 
+const string requiredInput = "RequiredOptionInputFixture";
+const string optionError = "Unknown option; use --help for supported arguments.";
+const string valueError = "Every option requires one nonempty value.";
+const string profileError = "Supported profiles are portable-request-reply and small-api.";
+foreach (var scenario in new (string Name, string[] Arguments, int Exit, string Code, string Message)[]
+{
+    ("new-missing-name", ["new", "--output", "$target", "--engine-root", "$source"],
+        2, "usage.required", "Missing required option --name; use cehpalon new --help."),
+    ("new-missing-output", ["new", "--engine-root", "$source", "--name", requiredInput],
+        2, "usage.required", "Missing required option --output; use cehpalon new --help."),
+    ("new-missing-engine-root-before-output-parent-check", ["new", "--name", requiredInput, "--output", "$nested"],
+        2, "usage.required", "Missing required option --engine-root; use cehpalon new --help."),
+    ("validate-missing-config", ["validate", "--profile", "small-api"],
+        2, "usage.required", "Missing required option --config; use cehpalon validate --help."),
+    ("new-missing-name-before-profile-and-other-missing-options", ["new", "--profile", requiredInput],
+        2, "usage.required", "Missing required option --name; use cehpalon new --help."),
+    ("new-missing-output-before-missing-engine-root", ["new", "--name", requiredInput],
+        2, "usage.required", "Missing required option --output; use cehpalon new --help."),
+    ("new-invalid-name-before-profile-and-output", ["new", "--name", "invalid-" + requiredInput, "--profile", requiredInput],
+        2, "usage.name", "Use [A-Z][A-Za-z0-9]{0,63}, excluding reserved DOS device names."),
+    ("new-invalid-profile-before-output", ["new", "--name", requiredInput, "--profile", requiredInput],
+        2, "usage.profile", profileError),
+    ("new-output-namespace-before-missing-engine-root", ["new", "--name", requiredInput, "--output", @"\\?\C:\" + requiredInput],
+        3, "path.namespace", "Windows device and extended path namespaces are not supported."),
+    ("validate-invalid-profile-before-missing-config", ["validate", "--profile", requiredInput],
+        2, "usage.profile", profileError),
+    ("new-malformed-output-before-missing-name", ["new", "--output", " "], 2, "usage.value", valueError),
+    ("validate-malformed-config-is-not-missing", ["validate", "--config"], 2, "usage.value", valueError),
+    ("new-duplicate-before-missing-name", ["new", "--output", "$target", "--output", "$nested"],
+        2, "usage.duplicate", "Options must not be repeated."),
+    ("new-mixed-help-before-missing-output", ["new", "--name", requiredInput, "--help"], 2, "usage.option", optionError),
+    ("validate-mixed-help-before-missing-config", ["validate", "--profile", "small-api", "--help"], 2, "usage.option", optionError),
+    ("validate-unknown-argument-before-missing-config", ["validate", "--" + requiredInput, "value"], 2, "usage.option", optionError)
+})
+{
+    Check("required-option-" + scenario.Name, () =>
+    {
+        var parent = Scope();
+        var target = Path.Combine(parent, requiredInput);
+        var arguments = scenario.Arguments.Select(value => value switch
+        {
+            "$target" => target,
+            "$nested" => Path.Combine(target, "nested"),
+            "$source" => Path.Combine(parent, requiredInput + "Source"),
+            _ => value
+        }).ToArray();
+        var writes = 0;
+        var moves = 0;
+        var fileSystem = new DelegatingFileSystem((_, _) => writes++, (_, _) => moves++);
+        var result = Invoke(arguments, fileSystem);
+        Assert(writes == 0 && moves == 0, "Rejected usage must not write or publish through the filesystem seam.");
+        AssertNoPublish(parent, target);
+        Assert(result.Code == scenario.Exit && result.Output.Length == 0, "Expected rejection with no stdout and exit " + scenario.Exit);
+        Assert(!result.Error.Contains(requiredInput, StringComparison.Ordinal), "Diagnostic echoed user-supplied input.");
+        var expected = $$"""{"success":false,"code":"{{scenario.Code}}","message":"{{scenario.Message}}"}""";
+        Assert(result.Error == expected + Environment.NewLine, "Expected " + expected + "; got " + result.Error.TrimEnd());
+    });
+}
+
 foreach (var invocation in new (string Name, string[] Arguments)[]
 {
     ("unknown-command", ["launch"]),
