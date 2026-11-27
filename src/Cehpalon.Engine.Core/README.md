@@ -31,6 +31,14 @@ separate code generator. Core does not scan assemblies or use runtime activation
 Release/provider/platform qualification and benchmarks remain separate gates;
 these contracts do not make unsupported Windows or hosted CI pass.
 
+## Trace context
+
+`TraceParent` is experimental (M0). Pass all raw `traceparent` values to
+`TraceParent.ParseOrNull`; it accepts exactly one valid W3C version 00 value and
+returns null otherwise. Validation checks syntax, not sender trust. Flags are the
+raw byte, not a sampling decision. The default value and public constructor do
+not validate.
+
 ## Dispatch duration
 
 Hosts can subscribe to the `cehpalon.operation.dispatch.duration` histogram on
