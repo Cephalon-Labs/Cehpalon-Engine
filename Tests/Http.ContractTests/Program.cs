@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
@@ -5,9 +7,13 @@ using Cehpalon.Engine.Core;
 using Cehpalon.Engine.Transports.Http;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 var checks = new List<object>();
 var failures = 0;
@@ -302,6 +308,51 @@ await Check("mapping-is-lazy-and-requires-authorization-metadata", async () =>
     Assert(endpoint.Metadata.GetMetadata<IAuthorizeData>() is not null);
     Assert(endpoint.Metadata.GetMetadata<HttpMethodMetadata>()?.HttpMethods.SequenceEqual(["POST"]) == true);
     Assert(!app.Services.GetServices<ITransportOperationDispatcher>().Any());
+});
+
+const string deadlineCode = "operation.deadline_exceeded";
+var deadlineError = new OperationError(deadlineCode, "private operation timing details");
+await Check("operation-deadline-status-is-gateway-timeout", () =>
+{
+    Assert(OperationHttpAdapter.ErrorStatusCode(deadlineError) == StatusCodes.Status504GatewayTimeout);
+    return Task.CompletedTask;
+});
+await Check("operation-deadline-client-error-replaces-private-message", () =>
+{
+    var error = TransportErrors.ForClient(deadlineError);
+    Assert(error.Code == deadlineCode && error.Message == "The operation deadline expired.");
+    return Task.CompletedTask;
+});
+await Check("operation-deadline-request-returns-redacted-504-problem", async () =>
+{
+    var probe = new Probe { ResultError = deadlineError };
+    var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = [], EnvironmentName = "Production" });
+    builder.Logging.ClearProviders();
+    builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0));
+    builder.Services.AddAuthorization();
+    builder.Services.AddSingleton<ITransportOperationDispatcher>(probe);
+    await using var app = builder.Build();
+    // Trusted fixture principal, not a protocol authentication proof.
+    app.Use(async (http, next) =>
+    {
+        http.User = new ClaimsPrincipal(new ClaimsIdentity([], "fixture"));
+        await next(http);
+    });
+    app.UseAuthorization();
+    app.MapOperation("/deadline", binding);
+    await app.StartAsync();
+    var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+    using var client = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(15) };
+    using var response = await client.PostAsJsonAsync("/deadline", new Input("A", 1));
+    var body = await response.Content.ReadAsStringAsync();
+    Assert(response.StatusCode == HttpStatusCode.GatewayTimeout && probe.Calls == 1, $"{response.StatusCode}: {body}");
+    Assert(response.Content.Headers.ContentType?.MediaType == "application/problem+json");
+    using var problem = JsonDocument.Parse(body);
+    Assert(problem.RootElement.GetProperty("status").GetInt32() == 504 &&
+        problem.RootElement.GetProperty("code").GetString() == deadlineCode &&
+        problem.RootElement.GetProperty("title").GetString() == "The operation deadline expired." &&
+        !body.Contains("private"), body);
+    await app.StopAsync();
 });
 
 await Check("schema-uses-adapter-camelcase-required-and-strict-member-policy", () =>

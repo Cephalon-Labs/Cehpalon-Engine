@@ -185,6 +185,14 @@ await Check("request-cancellation-reaches-dispatcher",async () =>
     await Fixture.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
     Assert(Fixture.Calls==1);
 });
+await Check("operation-deadline-is-a-redacted-graphql-field-error", async () =>
+{
+    var response = await Post(Query(9));
+    Assert(response.Status == 200 && Code(response.Body) == "operation.deadline_exceeded", response.Body);
+    using var json = JsonDocument.Parse(response.Body);
+    Assert(json.RootElement.GetProperty("errors")[0].GetProperty("message").GetString() ==
+        "The operation deadline expired." && !response.Body.Contains("private"), response.Body);
+});
 await application.StopAsync();
 var report=new { scope="Experimental loopback HTTP adapter fixture; no JWT/IdP, tenant authority, TLS or supported-Windows proof",passed=checks.Count-failed,failed,checks };
 var json=JsonSerializer.Serialize(report,new JsonSerializerOptions{WriteIndented=true});
@@ -240,6 +248,8 @@ public sealed class Fixture : ITransportOperationDispatcher
         if(input.Id==7) return OperationResult<TResponse>.Failure(new(
             OperationConcurrencyBudget.CapacityExceededCode, "private capacity details"));
         if(input.Id==8) return OperationResult<TResponse>.Failure(new(TransportErrors.AuditReadTimeoutCode, "private database detail"));
+        if(input.Id==9) return OperationResult<TResponse>.Failure(new(
+            "operation.deadline_exceeded", "private operation timing details"));
         if(input.Id==4) throw new OperationCanceledException("secret cancelled but request active");
         if(input.Id==6) throw new HotChocolate.GraphQLException(HotChocolate.ErrorBuilder.New().SetMessage("secret GraphQL exception").SetExtension("private","secret").Build());
         if(input.Id==5){Entered.TrySetResult();try{await Task.Delay(Timeout.InfiniteTimeSpan,cancellationToken);}catch(OperationCanceledException){Cancelled.TrySetResult();throw;}}
