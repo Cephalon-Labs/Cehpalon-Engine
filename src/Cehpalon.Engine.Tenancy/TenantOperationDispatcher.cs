@@ -169,9 +169,12 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         catch(TenantAuditWriteException failure) when(ReferenceEquals(failure,authorizationAuditFailure)) { throw; }
         catch(Exception failure) { executionFailure=failure; }
 
-        // A translated expiry still has a cause for required audit; a returned error code alone does not.
-        var operationFailure = executionFailure ?? bounded?.ObservedCancellation;
-        var outcome=operationFailure is OperationCanceledException && !ReferenceEquals(operationFailure,bounded?.CleanupCancellation)
+        // Required audit keeps the original cancellation, even when Core translates expiry or
+        // gives caller cancellation precedence. Non-cancellation faults still take priority.
+        var operationFailure = executionFailure is null or OperationCanceledException
+            ? bounded?.DispatchCancellation ?? executionFailure : executionFailure;
+        var outcome=operationFailure is OperationCanceledException cancellation &&
+            (bounded is null || executionFailure is null || bounded.IsExpectedCancellation(cancellation,token))
             ?TenantAuditOutcome.Cancelled:
             operationFailure is not null?TenantAuditOutcome.Faulted:
             result!.IsSuccess?TenantAuditOutcome.Succeeded:
@@ -180,7 +183,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         catch(TenantAuditWriteException auditFailure) when(operationFailure is not null)
         { throw new AggregateException("Operation and required audit persistence failed.",operationFailure,auditFailure); }
         if(executionFailure is not null) ExceptionDispatchInfo.Capture(executionFailure).Throw();
-        if(bounded?.ObservedCancellation is not null) token.ThrowIfCancellationRequested();
+        if(bounded?.DispatchCancellation is not null) token.ThrowIfCancellationRequested();
         return result!.IsSuccess && authority is not null && !authority.Identity.SatisfiesObservationConstraints()
             ? Denied() : result!;
     }
@@ -251,40 +254,48 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
     private ValueTask<OperationResult<TResponse>> DispatchWithDeadlineAsync(DeadlineDispatch bounded, AuthorizedInvocation invocation,
         TenantId tenant, OperationContext correlation, OperationConcurrencyBudget? budget,
         TenantOperationConcurrencyBudget? tenantBudget, CancellationToken token)
-        => bounded.ExecuteAsync(linked => DispatchBusinessAsync(invocation, tenant, correlation, budget, tenantBudget, linked), token);
+        => bounded.ExecuteAsync(linked => DispatchBusinessAsync(invocation, tenant, correlation, budget, tenantBudget, linked),
+            () => invocation.Context.DemandBinding(origin,operationId), token);
 
     private static bool ValidMembership(IdentitySnapshot identity,TenantId tenant,TenantMembershipSnapshot? membership,DateTimeOffset now)
         =>membership is not null && membership.IsActive && membership.Principal.Equals(identity.Principal) && membership.Tenant.Equals(tenant) && membership.NotBeforeUtc<=now && now<membership.ExpiresAtUtc;
     private static OperationResult<TResponse> Denied()=>OperationResult<TResponse>.Failure(new("access.denied","Access denied."));
     private sealed record AuthorizedInvocation(TRequest Request,TenantOperationContext Context,DeadlineDispatch? Deadline);
 
-    // Per invocation. OperationDeadline owns classification and the result; this keeps the exception for audit.
+    // Per invocation. OperationDeadline owns the public result; this records the cause for audit.
     private sealed class DeadlineDispatch(OperationDeadline deadline)
     {
-        internal OperationCanceledException? ObservedCancellation { get; private set; }
+        private CancellationToken operationToken;
+        internal OperationCanceledException? DispatchCancellation { get; private set; }
         internal OperationCanceledException? CleanupCancellation { get; set; }
+        internal bool HandlerFactoryStarted { get; set; }
+
+        internal bool IsExpectedCancellation(OperationCanceledException error, CancellationToken caller)
+            => !ReferenceEquals(error,CleanupCancellation) &&
+                (error.CancellationToken == operationToken && operationToken.IsCancellationRequested ||
+                 error.CancellationToken == caller && caller.IsCancellationRequested);
 
         internal async ValueTask<OperationResult<TResponse>> ExecuteAsync(
-            Func<CancellationToken,ValueTask<OperationResult<TResponse>>> dispatch, CancellationToken caller)
+            Func<CancellationToken,ValueTask<OperationResult<TResponse>>> dispatch, Action demandBinding, CancellationToken caller)
         {
-            OperationCanceledException? cancellation = null;
             try
             {
-                var result = await deadline.ExecuteAsync<TResponse>(async linked =>
+                return await deadline.ExecuteAsync<TResponse>(async linked =>
                 {
+                    operationToken = linked;
                     try { return await dispatch(linked).ConfigureAwait(false); }
                     catch (OperationCanceledException error)
                     {
                         // A lone cleanup fault can reuse the linked token. Keep it out of the deadline classifier.
                         // Core's execution+cleanup aggregate never enters this catch.
                         if (ReferenceEquals(error,CleanupCancellation)) throw new CleanupCancellationFault(error);
-                        cancellation = error;
+                        // Core or the budget can observe expiry before the bridge gets to demand the lease.
+                        if (!HandlerFactoryStarted && error.CancellationToken == linked && linked.IsCancellationRequested && !caller.IsCancellationRequested)
+                            demandBinding();
+                        DispatchCancellation = error;
                         throw;
                     }
                 }, caller).ConfigureAwait(false);
-                // Returning after a caught exception means Core translated it, not that a handler returned the code.
-                ObservedCancellation = cancellation;
-                return result;
             }
             catch (CleanupCancellationFault error)
             {
@@ -307,6 +318,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         {
             deadline=request.Deadline;
             request.Context.DemandBinding(origin,operationId); token.ThrowIfCancellationRequested();
+            if(deadline is not null) deadline.HandlerFactoryStarted=true;
             owned=factory()??throw new InvalidOperationException("The tenant handler factory returned null.");
             request.Context.DemandBinding(origin,operationId); token.ThrowIfCancellationRequested();
             return await owned.HandleAsync(request.Request,request.Context,token).ConfigureAwait(false);

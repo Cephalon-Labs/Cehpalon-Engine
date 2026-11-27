@@ -65,6 +65,20 @@ internal static class DeadlineChecks
             Require(f.Timer is null && f.Created == 0);
         });
 
+        await check("tenant-deadline-preserves-pre-factory-lease-denial-during-expiry", async () =>
+        {
+            var f = new Probe();
+            f.TimerStarted = () =>
+            {
+                f.Clock.AdvanceElapsed(TimeSpan.FromSeconds(30));
+                f.Expire();
+            };
+            var result = await Call(f.Build(audited: true).WithOperationDeadline(f.Deadline));
+            Require(result.Error is { Code: "access.denied", Message: "Access denied." });
+            Require(f.Created == 0 && f.Disposed == 0 && f.Timer?.Disposed == true);
+            Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Denied);
+        });
+
         await check("tenant-deadline-preserves-handler-access-denial-even-after-expiry", async () =>
         {
             var f = new Probe();
@@ -229,6 +243,25 @@ internal static class DeadlineChecks
             Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Cancelled);
         });
 
+        await check("tenant-deadline-caller-cancellation-does-not-replace-expiry-in-audit-aggregate", async () =>
+        {
+            using var caller = new CancellationTokenSource();
+            var f = new Probe();
+            var persistence = new IOException("terminal write failed");
+            f.Business = (_, token) => throw f.ObserveExpiry(token);
+            f.Cleanup = () => { caller.Cancel(); return ValueTask.CompletedTask; };
+            f.Append = (entry, token) =>
+            {
+                if (entry.Stage != TenantAuditStage.Terminal) return ValueTask.CompletedTask;
+                Require(caller.IsCancellationRequested && !token.IsCancellationRequested && f.Disposed == 1);
+                return ValueTask.FromException(persistence);
+            };
+            var error = await Throws<AggregateException>(() => Call(f.Build(audited: true).WithOperationDeadline(f.Deadline), caller.Token));
+            Require(error.InnerExceptions.Count == 2 && ReferenceEquals(error.InnerExceptions[0], f.ObservedCancellation));
+            Require(error.InnerExceptions[1] is TenantAuditWriteException { OperationMayHaveExecuted: true } audit && ReferenceEquals(audit.InnerException, persistence));
+            Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Cancelled);
+        });
+
         await check("tenant-deadline-cleanup-aggregate-stays-faulted-and-audit-failure-keeps-aggregate", async () =>
         {
             var f = new Probe();
@@ -265,6 +298,23 @@ internal static class DeadlineChecks
             f.Business = (_, _) => { f.Expire(); throw expected; };
             var error = await Throws<OperationCanceledException>(() => Call(f.Build().WithOperationDeadline(f.Deadline)));
             Require(ReferenceEquals(error, expected));
+        });
+
+        await check("tenant-deadline-audits-foreign-handler-cancellation-as-fault-without-changing-legacy", async () =>
+        {
+            using var foreign = new CancellationTokenSource();
+            foreign.Cancel();
+            var expected = new OperationCanceledException(foreign.Token);
+            var f = new Probe { Business = (_, _) => throw expected };
+            var original = f.Build(audited: true);
+            Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Call(original)), expected));
+            Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Cancelled);
+
+            f.Events.Clear();
+            f.Business = (_, token) => { f.Expire(); Require(token.IsCancellationRequested); throw expected; };
+            Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Call(original.WithOperationDeadline(f.Deadline))), expected));
+            Require(f.Created == 2 && f.Disposed == 2);
+            Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Faulted);
         });
 
         await check("tenant-deadline-preserves-possible-commit-fault-from-change-audit", async () =>
@@ -322,6 +372,7 @@ internal static class DeadlineChecks
         internal bool Allow = true;
         internal int Created, Disposed;
         internal Action<CancellationToken>? Authority;
+        internal Action? TimerStarted;
         internal Action? Factory;
         internal Func<TenantAuditEvent, CancellationToken, ValueTask>? Append;
         internal Func<ValueTask>? Cleanup;
@@ -329,7 +380,12 @@ internal static class DeadlineChecks
         internal OperationCanceledException? ObservedCancellation;
         internal ManualTimer? Timer { get; private set; }
         internal OperationDeadline Deadline => new(TimeSpan.FromTicks(1), this);
-        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) => Timer = new(callback, state);
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = Timer = new(callback, state);
+            TimerStarted?.Invoke();
+            return timer;
+        }
         internal void Expire() => (Timer ?? throw new InvalidOperationException("No deadline timer.")).Fire();
         internal OperationCanceledException ObserveExpiry(CancellationToken token)
         { Expire(); Require(token.IsCancellationRequested); return ObservedCancellation = new OperationCanceledException(token); }
