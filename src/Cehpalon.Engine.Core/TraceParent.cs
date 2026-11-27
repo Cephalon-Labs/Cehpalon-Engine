@@ -3,6 +3,8 @@ using System.Diagnostics;
 namespace Cehpalon.Engine.Core;
 
 /// <summary>Experimental (M0) W3C version 00 trace context. Flags are the raw byte, not a sampling decision.</summary>
+/// <remarks>Neither <c>default(TraceParent)</c> nor the public constructor validates the IDs, so both can yield
+/// values with all-zero IDs; only a non-null result from <see cref="ParseOrNull"/> is validated.</remarks>
 public readonly record struct TraceParent(ActivityTraceId TraceId, ActivitySpanId ParentSpanId, byte Flags)
 {
     /// <summary>Parse exactly one version 00 traceparent value, or return null for missing or invalid input.</summary>

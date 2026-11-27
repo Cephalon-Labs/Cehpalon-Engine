@@ -444,7 +444,8 @@ const string traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
 const string parentSpanId = "00f067aa0ba902b7";
 const string validTraceParent = "00-" + traceId + "-" + parentSpanId + "-01";
 
-foreach (var (flagsHex, flags) in new[] { ("00", 0), ("01", 1), ("af", 0xaf) })
+foreach (var (flagsHex, flags) in new[]
+    { ("00", 0), ("01", 1), ("09", 0x09), ("9f", 0x9f), ("af", 0xaf), ("ff", 0xff) })
 {
     await Check($"traceparent-accepts-55-characters-with-flags-{flagsHex}", () => Sync(() =>
     {
@@ -470,14 +471,23 @@ await RejectTraceParent("54-characters", validTraceParent[..^1]);
 await RejectTraceParent("56-characters", validTraceParent + "0");
 await RejectTraceParent("uppercase-trace-id", $"00-{traceId.ToUpperInvariant()}-{parentSpanId}-01");
 await RejectTraceParent("uppercase-parent-id", $"00-{traceId}-{parentSpanId.ToUpperInvariant()}-01");
+await RejectTraceParent("non-ascii-trace-id", $"00-{traceId[..3]}\uFF19{traceId[4..]}-{parentSpanId}-01");
+await RejectTraceParent("non-ascii-parent-id", $"00-{traceId}-{parentSpanId[..1]}\uFF10{parentSpanId[2..]}-01");
 await RejectTraceParent("uppercase-flags", validTraceParent[..^2] + "aF");
 await RejectTraceParent("non-ascii-hex-lookalike", validTraceParent[..^1] + "\uFF11");
+await RejectTraceParent("uppercase-high-flags-nibble", validTraceParent[..53] + "A" + validTraceParent[54..]);
+await RejectTraceParent("non-ascii-high-flags-nibble", validTraceParent[..53] + "\uFF10" + validTraceParent[54..]);
+await RejectTraceParent("non-hex-high-flags-nibble", validTraceParent[..53] + "g" + validTraceParent[54..]);
 await RejectTraceParent("unsupported-version", "01" + validTraceParent[2..]);
 await RejectTraceParent("invalid-version-ff", "ff" + validTraceParent[2..]);
 await RejectTraceParent("zero-trace-id", $"00-{new string('0', 32)}-{parentSpanId}-01");
 await RejectTraceParent("zero-parent-id", $"00-{traceId}-{new string('0', 16)}-01");
 await RejectTraceParent("non-hex-flags", validTraceParent[..^1] + "g");
 await RejectTraceParent("whitespace-padding", " " + validTraceParent);
+await RejectTraceParent("trailing-space-at-55-characters", validTraceParent[..^1] + " ");
+await RejectTraceParent("trailing-tab-at-55-characters", validTraceParent[..^1] + "\t");
+await RejectTraceParent("trailing-space-at-56-characters", validTraceParent + " ");
+await RejectTraceParent("trailing-tab-at-56-characters", validTraceParent + "\t");
 foreach (var index in new[] { 2, 35, 52 })
     await RejectTraceParent($"bad-separator-at-{index}", validTraceParent[..index] + ":" + validTraceParent[(index + 1)..]);
 
