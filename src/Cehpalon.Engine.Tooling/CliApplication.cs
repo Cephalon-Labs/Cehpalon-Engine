@@ -57,7 +57,7 @@ public static class CliApplication
             return args[0] switch
             {
                 "new" => New(Parse(args, ["--name", "--output", "--engine-root", "--profile"]), output, fileSystem),
-                "validate" => Validate(Parse(args, ["--config", "--profile"]), output),
+                "validate" => Validate(Parse(args, ["--config", "--profile"]), output, error),
                 _ => throw new UsageFailure("usage.command", "Unknown command or extra arguments to --help/--version.")
             };
         }
@@ -107,17 +107,24 @@ public static class CliApplication
     private static string Required(Dictionary<string, string> options, string key) => options.TryGetValue(key, out var value)
         ? value : throw new UsageFailure("usage.required", "A required option is missing; use --help.");
 
-    private static int Validate(Dictionary<string, string> options, TextWriter output)
+    private static int Validate(Dictionary<string, string> options, TextWriter output, TextWriter error)
     {
         var profile = Profile(options);
         var configPath = UserPath(Required(options, "--config"));
         DemandPlainAncestors(configPath);
         var compilation = CompositionCompiler.Compile(ReadConfiguration(configPath), profile == SupportedProfile ? TemplateFiles.Catalog() : SmallApiTemplateFiles.Catalog());
         if (!compilation.IsSuccess) throw new ConfigurationFailure(compilation.Diagnostics);
-        if (profile == SmallApiTemplateFiles.Profile && !SmallApiTemplateFiles.Supported(compilation.Plan!))
-            throw new UsageFailure("config.capability", "The small-api profile supports only host, API and GraphQL activation; disable unsupported capabilities.");
-        Write(output, new { success = true, status = "passed", profile, schemaVersion = compilation.Plan!.SchemaVersion,
-            activationOrder = compilation.Plan.ActivationOrder, modules = compilation.Plan.Modules });
+        var plan = compilation.Plan!;
+        if (profile == SmallApiTemplateFiles.Profile && !SmallApiTemplateFiles.Supported(plan))
+        {
+            Write(error, new { success = false, code = "config.capability",
+                message = "The small-api profile supports only host, API and GraphQL activation; disable unsupported capabilities.",
+                unsupported = SmallApiTemplateFiles.UnsupportedModuleIds(plan),
+                supported = SmallApiTemplateFiles.SupportedModuleIds });
+            return 2;
+        }
+        Write(output, new { success = true, status = "passed", profile, schemaVersion = plan.SchemaVersion,
+            activationOrder = plan.ActivationOrder, modules = plan.Modules });
         return 0;
     }
 

@@ -55,6 +55,9 @@ requires the existing exact JWT/GraphQL package-version policy. It embeds templa
 sources in the CLI assembly and does not read a Samples checkout at generation time.
 `validate --profile small-api` rejects unsupported selected Worker/provider modules
 before activation, in addition to Composition graph validation.
+The `config.capability` diagnostic lists active unsupported catalog IDs in
+`unsupported` and all supported catalog IDs (`api`, `graphql`, `host`) in
+`supported`, both in ordinal order.
 
 The generated Small API runtime has explicit `--self-test --output <new-report>`
 and defaults to this same finite fixture self-test when F5 supplies no arguments,
