@@ -692,6 +692,49 @@ foreach (var setting in new (string Field, string Supported)[]
     });
 }
 
+Check("mixed-config-diagnostics-hint-only-for-profile-and-redact-input", () =>
+{
+    var parent = Scope();
+    var path = Path.Combine(parent, "config.json");
+    const string rejectedVersion = "947631";
+    const string rejectedArchitecture = "rejected-architecture-fixture";
+    const string rejectedPattern = "rejected-pattern-fixture";
+    const string rejectedModules = "rejected-modules-fixture";
+    File.WriteAllText(path, $$"""
+        {
+          "Cehpalon": {
+            "SchemaVersion": {{rejectedVersion}},
+            "Architecture": "{{rejectedArchitecture}}",
+            "Topology": "SingleProcess",
+            "Pattern": "{{rejectedPattern}}",
+            "Modules": "{{rejectedModules}}"
+          }
+        }
+        """);
+    var before = Snapshot(parent);
+    var result = Run("validate", "--config", path);
+    AssertDiagnostic(result, "config.invalid", nestedCode: "CFG_PROFILE");
+    foreach (var rejected in new[] { rejectedVersion, rejectedArchitecture, rejectedPattern, rejectedModules })
+        Assert(!result.Error.Contains(rejected, StringComparison.Ordinal), "Stderr echoed rejected configuration input.");
+
+    using var error = JsonDocument.Parse(result.Error);
+    var diagnostics = error.RootElement.GetProperty("diagnostics").EnumerateArray().ToArray();
+    Assert(diagnostics.Select(diagnostic => diagnostic.GetProperty("code").GetString()).Order(StringComparer.Ordinal)
+        .SequenceEqual(["CFG_MODULES", "CFG_PROFILE", "CFG_PROFILE", "CFG_VERSION"]), "Expected both profile and non-profile rejections.");
+    var profileHints = new List<string?>();
+    foreach (var diagnostic in diagnostics)
+    {
+        var code = diagnostic.GetProperty("code").GetString();
+        var hasHint = diagnostic.TryGetProperty("hint", out var hint);
+        Assert(hasHint == (code == "CFG_PROFILE"), $"Unexpected hint presence for {code}.");
+        if (hasHint) profileHints.Add(hint.GetString());
+    }
+    Assert(profileHints.Order(StringComparer.Ordinal).SequenceEqual([
+        "$.Cehpalon.Architecture: Only Modular is supported in schema 1.",
+        "$.Cehpalon.Pattern: Only RequestReply is supported in schema 1."]), "Expected one fixed hint for each rejected tuple field.");
+    SameSnapshot(before, parent);
+});
+
 Check("unknown-module-config-diagnostic-does-not-disclose-module-key", () =>
 {
     var parent = Scope();
