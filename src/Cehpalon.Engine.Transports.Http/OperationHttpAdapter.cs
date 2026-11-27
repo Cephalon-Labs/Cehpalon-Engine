@@ -171,6 +171,7 @@ public static class OperationHttpAdapter
             "resource.conflict" => 409,
             OperationConcurrencyBudget.CapacityExceededCode => 503,
             TransportErrors.AuditReadTimeoutCode => 504,
+            OperationDeadline.DeadlineExceededCode => 504,
             TransportErrors.InternalCode => 500,
             _ => 422
         };

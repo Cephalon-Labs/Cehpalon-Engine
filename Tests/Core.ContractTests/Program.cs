@@ -872,7 +872,11 @@ await Check("operation-deadline-does-not-convert-token-match-before-expiry", asy
     OperationCanceledException? expected = null;
     var clock = new DeadlineTestClock();
     var actual = await ThrowsAsync<OperationCanceledException>(() => new OperationDeadline(longDeadline, clock)
-        .ExecuteAsync<int>(token => throw expected = new OperationCanceledException(token)).AsTask());
+        .ExecuteAsync<int>(token =>
+        {
+            expected = new OperationCanceledException(token);
+            throw expected;
+        }).AsTask());
     Assert(ReferenceEquals(actual, expected) && clock.Timer?.Disposed == true);
 });
 await Check("operation-deadline-preserves-dispatch-handler-fault", async () =>

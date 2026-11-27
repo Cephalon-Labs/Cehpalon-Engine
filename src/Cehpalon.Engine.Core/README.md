@@ -16,9 +16,10 @@ The dispatcher awaits its result and then disposes `IAsyncDisposable` (preferred
 or `IDisposable` on success, failure, exception or cancellation. Do not return
 pooled/shared/container-owned handlers through this ownership contract. If execution
 and cleanup both fail, an `AggregateException` preserves both, execution first.
-Cleanup-only failures propagate. No retry, cancellation timer or background task
-is created by Core. A successful null response is permitted for nullable contracts;
-a null result object from a faulty handler is rejected and the handler disposed.
+Cleanup-only failures propagate. The standard dispatcher creates no retry,
+cancellation timer or background task. A successful null response is permitted
+for nullable contracts; a null result object from a faulty handler is rejected
+and the handler disposed.
 
 Registry/context collections are defensive snapshots. The builder is for single
 startup-thread use; registries and dispatchers may be shared concurrently. Handler
@@ -30,6 +31,29 @@ The attribute and `IOperationHandlerFactory` are the compile-time bridge for the
 separate code generator. Core does not scan assemblies or use runtime activation.
 Release/provider/platform qualification and benchmarks remain separate gates;
 these contracts do not make unsupported Windows or hosted CI pass.
+
+## Operation deadline
+
+`OperationDeadline` is experimental (M0) and opt-in. Use `DispatchAsync` to
+wrap one dispatch or `ExecuteAsync` to wrap another operation. Each call starts
+a fresh timeout (greater than zero and at most one hour). Expiry cancels the
+operation's token; it does not kill the handler or skip cleanup. If the
+operation ignores cancellation, the wrapper waits and returns its result
+unchanged. If the operation throws cancellation with the supplied token after
+expiry, the wrapper returns `operation.deadline_exceeded`. If the caller's token
+is canceled when a cancellation exception is handled, caller cancellation wins
+and the exception carries the caller's token. An inner dispatch that observes
+deadline cancellation reports `Canceled`, not a new outcome.
+
+To compose with a concurrency budget, pass the deadline's token to the budget:
+
+```csharp
+await deadline.ExecuteAsync(token =>
+    budget.DispatchAsync<TRequest, TResponse>(dispatcher, id, request, context, token), ct);
+```
+
+The budget still holds its permit through cleanup. No timing or overhead claim
+is made.
 
 ## Trace context
 
