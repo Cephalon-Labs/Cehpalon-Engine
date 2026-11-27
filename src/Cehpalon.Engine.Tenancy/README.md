@@ -69,6 +69,30 @@ Events contain invocation ID, stage, timestamp, fixed outcome, operation/action/
 
 Use `TenantAuditHistoryReader` over your `ITenantAuditHistorySource` inside a tenant handler authorized for `audit-history` kind, `tenant` resource and `read` action. It demands the active scope before and after the asynchronous call, caps pages at 200 and rejects foreign/unverified tenant records. Your source must scope queries and pagination to the provided checked tenant. Do not expose the raw sink/history source as a public endpoint. The source/sink lifetime remains consumer-owned.
 
+## Optional operation deadline
+
+`dispatcher.WithOperationDeadline(new OperationDeadline(timeout))` returns a new
+dispatcher with the same registry, security services and capacity budget. The
+deadline starts per call only after fresh identity, membership, resource and
+policy checks and the awaited authorization audit, if configured. Authority
+checks still use the caller's token. Denial still returns `access.denied` without
+creating a handler or starting a timer; handler access denial and the existing
+post-execution observation checks also still apply.
+
+The deadline wraps capacity admission and owned handler construction, execution
+and cleanup. Capacity rejections pass through and permits are released after
+cleanup. When work observes expiry through its supplied token, the dispatcher
+returns `operation.deadline_exceeded`; caller cancellation takes precedence.
+This is cooperative, not a hard kill: work that ignores the token is awaited and
+keeps its result, subject to the existing observation checks. No timing or
+overhead claim is made (experimental, M0).
+
+Required audit is independently bounded and awaited. An observed expiry records
+terminal `Cancelled`; a handler-returned deadline error code is a rejection. If
+terminal persistence also fails, both the original cancellation and the audit
+error are preserved, including the existing may-have-executed flag. Cleanup
+aggregates and faults that indicate a possible commit are not deadline results.
+
 ## Tenant selection and read sets
 
 `builder.RegisterTenantSelection()` adds `tenant.select` with action `select`, kind `tenant` and destination-tenant ID as resource ID. Use normal `TenantSecurityServices` and destination membership/resource/policy. A successful `TenantSelectionRequest` only returns the selected ID; it does not mutate a global current tenant, change login identity, issue an authority token or bypass the next data request's checks. Keep a selected tenant in client/tab/request state and send it as an untrusted selector. Parallel requests retain their own checked context; A work cannot acquire B authority because another tab switched.
