@@ -54,6 +54,22 @@ public static class CliApplication
                 Write(output, new { success = true, version = Version });
                 return 0;
             }
+            // Match only the standalone help forms, before parsing or accessing any paths.
+            const string profileUsage = $"[--profile {SupportedProfile}|{SmallApiTemplateFiles.Profile}]";
+            if (args is ["new", "--help"])
+                return WriteCommandHelp(output, "new", "Scaffold an experimental consumer from an Engine source checkout without building or starting services.",
+                    $"cehpalon new --name <ASCIIUpperIdentifier> --output <new-directory> --engine-root <existing-checkout> {profileUsage}",
+                    "cehpalon new --name DemoApp --output ./DemoApp --engine-root ./Cehpalon-Engine",
+                    [new("--name", true, "Use [A-Z][A-Za-z0-9]{0,63}, excluding DOS device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) regardless of case."),
+                     new("--output", true, "Choose a new directory under an existing parent (no overwrite). Inside known program checkouts, only .local descendants are allowed. Observed symlinks or reparse points are rejected."),
+                     new("--engine-root", true, "Use an existing Engine checkout with the required source inputs and supported SDK/package policy. Observed symlinks or reparse points and MSBuild path metacharacters (% $ @ ; * ?) are rejected.")]);
+            if (args is ["validate", "--help"])
+                return WriteCommandHelp(output, "validate", "Check configuration against the selected profile without activating modules or starting services.",
+                    $"cehpalon validate --config <file> {profileUsage}",
+                    "cehpalon validate --config ./DemoApp/appsettings.json",
+                    [new("--config", true, FormattableString.Invariant(
+                        $"Use a JSON file encoded as strict UTF-8, at most {CompositionCompiler.MaximumConfigurationBytes} bytes. A leading UTF-8 BOM is allowed and counts toward the limit. Observed symlinks or reparse points are rejected."))]);
+
             return args[0] switch
             {
                 "new" => New(Parse(args, ["--name", "--output", "--engine-root", "--profile"]), output, fileSystem),
@@ -87,6 +103,17 @@ public static class CliApplication
             Write(error, new { success = false, code = "path.io", message = "The source, configuration or output path could not be safely read or written." });
             return 3;
         }
+    }
+
+    private static int WriteCommandHelp(TextWriter output, string command, string description, string usage, string example, HelpOption[] commandOptions)
+    {
+        HelpOption[] options = [.. commandOptions, new("--profile", false, "Select a supported profile; omit this option to use the default profile.")];
+        Write(output, new
+        {
+            success = true, command, description, usage, options,
+            profiles = new[] { SupportedProfile, SmallApiTemplateFiles.Profile }, defaultProfile = SupportedProfile, example
+        });
+        return 0;
     }
 
     private static Dictionary<string, string> Parse(string[] args, string[] allowed)
@@ -335,6 +362,7 @@ public static class CliApplication
     }
 
     private static void Write(TextWriter writer, object value) => writer.WriteLine(JsonSerializer.Serialize(value, JsonOptions));
+    private sealed record HelpOption(string Name, bool Required, string Description);
     private sealed record SourceInput(string Path, string Sha256, long Bytes);
     private sealed record CliConfigurationDiagnostic(string Code, string Path, string Message,
         [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Hint);

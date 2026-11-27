@@ -140,6 +140,87 @@ Check("no-command-shows-help-without-filesystem-work", () =>
     SameSnapshot(before, runRoot);
 });
 
+JsonDocument ReadCommandHelp(string command)
+{
+    var writes = 0;
+    var moves = 0;
+    var fileSystem = new DelegatingFileSystem((_, _) => writes++, (_, _) => moves++);
+    var result = Invoke([command, "--help"], fileSystem);
+    Assert(writes == 0 && moves == 0, "Command help must not write or publish through the filesystem seam.");
+    Assert(result.Code == 0 && result.Error.Length == 0, "Expected exit 0 and empty stderr for command help; got " + result.Code);
+    Assert(result.Output.EndsWith(Environment.NewLine, StringComparison.Ordinal)
+        && result.Output[..^Environment.NewLine.Length].IndexOfAny(['\r', '\n']) < 0,
+        "Expected exactly one JSON stdout line.");
+    return JsonDocument.Parse(result.Output);
+}
+
+void AssertHelpHeader(JsonElement help, string command, string usage, string example)
+{
+    Assert(help.GetProperty("success").GetBoolean());
+    Assert(help.GetProperty("command").GetString() == command);
+    Assert(!string.IsNullOrWhiteSpace(help.GetProperty("description").GetString()));
+    Assert(help.GetProperty("usage").GetString() == usage);
+    Assert(help.GetProperty("profiles").EnumerateArray().Select(profile => profile.GetString())
+        .SequenceEqual(["portable-request-reply", "small-api"]));
+    Assert(help.GetProperty("defaultProfile").GetString() == "portable-request-reply");
+    Assert(help.GetProperty("example").GetString() == example);
+}
+
+Dictionary<string, string> ReadHelpOptions(JsonElement help, params string[] requiredOptions)
+{
+    var options = help.GetProperty("options").EnumerateArray().ToDictionary(option => option.GetProperty("name").GetString()!);
+    Assert(options.Count == requiredOptions.Length + 1, "Help must list only this command's options.");
+    Assert(!options["--profile"].GetProperty("required").GetBoolean());
+    foreach (var name in requiredOptions)
+        Assert(options[name].GetProperty("required").GetBoolean(), "Help must mark " + name + " as required.");
+    return options.ToDictionary(option => option.Key, option => option.Value.GetProperty("description").GetString()!);
+}
+
+Check("new-command-help-lists-scaffold-options-and-constraints", () =>
+{
+    using var json = ReadCommandHelp("new");
+    var help = json.RootElement;
+    AssertHelpHeader(help, "new",
+        "cehpalon new --name <ASCIIUpperIdentifier> --output <new-directory> --engine-root <existing-checkout> [--profile portable-request-reply|small-api]",
+        "cehpalon new --name DemoApp --output ./DemoApp --engine-root ./Cehpalon-Engine");
+    var options = ReadHelpOptions(help, "--name", "--output", "--engine-root");
+    Assert(options["--name"].Contains("[A-Z][A-Za-z0-9]{0,63}", StringComparison.Ordinal)
+        && options["--name"].Contains("DOS device names", StringComparison.Ordinal));
+    Assert(options["--output"].Contains("existing parent", StringComparison.Ordinal)
+        && options["--output"].Contains("no overwrite", StringComparison.Ordinal)
+        && options["--output"].Contains(".local", StringComparison.Ordinal));
+    Assert(options["--engine-root"].Contains("existing Engine checkout", StringComparison.Ordinal)
+        && options["--engine-root"].Contains("required source inputs", StringComparison.Ordinal)
+        && options["--engine-root"].Contains("MSBuild", StringComparison.Ordinal));
+});
+
+Check("validate-command-help-lists-config-policy-and-no-activation", () =>
+{
+    using var json = ReadCommandHelp("validate");
+    var help = json.RootElement;
+    AssertHelpHeader(help, "validate", "cehpalon validate --config <file> [--profile portable-request-reply|small-api]",
+        "cehpalon validate --config ./DemoApp/appsettings.json");
+    Assert(help.GetProperty("description").GetString()!.Contains("without activating", StringComparison.Ordinal));
+    var options = ReadHelpOptions(help, "--config");
+    Assert(options["--config"].Contains("JSON file", StringComparison.Ordinal)
+        && options["--config"].Contains("strict UTF-8", StringComparison.Ordinal)
+        && options["--config"].Contains("1048576 bytes", StringComparison.Ordinal)
+        && options["--config"].Contains("BOM", StringComparison.Ordinal));
+});
+
+const string rejectedHelpInput = "rejected-command-help-input-fixture";
+foreach (var invocation in new (string Name, string Code, string[] Arguments)[]
+{
+    ("new-help-extra-argument", "usage.option", ["new", "--help", rejectedHelpInput]),
+    ("validate-help-extra-argument", "usage.option", ["validate", "--help", rejectedHelpInput]),
+    ("validate-help-as-config-value", "usage.value", ["validate", "--config", "--help"]),
+    ("new-help-as-output-value", "usage.value", ["new", "--output", "--help"]),
+    ("validate-help-after-config-path", "usage.option", ["validate", "--config", "./" + rejectedHelpInput + ".json", "--help"]),
+    ("new-help-command-is-case-sensitive", "usage.command", ["New", "--help"]),
+    ("validate-help-option-is-case-sensitive", "usage.option", ["validate", "--HELP"])
+})
+    Check(invocation.Name, () => AssertDiagnostic(Run(invocation.Arguments), invocation.Code, rejectedHelpInput));
+
 foreach (var invocation in new (string Name, string[] Arguments)[]
 {
     ("unknown-command", ["launch"]),

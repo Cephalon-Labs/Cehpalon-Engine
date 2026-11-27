@@ -12,9 +12,18 @@ platform gates remain outstanding; #3 is not changed by this tool.
 ```text
 cehpalon --help
 cehpalon --version
+cehpalon new --help
+cehpalon validate --help
 cehpalon new --name DemoApp --output <new-directory> --engine-root <existing-engine-checkout> [--profile portable-request-reply|small-api]
 cehpalon validate --config <file> [--profile portable-request-reply|small-api]
 ```
+
+`new --help` and `validate --help` are exact, case-sensitive invocations. Each
+returns exit 0 with one JSON line on stdout and empty stderr, before reading any
+files or activating anything. The response includes the command, usage,
+required and optional options, supported profiles, the `portable-request-reply`
+default, and one example. Combining `--help` with other command arguments is a
+usage error, not a help request.
 
 `CliApplication.Run(string[], TextWriter, TextWriter)` returns 0 for success, 2 for
 usage/configuration rejection, and 3 for path/I/O/source failure. Results are JSON;
