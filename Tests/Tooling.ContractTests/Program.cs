@@ -688,6 +688,8 @@ foreach (var setting in new (string Field, string Supported)[]
         Assert(diagnostic.TryGetProperty("hint", out var hint)
             && hint.GetString() == $"$.Cehpalon.{setting.Field}: Only {setting.Supported} is supported in schema 1.",
             "Expected a hint naming the rejected setting and its supported value.");
+        Assert(result.Error == $$"""{"success":false,"code":"config.invalid","message":"Configuration was rejected before activation.","diagnostics":[{"code":"CFG_PROFILE","path":"$.Cehpalon","message":"Configuration violates the selected profile.","hint":"$.Cehpalon.{{setting.Field}}: Only {{setting.Supported}} is supported in schema 1."}]}""" + Environment.NewLine,
+            "Profile tuple rejection stderr changed.");
         SameSnapshot(before, parent);
     });
 }
@@ -752,6 +754,8 @@ Check("unknown-module-config-diagnostic-does-not-disclose-module-key", () =>
     var diagnostic = error.RootElement.GetProperty("diagnostics").EnumerateArray().Single();
     Assert(diagnostic.GetProperty("code").GetString() == "CFG_UNKNOWN_MODULE" && !diagnostic.TryGetProperty("hint", out _),
         "Only unsupported profile tuple diagnostics may include a hint.");
+    Assert(result.Error == """{"success":false,"code":"config.invalid","message":"Configuration was rejected before activation.","diagnostics":[{"code":"CFG_UNKNOWN_MODULE","path":"$.Cehpalon","message":"Configuration violates the selected profile."}]}""" + Environment.NewLine,
+        "Portable unknown-module rejection stderr changed.");
     SameSnapshot(before, parent);
 });
 
@@ -870,6 +874,69 @@ foreach (var capability in new[] { "worker", "database", "cache", "broker", "ai"
         AssertDiagnostic(result, "config.capability"); SameSnapshot(before, target);
     });
 }
+
+string CapabilityConfig(string path, string fixtureValue, params string[] enabledModules)
+{
+    var modules = string.Join(",", enabledModules.Select(id => "\"" + id + "\":{\"Enabled\":true}"));
+    File.WriteAllText(path, $$"""
+        {
+          "Unrelated": "{{fixtureValue}}",
+          "Cehpalon": {
+            "SchemaVersion": 1, "Architecture": "Modular", "Topology": "SingleProcess", "Pattern": "RequestReply",
+            "Modules": { {{modules}} }
+          }
+        }
+        """);
+    return path;
+}
+
+void AssertCapabilityDiagnostic(CliResult result, string[] unsupported, string? redacted = null)
+{
+    AssertDiagnostic(result, "config.capability", redacted);
+    var expected = $$"""{"success":false,"code":"config.capability","message":"The small-api profile supports only host, API and GraphQL activation; disable unsupported capabilities.","unsupported":{{JsonSerializer.Serialize(unsupported)}},"supported":["api","graphql","host"]}""";
+    Assert(result.Error == expected + Environment.NewLine, "Unexpected capability rejection stderr: " + result.Error);
+}
+
+foreach (var capability in new[] { "worker", "database", "cache", "broker", "ai", "retrieval" })
+{
+    Check("small-api-capability-diagnostic-lists-only-" + capability, () =>
+    {
+        var path = CapabilityConfig(Path.Combine(Scope(), "config.json"), "unrelated-fixture", capability);
+        AssertCapabilityDiagnostic(Run("validate", "--profile", "small-api", "--config", path), [capability]);
+    });
+}
+
+Check("small-api-capability-diagnostic-lists-sorted-unique-unsupported-only", () =>
+{
+    const string unrelated = "unrelated-config-value-fixture";
+    var path = CapabilityConfig(Path.Combine(Scope(), "config.json"), unrelated, "worker", "graphql", "database", "api", "cache", "ai");
+    AssertCapabilityDiagnostic(Run("validate", "--profile", "small-api", "--config", path), ["ai", "cache", "database", "worker"], unrelated);
+});
+
+Check("small-api-unknown-module-rejection-precedes-capability-diagnostic", () =>
+{
+    const string unknown = "unknown-module-fixture";
+    var path = CapabilityConfig(Path.Combine(Scope(), "config.json"), "unrelated-fixture", "worker", unknown);
+    var result = Run("validate", "--profile", "small-api", "--config", path);
+    AssertDiagnostic(result, "config.invalid", unknown, "CFG_UNKNOWN_MODULE");
+    Assert(result.Error == """{"success":false,"code":"config.invalid","message":"Configuration was rejected before activation.","diagnostics":[{"code":"CFG_UNKNOWN_MODULE","path":"$.Cehpalon","message":"Configuration violates the selected profile."}]}""" + Environment.NewLine,
+        "Invalid configuration must keep its existing stderr shape.");
+});
+
+Check("small-api-unknown-option-rejection-keeps-exact-stderr", () =>
+{
+    var result = Run("validate", "--profile", "small-api", "--unknown", "rejected-option-fixture");
+    AssertDiagnostic(result, "usage.option", "rejected-option-fixture");
+    Assert(result.Error == """{"success":false,"code":"usage.option","message":"Unknown option; use --help for supported arguments."}""" + Environment.NewLine);
+});
+
+Check("small-api-missing-config-rejection-keeps-exact-stderr", () =>
+{
+    var path = Path.Combine(Scope(), "missing.json");
+    var result = Run("validate", "--profile", "small-api", "--config", path);
+    Assert(result.Code == 3 && result.Output.Length == 0);
+    Assert(result.Error == """{"success":false,"code":"path.io","message":"The source, configuration or output path could not be safely read or written."}""" + Environment.NewLine);
+});
 
 for (var position = 1; position <= 14; position++)
 foreach (var after in new[] { false, true })

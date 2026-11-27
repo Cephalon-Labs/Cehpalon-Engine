@@ -22,14 +22,28 @@ internal static class SmallApiTemplateFiles
         "src/Cehpalon.Engine.Transports.GraphQL/GraphQLAdapter.cs", "src/Cehpalon.Engine.Transports.GraphQL/GraphQLOperationCatalog.cs",
         "src/Cehpalon.Engine.Transports.GraphQL/packages.lock.json"
     ];
-    internal static ModuleDescriptor[] Catalog() =>
+    private static readonly ModuleDescriptor[] SupportedModules =
     [
         new("host", ModuleRole.Support), new("api", ModuleRole.EntryPoint, ["host"]),
-        new("graphql", ModuleRole.EntryPoint, ["host"]), new("worker", ModuleRole.EntryPoint),
+        new("graphql", ModuleRole.EntryPoint, ["host"])
+    ];
+    internal static IReadOnlyList<string> SupportedModuleIds { get; } =
+        Array.AsReadOnly(SupportedModules.Select(module => module.Id).Order(StringComparer.Ordinal).ToArray());
+
+    internal static ModuleDescriptor[] Catalog() =>
+    [
+        .. SupportedModules, new("worker", ModuleRole.EntryPoint),
         new("database", ModuleRole.EntryPoint), new("cache", ModuleRole.EntryPoint),
         new("broker", ModuleRole.EntryPoint), new("ai", ModuleRole.EntryPoint), new("retrieval", ModuleRole.EntryPoint)
     ];
-    internal static bool Supported(ActivationPlan plan) => plan.ActivationOrder.All(id => id is "host" or "api" or "graphql");
+    internal static bool Supported(ActivationPlan plan) => plan.ActivationOrder.All(IsSupportedModule);
+
+    // Composition produces exactly one decision per catalog descriptor, not per input key.
+    internal static string[] UnsupportedModuleIds(ActivationPlan plan) => plan.Modules
+        .Where(module => module.IsEnabled && !IsSupportedModule(module.Id))
+        .Select(module => module.Id).Order(StringComparer.Ordinal).ToArray();
+
+    private static bool IsSupportedModule(string id) => SupportedModuleIds.Contains(id, StringComparer.Ordinal);
 
     internal static bool PackagePolicy(byte[] bytes)
     {
