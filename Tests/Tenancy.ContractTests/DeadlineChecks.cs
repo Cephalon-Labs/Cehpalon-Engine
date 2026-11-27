@@ -65,6 +65,29 @@ internal static class DeadlineChecks
             Require(f.Timer is null && f.Created == 0);
         });
 
+        foreach (var (stage, step) in new[] { ("identity", 1), ("policy", 4) })
+            await check($"tenant-deadline-preserves-{stage}-provider-cancellation-audit", async () =>
+            {
+                using var provider = new CancellationTokenSource();
+                provider.Cancel();
+                var expected = new OperationCanceledException(provider.Token);
+                var f = new Probe();
+                var calls = 0;
+                f.Authority = _ => { if (++calls == step) throw expected; };
+                var original = f.Build(audited: true);
+
+                Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Call(original)), expected));
+                var baseline = f.Events.Single();
+                Require(baseline is { Stage: TenantAuditStage.Terminal, Outcome: TenantAuditOutcome.Cancelled, AuthorizedTenant: null });
+
+                calls = 0;
+                f.Events.Clear();
+                var configured = original.WithOperationDeadline(f.Deadline);
+                Require(ReferenceEquals(await Throws<OperationCanceledException>(() => Call(configured)), expected));
+                Require(calls == step && f.Timer is null && f.Created == 0 && f.Disposed == 0);
+                Require(Entry(f.Events.Single()).Equals(Entry(baseline)));
+            });
+
         await check("tenant-deadline-preserves-pre-factory-lease-denial-during-expiry", async () =>
         {
             var f = new Probe();

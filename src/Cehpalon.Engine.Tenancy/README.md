@@ -75,9 +75,11 @@ Use `TenantAuditHistoryReader` over your `ITenantAuditHistorySource` inside a te
 dispatcher with the same registry, security services and capacity budget. The
 deadline starts per call only after fresh identity, membership, resource and
 policy checks and the awaited authorization audit, if configured. Authority
-checks still use the caller's token. Denial still returns `access.denied` without
-creating a handler or starting a timer; handler access denial and the existing
-post-execution observation checks also still apply.
+checks still use the caller's token. A denial before the deadline starts returns
+`access.denied` without starting a timer or creating a handler. The pre-factory
+lease recheck can still deny access after the timer has started, without
+creating a handler. Handler access denial and the existing post-execution
+observation checks also still apply.
 
 The deadline wraps capacity admission and owned handler construction, execution
 and cleanup. Capacity rejections pass through and permits are released after

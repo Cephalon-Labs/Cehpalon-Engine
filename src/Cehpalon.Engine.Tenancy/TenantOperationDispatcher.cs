@@ -173,8 +173,9 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         // gives caller cancellation precedence. Non-cancellation faults still take priority.
         var operationFailure = executionFailure is null or OperationCanceledException
             ? bounded?.DispatchCancellation ?? executionFailure : executionFailure;
+        // Authority checks keep legacy cancellation outcomes; classify tokens only after linked dispatch starts.
         var outcome=operationFailure is OperationCanceledException cancellation &&
-            (bounded is null || executionFailure is null || bounded.IsExpectedCancellation(cancellation,token))
+            (bounded is not { HasEnteredDispatch: true } || executionFailure is null || bounded.IsExpectedCancellation(cancellation,token))
             ?TenantAuditOutcome.Cancelled:
             operationFailure is not null?TenantAuditOutcome.Faulted:
             result!.IsSuccess?TenantAuditOutcome.Succeeded:
@@ -266,6 +267,7 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
     private sealed class DeadlineDispatch(OperationDeadline deadline)
     {
         private CancellationToken operationToken;
+        internal bool HasEnteredDispatch => operationToken.CanBeCanceled;
         internal OperationCanceledException? DispatchCancellation { get; private set; }
         internal OperationCanceledException? CleanupCancellation { get; set; }
         internal bool HandlerFactoryStarted { get; set; }
