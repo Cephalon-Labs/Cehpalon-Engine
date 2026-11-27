@@ -131,13 +131,14 @@ public static class CliApplication
         return result;
     }
 
-    private static string Required(Dictionary<string, string> options, string key) => options.TryGetValue(key, out var value)
-        ? value : throw new UsageFailure("usage.required", "A required option is missing; use --help.");
+    // The key and command are fixed call-site literals, never taken from CLI input.
+    private static string Required(Dictionary<string, string> options, string key, string command) => options.TryGetValue(key, out var value)
+        ? value : throw new UsageFailure("usage.required", $"Missing required option {key}; use cehpalon {command} --help.");
 
     private static int Validate(Dictionary<string, string> options, TextWriter output, TextWriter error)
     {
         var profile = Profile(options);
-        var configPath = UserPath(Required(options, "--config"));
+        var configPath = UserPath(Required(options, "--config", "validate"));
         DemandPlainAncestors(configPath);
         var compilation = CompositionCompiler.Compile(ReadConfiguration(configPath), profile == SupportedProfile ? TemplateFiles.Catalog() : SmallApiTemplateFiles.Catalog());
         if (!compilation.IsSuccess) throw new ConfigurationFailure(compilation.Diagnostics);
@@ -157,11 +158,11 @@ public static class CliApplication
 
     private static int New(Dictionary<string, string> options, TextWriter output, IToolingFileSystem fileSystem)
     {
-        var name = Required(options, "--name");
+        var name = Required(options, "--name", "new");
         if (!ValidName(name)) throw new UsageFailure("usage.name", "Use [A-Z][A-Za-z0-9]{0,63}, excluding reserved DOS device names.");
         var profile = Profile(options);
-        var destination = Path.TrimEndingDirectorySeparator(UserPath(Required(options, "--output")));
-        var engineRoot = Path.TrimEndingDirectorySeparator(UserPath(Required(options, "--engine-root")));
+        var destination = Path.TrimEndingDirectorySeparator(UserPath(Required(options, "--output", "new")));
+        var engineRoot = Path.TrimEndingDirectorySeparator(UserPath(Required(options, "--engine-root", "new")));
         if (engineRoot.IndexOfAny(['%', '$', '@', ';', '*', '?']) >= 0)
             throw new PathFailure("source.path", "Engine source paths containing MSBuild expansion, escape, wildcard or item-list metacharacters are not supported.");
         var parent = Path.GetDirectoryName(destination);
