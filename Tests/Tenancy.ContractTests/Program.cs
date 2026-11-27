@@ -169,6 +169,7 @@ await Check("core-budget-drain-closes-spare-capacity-and-waits-through-cleanup",
 await Check("tenant-budget-drain-preserves-fresh-authorization-and-independent-waits", BudgetChecks.DrainTenants);
 await Check("budget-snapshot-stays-bounded-during-concurrent-admission-and-drain", BudgetChecks.SnapshotRace);
 await Check("opt-in-budget-metrics-observe-owned-lifecycle-and-dispose-cleanly", BudgetChecks.MetricsLifecycle);
+await DeadlineChecks.Run(Check);
 await Check("business-failure-result-is-preserved-and-owned-handler-disposed",async()=>
 {var f=new Fixture{BusinessFailure=true};var result=await f.Call();Assert(!result.IsSuccess&&result.Error.Code=="business.invalid"&&f.Disposed==1);});
 await Check("unexpected-handler-and-cleanup-faults-both-preserved",async()=>
