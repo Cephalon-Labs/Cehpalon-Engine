@@ -3,6 +3,7 @@ using System.Diagnostics.Metrics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Cehpalon.Engine.Composition;
 
 var cases = new List<(string Name, Func<Task> Run)>();
@@ -241,6 +242,42 @@ Add("fractional schema version rejected", () => Invalid(Json().Replace("\"Schema
 Add("unsupported topology rejected", () => Invalid(Json().Replace("SingleProcess", "Distributed"), "CFG_PROFILE"));
 Add("unsupported pattern rejected", () => Invalid(Json().Replace("RequestReply", "EventDriven"), "CFG_PROFILE"));
 Add("unsupported architecture rejected", () => Invalid(Json().Replace("Modular", "Microservices"), "CFG_PROFILE"));
+
+// The CLI exposes these diagnostics as hints, so both fields must stay independent of input.
+const string rejectedProfileValue = "rejected-profile-value-fixture";
+foreach (var setting in new (string Field, string Supported)[]
+{
+    ("Architecture", "Modular"),
+    ("Topology", "SingleProcess"),
+    ("Pattern", "RequestReply")
+})
+foreach (var scenario in new (string Name, string? ValueJson)[]
+{
+    ("missing", null),
+    ("non-string", $$"""{"fixture":"{{rejectedProfileValue}}"}"""),
+    ("rejected-string", JsonSerializer.Serialize(rejectedProfileValue))
+})
+{
+    Add($"CFG_PROFILE {setting.Field} {scenario.Name} has fixed path and message", () =>
+    {
+        var config = JsonNode.Parse(Json())!;
+        var section = config["Cehpalon"]!.AsObject();
+        if (scenario.ValueJson is null)
+            Assert(section.Remove(setting.Field), "Expected baseline profile setting not present.");
+        else
+            section[setting.Field] = JsonNode.Parse(scenario.ValueJson);
+
+        var result = CompositionCompiler.Compile(config.ToJsonString(), Catalog());
+        Assert(!result.IsSuccess && result.Plan is null && result.Diagnostics.Count == 1, "Expected exactly one rejection.");
+        var diagnostic = result.Diagnostics[0];
+        Assert(diagnostic.Code == "CFG_PROFILE", "Expected CFG_PROFILE.");
+        Assert(!diagnostic.Path.Contains(rejectedProfileValue, StringComparison.Ordinal)
+            && !diagnostic.Message.Contains(rejectedProfileValue, StringComparison.Ordinal), "Profile diagnostic echoed rejected input.");
+        Assert(diagnostic.Path == $"$.Cehpalon.{setting.Field}", "Unexpected profile diagnostic path.");
+        Assert(diagnostic.Message == $"Only {setting.Supported} is supported in schema 1.", "Unexpected profile diagnostic message.");
+    });
+}
+
 Add("unknown engine setting rejected", () => Invalid(Json().Replace("\"SchemaVersion\":1", "\"Unknown\":true,\"SchemaVersion\":1"), "CFG_UNKNOWN"));
 Add("case-ambiguous engine setting rejected", () => Invalid(Json().Replace("\"SchemaVersion\":1", "\"schemaversion\":1,\"SchemaVersion\":1"), "CFG_DUPLICATE"));
 Add("module selections must be object", () => Invalid(Json().Replace("\"Modules\":{}", "\"Modules\":[]"), "CFG_MODULES"));
