@@ -150,6 +150,27 @@ internal static class DeadlineChecks
             Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Cancelled);
         });
 
+        await check("tenant-deadline-caller-cancellation-during-terminal-audit-wins-after-write", async () =>
+        {
+            var f = new Probe();
+            using var caller = new CancellationTokenSource();
+            f.Business = (_, token) => throw f.ObserveExpiry(token);
+            var completedWrite = false;
+            f.Append = (entry, token) =>
+            {
+                if (entry.Stage == TenantAuditStage.Terminal)
+                {
+                    caller.Cancel();
+                    Require(!token.IsCancellationRequested);
+                    completedWrite = true;
+                }
+                return ValueTask.CompletedTask;
+            };
+            var error = await Throws<OperationCanceledException>(() => Call(f.Build(audited: true).WithOperationDeadline(f.Deadline), caller.Token));
+            Require(completedWrite && error.CancellationToken == caller.Token);
+            Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Cancelled);
+        });
+
         await check("tenant-deadline-nonexpired-success-and-denial-keep-audit-entries", async () =>
         {
             foreach (var allowed in new[] { true, false })
@@ -204,6 +225,28 @@ internal static class DeadlineChecks
             Require(ReferenceEquals(work.InnerExceptions[0], f.ObservedCancellation) && ReferenceEquals(work.InnerExceptions[1], cleanup));
             Require(error.InnerExceptions[1] is TenantAuditWriteException { OperationMayHaveExecuted: true } audit && ReferenceEquals(audit.InnerException, persistence));
             Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Faulted);
+        });
+
+        await check("tenant-deadline-does-not-translate-cleanup-only-cancellation", async () =>
+        {
+            var f = new Probe();
+            CancellationToken linked = default;
+            f.Business = (_, token) => { linked = token; return OperationResult<int>.Success(42); };
+            f.Cleanup = () => throw f.ObserveExpiry(linked);
+            var error = await Throws<OperationCanceledException>(() => Call(f.Build(audited: true).WithOperationDeadline(f.Deadline)));
+            Require(ReferenceEquals(error, f.ObservedCancellation));
+            Outcomes(f, TenantAuditOutcome.Authorized, TenantAuditOutcome.Faulted);
+        });
+
+        await check("tenant-deadline-does-not-translate-foreign-cancellation", async () =>
+        {
+            using var foreign = new CancellationTokenSource();
+            foreign.Cancel();
+            var expected = new OperationCanceledException(foreign.Token);
+            var f = new Probe();
+            f.Business = (_, _) => { f.Expire(); throw expected; };
+            var error = await Throws<OperationCanceledException>(() => Call(f.Build().WithOperationDeadline(f.Deadline)));
+            Require(ReferenceEquals(error, expected));
         });
 
         await check("tenant-deadline-preserves-possible-commit-fault-from-change-audit", async () =>
