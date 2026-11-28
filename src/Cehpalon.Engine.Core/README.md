@@ -42,7 +42,9 @@ operation ignores cancellation, the wrapper waits and returns its result
 unchanged. If the operation throws cancellation with the supplied token after
 expiry, the wrapper returns `operation.deadline_exceeded`. If the caller's token
 is canceled when a cancellation exception is handled, caller cancellation wins
-and the exception carries the caller's token. An inner dispatch that observes
+and the exception carries the caller's token. Otherwise, an `OperationCanceledException`
+from a handler or library using its own token after expiry is not translated and
+surfaces as a fault. An inner dispatch that observes
 deadline cancellation reports `Canceled`, not a new outcome.
 
 To compose with a concurrency budget, pass the deadline's token to the budget:

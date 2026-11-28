@@ -953,6 +953,37 @@ foreach (var useBudget in new[] { false, true })
         Assert(budget.GetSnapshot().ActiveOperations == 0);
     });
 
+await Check("operation-deadline-preserves-capacity-rejection", async () =>
+{
+    var clock = new DeadlineTestClock();
+    var budget = new OperationConcurrencyBudget(1);
+    await budget.DrainAsync();
+    var dispatcher = Dispatcher(() => throw new InvalidOperationException("A rejected call must not create a handler."));
+    var expected = await budget.DispatchAsync<int, int>(dispatcher, "test.run", 1, context);
+    var actual = await new OperationDeadline(shortDeadline, clock).ExecuteAsync(
+        token => budget.DispatchAsync<int, int>(dispatcher, "test.run", 1, context, token));
+    Assert(ReferenceEquals(expected, actual) && actual.Error.Code == OperationConcurrencyBudget.CapacityExceededCode);
+    Assert(clock.Timer?.Disposed == true);
+});
+
+await Check("operation-deadline-preserves-expiry-and-cleanup-aggregate", async () =>
+{
+    var clock = new DeadlineTestClock();
+    var cleanup = new IOException("cleanup failed");
+    OperationCanceledException? cancellation = null;
+    var handler = new Handler((_, _, token) =>
+    {
+        clock.Expire();
+        Assert(token.IsCancellationRequested);
+        throw (cancellation = new OperationCanceledException(token));
+    }, () => throw cleanup);
+    var error = await ThrowsAsync<AggregateException>(() => new OperationDeadline(shortDeadline, clock)
+        .DispatchAsync<int, int>(Dispatcher(() => handler), "test.run", 1, context).AsTask());
+    Assert(error.InnerExceptions.Count == 2 && ReferenceEquals(error.InnerExceptions[0], cancellation)
+        && ReferenceEquals(error.InnerExceptions[1], cleanup));
+    Assert(handler.DisposeCalls == 1 && clock.Timer?.Disposed == true);
+});
+
 var output = new
 {
     observedAtUtc = DateTimeOffset.UtcNow,

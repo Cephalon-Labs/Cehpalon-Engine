@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Runtime.ExceptionServices;
 using Cehpalon.Engine.Core;
 using Cehpalon.Engine.Identity;
 
@@ -84,6 +85,7 @@ public sealed class TenantOperationDispatcher
     private readonly TenantSecurityServices services;
     private readonly OperationConcurrencyBudget? budget;
     private readonly TenantOperationConcurrencyBudget? tenantBudget;
+    private readonly OperationDeadline? deadline;
     public TenantOperationDispatcher(TenantOperationRegistry registry,TenantSecurityServices services)
     { this.registry=registry??throw new ArgumentNullException(nameof(registry)); this.services=services??throw new ArgumentNullException(nameof(services)); }
 
@@ -95,6 +97,14 @@ public sealed class TenantOperationDispatcher
         TenantOperationConcurrencyBudget tenantBudget)
         : this(registry, services) => this.tenantBudget = tenantBudget ?? throw new ArgumentNullException(nameof(tenantBudget));
 
+    private TenantOperationDispatcher(TenantOperationDispatcher source, OperationDeadline deadline)
+        => (registry, services, budget, tenantBudget, this.deadline) =
+            (source.registry, source.services, source.budget, source.tenantBudget, deadline);
+
+    /// <summary>Copy this dispatcher with a cooperative deadline for authorized business work. Experimental (M0).</summary>
+    public TenantOperationDispatcher WithOperationDeadline(OperationDeadline deadline)
+        => new(this, deadline ?? throw new ArgumentNullException(nameof(deadline)));
+
     /// <summary>Share a total and per-tenant capacity budget across protected dispatchers.</summary>
     public static TenantOperationDispatcher WithTenantConcurrencyBudget(
         TenantOperationRegistry registry, TenantSecurityServices services, TenantOperationConcurrencyBudget tenantBudget)
@@ -105,7 +115,7 @@ public sealed class TenantOperationDispatcher
         OperationId.RequireValid(operationId); ArgumentNullException.ThrowIfNull(correlation); cancellationToken.ThrowIfCancellationRequested();
         if(!registry.TryGet(operationId,out var registration)) return ValueTask.FromResult(OperationResult<TResponse>.Failure(new("operation.not_found","The requested operation is not registered.")));
         if(registration is not TenantRegistration<TRequest,TResponse> typed) return ValueTask.FromResult(OperationResult<TResponse>.Failure(new("operation.contract_mismatch","The requested operation does not use these request/response contracts.")));
-        return typed.DispatchAsync(request,correlation,services,budget,tenantBudget,cancellationToken,registry);
+        return typed.DispatchAsync(request,correlation,services,budget,tenantBudget,deadline,cancellationToken,registry);
     }
 }
 
@@ -132,13 +142,16 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         core=new(new OperationRegistryBuilder().Register<AuthorizedInvocation,TResponse>(operationId,()=>new HandlerBridge(factory,origin,operationId)).Build());
     }
     internal ValueTask<OperationResult<TResponse>> DispatchAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
-        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token,TenantOperationRegistry owningRegistry)
-        => services.Audit is null
-            ? DispatchCoreAsync(request,correlation,services,budget,tenantBudget,token,null,owningRegistry)
-            : DispatchAuditedAsync(request,correlation,services,budget,tenantBudget,token,owningRegistry);
+        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,OperationDeadline? deadline,CancellationToken token,TenantOperationRegistry owningRegistry)
+    {
+        var bounded = deadline is null ? null : new DeadlineDispatch(deadline);
+        return services.Audit is null
+            ? DispatchCoreAsync(request,correlation,services,budget,tenantBudget,bounded,token,null,owningRegistry)
+            : DispatchAuditedAsync(request,correlation,services,budget,tenantBudget,bounded,token,owningRegistry);
+    }
 
     private async ValueTask<OperationResult<TResponse>> DispatchAuditedAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
-        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token,TenantOperationRegistry owningRegistry)
+        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,DeadlineDispatch? bounded,CancellationToken token,TenantOperationRegistry owningRegistry)
     {
         var id=Guid.NewGuid(); TenantAccessRequest? authority=null; var mayHaveExecuted=false;
         TenantAuditWriteException? authorizationAuditFailure=null;
@@ -152,23 +165,32 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
             mayHaveExecuted=true;
         }
         OperationResult<TResponse>? result=null; Exception? executionFailure=null;
-        try { result=await DispatchCoreAsync(request,correlation,services,budget,tenantBudget,token,Authorized,owningRegistry).ConfigureAwait(false); }
+        try { result=await DispatchCoreAsync(request,correlation,services,budget,tenantBudget,bounded,token,Authorized,owningRegistry).ConfigureAwait(false); }
         catch(TenantAuditWriteException failure) when(ReferenceEquals(failure,authorizationAuditFailure)) { throw; }
         catch(Exception failure) { executionFailure=failure; }
-        var outcome=executionFailure is OperationCanceledException?TenantAuditOutcome.Cancelled:
-            executionFailure is not null?TenantAuditOutcome.Faulted:
+
+        // Required audit keeps the original cancellation, even when Core translates expiry or
+        // gives caller cancellation precedence. Non-cancellation faults still take priority.
+        var operationFailure = executionFailure is null or OperationCanceledException
+            ? bounded?.DispatchCancellation ?? executionFailure : executionFailure;
+        // Authority checks keep legacy cancellation outcomes; classify tokens only after linked dispatch starts.
+        var outcome=operationFailure is OperationCanceledException cancellation &&
+            (bounded is not { HasEnteredDispatch: true } || executionFailure is null || bounded.IsExpectedCancellation(cancellation,token))
+            ?TenantAuditOutcome.Cancelled:
+            operationFailure is not null?TenantAuditOutcome.Faulted:
             result!.IsSuccess?TenantAuditOutcome.Succeeded:
             result.Error!.Code=="access.denied"?TenantAuditOutcome.Denied:TenantAuditOutcome.Rejected;
         try { await services.Audit!.AppendAsync(Entry(TenantAuditStage.Terminal,outcome),mayHaveExecuted).ConfigureAwait(false); }
-        catch(TenantAuditWriteException auditFailure) when(executionFailure is not null)
-        { throw new AggregateException("Operation and required audit persistence failed.",executionFailure,auditFailure); }
-        if(executionFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(executionFailure).Throw();
+        catch(TenantAuditWriteException auditFailure) when(operationFailure is not null)
+        { throw new AggregateException("Operation and required audit persistence failed.",operationFailure,auditFailure); }
+        if(executionFailure is not null) ExceptionDispatchInfo.Capture(executionFailure).Throw();
+        if(bounded?.DispatchCancellation is not null) token.ThrowIfCancellationRequested();
         return result!.IsSuccess && authority is not null && !authority.Identity.SatisfiesObservationConstraints()
             ? Denied() : result!;
     }
 
     private async ValueTask<OperationResult<TResponse>> DispatchCoreAsync(TRequest request,OperationContext correlation,TenantSecurityServices services,
-        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,CancellationToken token,
+        OperationConcurrencyBudget? budget,TenantOperationConcurrencyBudget? tenantBudget,DeadlineDispatch? bounded,CancellationToken token,
         Func<TenantAccessRequest,ValueTask>? authorized,TenantOperationRegistry owningRegistry)
     {
         token.ThrowIfCancellationRequested();
@@ -211,28 +233,94 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
         var context=new TenantOperationContext(access,correlation,lease,origin,owningRegistry);
         try
         {
-            var invocation = new AuthorizedInvocation(frozen, context);
-            var work = tenantBudget is not null
-                ? tenantBudget.DispatchAsync<AuthorizedInvocation, TResponse>(resource.Tenant, core, operationId, invocation, correlation, token)
-                : budget is null
-                    ? core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId, invocation, correlation, token)
-                    : budget.DispatchAsync<AuthorizedInvocation,TResponse>(core, operationId, invocation, correlation, token);
+            var invocation = new AuthorizedInvocation(frozen, context, bounded);
+            var work = bounded is null
+                ? DispatchBusinessAsync(invocation, resource.Tenant, correlation, budget, tenantBudget, token)
+                : DispatchWithDeadlineAsync(bounded, invocation, resource.Tenant, correlation, budget, tenantBudget, token);
             // Core returns after owned cleanup. Never replace an explicit business failure or cleanup fault.
             var result = await work.ConfigureAwait(false);
             return result.IsSuccess && !identity.SatisfiesObservationConstraints() ? Denied() : result;
         }
         catch(TenantAccessDeniedException) { return Denied(); }
     }
+
+    private ValueTask<OperationResult<TResponse>> DispatchBusinessAsync(AuthorizedInvocation invocation, TenantId tenant,
+        OperationContext correlation, OperationConcurrencyBudget? budget, TenantOperationConcurrencyBudget? tenantBudget, CancellationToken token)
+        => tenantBudget is not null
+            ? tenantBudget.DispatchAsync<AuthorizedInvocation,TResponse>(tenant, core, operationId, invocation, correlation, token)
+            : budget is null
+                ? core.DispatchAsync<AuthorizedInvocation,TResponse>(operationId, invocation, correlation, token)
+                : budget.DispatchAsync<AuthorizedInvocation,TResponse>(core, operationId, invocation, correlation, token);
+
+    private ValueTask<OperationResult<TResponse>> DispatchWithDeadlineAsync(DeadlineDispatch bounded, AuthorizedInvocation invocation,
+        TenantId tenant, OperationContext correlation, OperationConcurrencyBudget? budget,
+        TenantOperationConcurrencyBudget? tenantBudget, CancellationToken token)
+        => bounded.ExecuteAsync(linked => DispatchBusinessAsync(invocation, tenant, correlation, budget, tenantBudget, linked),
+            () => invocation.Context.DemandBinding(origin,operationId), token);
+
     private static bool ValidMembership(IdentitySnapshot identity,TenantId tenant,TenantMembershipSnapshot? membership,DateTimeOffset now)
         =>membership is not null && membership.IsActive && membership.Principal.Equals(identity.Principal) && membership.Tenant.Equals(tenant) && membership.NotBeforeUtc<=now && now<membership.ExpiresAtUtc;
     private static OperationResult<TResponse> Denied()=>OperationResult<TResponse>.Failure(new("access.denied","Access denied."));
-    private sealed record AuthorizedInvocation(TRequest Request,TenantOperationContext Context);
+    private sealed record AuthorizedInvocation(TRequest Request,TenantOperationContext Context,DeadlineDispatch? Deadline);
+
+    // Per invocation. OperationDeadline owns the public result; this records the cause for audit.
+    private sealed class DeadlineDispatch(OperationDeadline deadline)
+    {
+        private CancellationToken operationToken;
+        internal bool HasEnteredDispatch => operationToken.CanBeCanceled;
+        internal OperationCanceledException? DispatchCancellation { get; private set; }
+        internal OperationCanceledException? CleanupCancellation { get; set; }
+        internal bool HandlerFactoryStarted { get; set; }
+
+        internal bool IsExpectedCancellation(OperationCanceledException error, CancellationToken caller)
+            => !ReferenceEquals(error,CleanupCancellation) &&
+                (error.CancellationToken == operationToken && operationToken.IsCancellationRequested ||
+                 error.CancellationToken == caller && caller.IsCancellationRequested);
+
+        internal async ValueTask<OperationResult<TResponse>> ExecuteAsync(
+            Func<CancellationToken,ValueTask<OperationResult<TResponse>>> dispatch, Action demandBinding, CancellationToken caller)
+        {
+            try
+            {
+                return await deadline.ExecuteAsync<TResponse>(async linked =>
+                {
+                    operationToken = linked;
+                    try { return await dispatch(linked).ConfigureAwait(false); }
+                    catch (OperationCanceledException error)
+                    {
+                        // A lone cleanup fault can reuse the linked token. Keep it out of the deadline classifier.
+                        // Core's execution+cleanup aggregate never enters this catch.
+                        if (ReferenceEquals(error,CleanupCancellation)) throw new CleanupCancellationFault(error);
+                        // Core or the budget can observe expiry before the bridge gets to demand the lease.
+                        if (!HandlerFactoryStarted && error.CancellationToken == linked && linked.IsCancellationRequested && !caller.IsCancellationRequested)
+                            demandBinding();
+                        DispatchCancellation = error;
+                        throw;
+                    }
+                }, caller).ConfigureAwait(false);
+            }
+            catch (CleanupCancellationFault error)
+            {
+                ExceptionDispatchInfo.Capture(error.Cause).Throw();
+                throw;
+            }
+        }
+
+        private sealed class CleanupCancellationFault(OperationCanceledException cause) : Exception
+        {
+            internal OperationCanceledException Cause { get; } = cause;
+        }
+    }
+
     private sealed class HandlerBridge(Func<ITenantOperationHandler<TRequest,TResponse>> factory,object origin,string operationId):IOperationHandler<AuthorizedInvocation,TResponse>,IAsyncDisposable
     {
         private ITenantOperationHandler<TRequest,TResponse>? owned;
+        private DeadlineDispatch? deadline;
         public async ValueTask<OperationResult<TResponse>> HandleAsync(AuthorizedInvocation request,OperationContext correlation,CancellationToken token)
         {
+            deadline=request.Deadline;
             request.Context.DemandBinding(origin,operationId); token.ThrowIfCancellationRequested();
+            if(deadline is not null) deadline.HandlerFactoryStarted=true;
             owned=factory()??throw new InvalidOperationException("The tenant handler factory returned null.");
             request.Context.DemandBinding(origin,operationId); token.ThrowIfCancellationRequested();
             return await owned.HandleAsync(request.Request,request.Context,token).ConfigureAwait(false);
@@ -249,6 +337,11 @@ internal sealed class TenantRegistration<TRequest,TResponse> : ITenantRegistrati
                 // Cleanup is an infrastructure/lifecycle failure, not a fresh authorization denial.
                 // Preserve its cause without letting the outer semantic-denial mapper hide it.
                 throw new InvalidOperationException("Owned tenant handler cleanup failed.",failure);
+            }
+            catch(OperationCanceledException failure) when(deadline is not null)
+            {
+                deadline.CleanupCancellation=failure;
+                throw;
             }
         }
     }
