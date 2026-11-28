@@ -128,7 +128,7 @@ public static class CliApplication
             if (index + 1 >= args.Length || string.IsNullOrWhiteSpace(args[index + 1]) || args[index + 1].StartsWith("--", StringComparison.Ordinal))
                 throw new UsageFailure("usage.value", $"Option {allowed[optionIndex]} requires one nonempty value; use cehpalon {command} --help.");
             if (!result.TryAdd(args[index], args[index + 1]))
-                throw new UsageFailure("usage.duplicate", "Options must not be repeated.");
+                throw new UsageFailure("usage.duplicate", $"Option {allowed[optionIndex]} must not be repeated; use cehpalon {command} --help.");
         }
         return result;
     }
