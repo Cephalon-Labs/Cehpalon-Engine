@@ -27,10 +27,12 @@ usage error, not a help request.
 
 The `usage.required` diagnostic names the first missing required option reached
 in the existing validation order and points to `cehpalon new --help` or
-`cehpalon validate --help`. It returns exit 2 with one JSON line on stderr
-(`success`, `code`, `message`) and empty stdout, without echoing supplied values
-or paths. A recognized option with a missing, blank, or `--`-prefixed value
-still reports `usage.value`.
+`cehpalon validate --help`. A recognized option with a missing, blank, or
+`--`-prefixed value instead reports `usage.value` and names the option and the
+invoked subcommand's help. For example, `cehpalon validate --config` reports:
+`Option --config requires one nonempty value; use cehpalon validate --help.`
+Both diagnostics return exit 2 with one JSON line on stderr (`success`, `code`,
+`message`) and empty stdout, without echoing supplied values or paths.
 
 `CliApplication.Run(string[], TextWriter, TextWriter)` returns 0 for success, 2 for
 usage/configuration rejection, and 3 for path/I/O/source failure. Results are JSON;
