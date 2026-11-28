@@ -72,8 +72,8 @@ public static class CliApplication
 
             return args[0] switch
             {
-                "new" => New(Parse(args, ["--name", "--output", "--engine-root", "--profile"]), output, fileSystem),
-                "validate" => Validate(Parse(args, ["--config", "--profile"]), output, error),
+                "new" => New(Parse(args, "new", ["--name", "--output", "--engine-root", "--profile"]), output, fileSystem),
+                "validate" => Validate(Parse(args, "validate", ["--config", "--profile"]), output, error),
                 _ => throw new UsageFailure("usage.command", "Unknown command or extra arguments to --help/--version.")
             };
         }
@@ -116,15 +116,17 @@ public static class CliApplication
         return 0;
     }
 
-    private static Dictionary<string, string> Parse(string[] args, string[] allowed)
+    private static Dictionary<string, string> Parse(string[] args, string command, string[] allowed)
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         for (var index = 1; index < args.Length; index += 2)
         {
-            if (!allowed.Contains(args[index], StringComparer.Ordinal))
+            // String equality is ordinal; use the matched allowlist literal in the diagnostic.
+            var optionIndex = Array.IndexOf(allowed, args[index]);
+            if (optionIndex < 0)
                 throw new UsageFailure("usage.option", "Unknown option; use --help for supported arguments.");
             if (index + 1 >= args.Length || string.IsNullOrWhiteSpace(args[index + 1]) || args[index + 1].StartsWith("--", StringComparison.Ordinal))
-                throw new UsageFailure("usage.value", "Every option requires one nonempty value.");
+                throw new UsageFailure("usage.value", $"Option {allowed[optionIndex]} requires one nonempty value; use cehpalon {command} --help.");
             if (!result.TryAdd(args[index], args[index + 1]))
                 throw new UsageFailure("usage.duplicate", "Options must not be repeated.");
         }

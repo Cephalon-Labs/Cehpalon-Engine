@@ -223,9 +223,12 @@ foreach (var invocation in new (string Name, string Code, string[] Arguments)[]
 
 const string requiredInput = "RequiredOptionInputFixture";
 const string optionError = "Unknown option; use --help for supported arguments.";
-const string valueError = "Every option requires one nonempty value.";
 const string profileError = "Supported profiles are portable-request-reply and small-api.";
-foreach (var scenario in new (string Name, string[] Arguments, int Exit, string Code, string Message)[]
+const string configValueError = "Option --config requires one nonempty value; use cehpalon validate --help.";
+const string outputValueError = "Option --output requires one nonempty value; use cehpalon new --help.";
+const string validateProfileValueError = "Option --profile requires one nonempty value; use cehpalon validate --help.";
+const string nextOption = "--unrecognized-" + requiredInput;
+var requiredOptionDiagnostics = new (string Name, string[] Arguments, int Exit, string Code, string Message)[]
 {
     ("new-missing-name", ["new", "--output", "$target", "--engine-root", "$source"],
         2, "usage.required", "Missing required option --name; use cehpalon new --help."),
@@ -247,16 +250,34 @@ foreach (var scenario in new (string Name, string[] Arguments, int Exit, string 
         3, "path.namespace", "Windows device and extended path namespaces are not supported."),
     ("validate-invalid-profile-before-missing-config", ["validate", "--profile", requiredInput],
         2, "usage.profile", profileError),
-    ("new-malformed-output-before-missing-name", ["new", "--output", " "], 2, "usage.value", valueError),
-    ("validate-malformed-config-is-not-missing", ["validate", "--config"], 2, "usage.value", valueError),
+    ("new-malformed-output-before-missing-name", ["new", "--output", " "], 2, "usage.value", outputValueError),
+    ("validate-malformed-config-is-not-missing", ["validate", "--config"], 2, "usage.value", configValueError),
     ("new-duplicate-before-missing-name", ["new", "--output", "$target", "--output", "$nested"],
         2, "usage.duplicate", "Options must not be repeated."),
     ("new-mixed-help-before-missing-output", ["new", "--name", requiredInput, "--help"], 2, "usage.option", optionError),
     ("validate-mixed-help-before-missing-config", ["validate", "--profile", "small-api", "--help"], 2, "usage.option", optionError),
     ("validate-unknown-argument-before-missing-config", ["validate", "--" + requiredInput, "value"], 2, "usage.option", optionError)
-})
+};
+var optionValueDiagnostics = new (string Name, string[] Arguments, int Exit, string Code, string Message)[]
 {
-    Check("required-option-" + scenario.Name, () =>
+    ("option-value-validate-profile-before-next-option-and-config-read", ["validate", "--config", "$config", "--profile", nextOption],
+        2, "usage.value", validateProfileValueError),
+    ("option-value-validate-config-followed-by-help-is-not-command-help", ["validate", "--config", "--help"],
+        2, "usage.value", configValueError),
+    ("option-value-new-empty-name", ["new", "--name", "", "--output", "$target", "--engine-root", "$source"],
+        2, "usage.value", "Option --name requires one nonempty value; use cehpalon new --help."),
+    ("option-value-new-missing-engine-root", ["new", "--name", requiredInput, "--output", "$target", "--engine-root"],
+        2, "usage.value", "Option --engine-root requires one nonempty value; use cehpalon new --help."),
+    ("option-value-new-profile-before-next-option-and-source-read", ["new", "--name", requiredInput, "--output", "$target", "--engine-root", "$source", "--profile", nextOption],
+        2, "usage.value", "Option --profile requires one nonempty value; use cehpalon new --help."),
+    ("option-value-validate-malformed-repeat-before-duplicate-and-config-read", ["validate", "--config", "$config", "--config"],
+        2, "usage.value", configValueError)
+};
+foreach (var scenario in requiredOptionDiagnostics
+    .Select(test => (Name: "required-option-" + test.Name, test.Arguments, test.Exit, test.Code, test.Message))
+    .Concat(optionValueDiagnostics))
+{
+    Check(scenario.Name, () =>
     {
         var parent = Scope();
         var target = Path.Combine(parent, requiredInput);
@@ -265,6 +286,7 @@ foreach (var scenario in new (string Name, string[] Arguments, int Exit, string 
             "$target" => target,
             "$nested" => Path.Combine(target, "nested"),
             "$source" => Path.Combine(parent, requiredInput + "Source"),
+            "$config" => Path.Combine(parent, requiredInput + ".json"),
             _ => value
         }).ToArray();
         var writes = 0;
@@ -275,8 +297,10 @@ foreach (var scenario in new (string Name, string[] Arguments, int Exit, string 
         AssertNoPublish(parent, target);
         Assert(result.Code == scenario.Exit && result.Output.Length == 0, "Expected rejection with no stdout and exit " + scenario.Exit);
         Assert(!result.Error.Contains(requiredInput, StringComparison.Ordinal), "Diagnostic echoed user-supplied input.");
+        if (scenario.Code == "usage.value")
+            AssertDiagnostic(result, scenario.Code);
         var expected = $$"""{"success":false,"code":"{{scenario.Code}}","message":"{{scenario.Message}}"}""";
-        Assert(result.Error == expected + Environment.NewLine, "Expected " + expected + "; got " + result.Error.TrimEnd());
+        Assert(result.Error == expected + Environment.NewLine, "Expected exactly one stderr JSON line: " + expected);
     });
 }
 
