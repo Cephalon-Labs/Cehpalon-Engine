@@ -253,7 +253,7 @@ var requiredOptionDiagnostics = new (string Name, string[] Arguments, int Exit, 
     ("new-malformed-output-before-missing-name", ["new", "--output", " "], 2, "usage.value", outputValueError),
     ("validate-malformed-config-is-not-missing", ["validate", "--config"], 2, "usage.value", configValueError),
     ("new-duplicate-before-missing-name", ["new", "--output", "$target", "--output", "$nested"],
-        2, "usage.duplicate", "Options must not be repeated."),
+        2, "usage.duplicate", "Option --output must not be repeated; use cehpalon new --help."),
     ("new-mixed-help-before-missing-output", ["new", "--name", requiredInput, "--help"], 2, "usage.option", optionError),
     ("validate-mixed-help-before-missing-config", ["validate", "--profile", "small-api", "--help"], 2, "usage.option", optionError),
     ("validate-unknown-argument-before-missing-config", ["validate", "--" + requiredInput, "value"], 2, "usage.option", optionError)
@@ -273,9 +273,30 @@ var optionValueDiagnostics = new (string Name, string[] Arguments, int Exit, str
     ("option-value-validate-malformed-repeat-before-duplicate-and-config-read", ["validate", "--config", "$config", "--config"],
         2, "usage.value", configValueError)
 };
+var duplicateOptionDiagnostics = new (string Name, string[] Arguments, int Exit, string Code, string Message)[]
+{
+    ("duplicate-option-new-name", ["new", "--name", "First" + requiredInput, "--output", "$target", "--engine-root", "$engine", "--name", "Second" + requiredInput],
+        2, "usage.duplicate", "Option --name must not be repeated; use cehpalon new --help."),
+    ("duplicate-option-new-engine-root", ["new", "--name", "Demo", "--output", "$target", "--engine-root", "$source", "--engine-root", "$nested"],
+        2, "usage.duplicate", "Option --engine-root must not be repeated; use cehpalon new --help."),
+    ("duplicate-option-new-profile", ["new", "--name", "Demo", "--output", "$target", "--engine-root", "$source", "--profile", "portable-request-reply", "--profile", "small-api"],
+        2, "usage.duplicate", "Option --profile must not be repeated; use cehpalon new --help."),
+    ("duplicate-option-validate-config", ["validate", "--config", "$config", "--config", "$nested"],
+        2, "usage.duplicate", "Option --config must not be repeated; use cehpalon validate --help."),
+    ("duplicate-option-validate-profile", ["validate", "--config", "$config", "--profile", "small-api", "--profile", "portable-request-reply"],
+        2, "usage.duplicate", "Option --profile must not be repeated; use cehpalon validate --help."),
+    ("duplicate-option-new-blank-second-value", ["new", "--output", "$target", "--output", " \t"],
+        2, "usage.value", outputValueError),
+    ("duplicate-option-validate-option-like-second-value", ["validate", "--config", "$config", "--config", nextOption],
+        2, "usage.value", configValueError),
+    ("duplicate-option-validate-earlier-unknown-stays-unknown", ["validate", "--config", "$config", nextOption, requiredInput, "--config", "$nested"],
+        2, "usage.option", optionError),
+    ("duplicate-option-new-case-variant-is-unknown", ["new", "--output", "$target", "--Output", "$nested"],
+        2, "usage.option", optionError)
+};
 foreach (var scenario in requiredOptionDiagnostics
     .Select(test => (Name: "required-option-" + test.Name, test.Arguments, test.Exit, test.Code, test.Message))
-    .Concat(optionValueDiagnostics))
+    .Concat(optionValueDiagnostics).Concat(duplicateOptionDiagnostics))
 {
     Check(scenario.Name, () =>
     {
@@ -286,6 +307,7 @@ foreach (var scenario in requiredOptionDiagnostics
             "$target" => target,
             "$nested" => Path.Combine(target, "nested"),
             "$source" => Path.Combine(parent, requiredInput + "Source"),
+            "$engine" => engineRoot,
             "$config" => Path.Combine(parent, requiredInput + ".json"),
             _ => value
         }).ToArray();
@@ -297,7 +319,7 @@ foreach (var scenario in requiredOptionDiagnostics
         AssertNoPublish(parent, target);
         Assert(result.Code == scenario.Exit && result.Output.Length == 0, "Expected rejection with no stdout and exit " + scenario.Exit);
         Assert(!result.Error.Contains(requiredInput, StringComparison.Ordinal), "Diagnostic echoed user-supplied input.");
-        if (scenario.Code == "usage.value")
+        if (scenario.Code is "usage.value" or "usage.duplicate")
             AssertDiagnostic(result, scenario.Code);
         var expected = $$"""{"success":false,"code":"{{scenario.Code}}","message":"{{scenario.Message}}"}""";
         Assert(result.Error == expected + Environment.NewLine, "Expected exactly one stderr JSON line: " + expected);
